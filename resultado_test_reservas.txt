@@ -1,0 +1,45 @@
+=============================== 
+SpainRoom - Test Reservas (Room 1) 
+Fecha: 24/08/2025 23:22:58,04 
+=============================== 
+0) Health 
+{
+  "ok": true,
+  "time": "2025-08-24T21:22:58.110306Z"
+}
+
+1) Disponibilidad (2025-09-10 a 2025-09-20) 
+<!doctype html>
+<html lang=en>
+<title>404 Not Found</title>
+<h1>Not Found</h1>
+<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try again.</p>
+
+2) Crear reserva (pending) 
+<!doctype html>
+<html lang=en>
+<title>404 Not Found</title>
+<h1>Not Found</h1>
+<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try again.</p>
+
+ID de la reserva creada:   
+
+3) Listar reservas pending (TOP 200) 
+<!doctype html>
+<html lang=en>
+<title>404 Not Found</title>
+<h1>Not Found</h1>
+<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try again.</p>
+
+4) Aprobar reserva (PATCH -
+
+5) Cancelar reserva (PATCH -
+
+6) Estado final de reservas (últimas) 
+<!doctype html>
+<html lang=en>
+<title>404 Not Found</title>
+<h1>Not Found</h1>
+<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try again.</p>
+
+=============================== 

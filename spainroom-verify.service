@@ -1,0 +1,18 @@
+[Unit]
+Description=SpainRoom - Verificador Cédula (Flask)
+After=network.target
+
+[Service]
+User=spainroom
+Group=spainroom
+WorkingDirectory=/srv/spainroom/cedula-backend
+Environment="PORT=5001"
+# Activar cuando tengáis certificado:
+# Environment="SP_CERT=/etc/ssl/spainroom/spainroom-cert.pem"
+# Environment="SP_KEY=/etc/ssl/spainroom/spainroom-key-nopass.pem"
+# Environment="SP_CA=/etc/ssl/certs/ca-certificates.crt"
+ExecStart=/srv/spainroom/cedula-backend/venv/bin/python app_verify_cedula.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

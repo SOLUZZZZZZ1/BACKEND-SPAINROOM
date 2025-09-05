@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Comprobación de Cédula</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { --blue:#2563eb; --ok:#16a34a; --err:#dc2626; --muted:#64748b; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#f8fafc; margin:32px; color:#0f172a; }
+    .wrap { max-width: 680px; margin: 0 auto; }
+    h1 { margin: 0 0 12px 0; }
+    p.sub { margin: 0 0 16px 0; color: var(--muted); }
+    .card { background:#fff; border:1px solid #e5e7eb; border-radius:14px; padding:16px 18px; box-shadow:0 6px 24px rgba(0,0,0,.06); }
+    label { display:block; font-size:14px; color:#334155; margin-top:10px; margin-bottom:4px; }
+    input { width:100%; padding:10px; border:1px solid #e2e8f0; border-radius:10px; outline:none; }
+    button { margin-top:12px; padding:10px 14px; border-radius:10px; border:none; background:var(--blue); color:#fff; font-weight:700; cursor:pointer; }
+    .muted { color: var(--muted); font-size:12px; }
+    .ok { color: var(--ok); }
+    .err { color: var(--err); }
+    code { background:#f3f4f6; padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Comprobación de Cédula</h1>
+    <p class="sub">Indica <b>dirección</b> o <b>referencia catastral (20)</b>. El sistema devolverá un <b>ID</b> de verificación.</p>
+
+    <div class="card">
+      <label>Dirección (opcional si indicas referencia catastral)</label>
+      <input id="address" placeholder="Calle Mayor 1, Madrid" />
+
+      <label>Referencia catastral (20 caracteres)</label>
+      <input id="refc" placeholder="XXXXXXXXXXXXYYYYYY" />
+
+      <label>Email (opcional)</label>
+      <input id="email" type="email" placeholder="tu@correo.com" />
+
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px">
+        <div>
+          <label>Ciudad (opcional)</label>
+          <input id="city" placeholder="Madrid" />
+        </div>
+        <div>
+          <label>Comunidad (opcional)</label>
+          <input id="ccaa" placeholder="Comunidad de Madrid" />
+        </div>
+      </div>
+
+      <button id="btn">Comprobar</button>
+      <div id="out" style="margin-top:10px"></div>
+      <div class="muted">POST → <code>/api/cedula/check</code></div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const CHECK_URL = "/api/cedula/check";
+
+    const cleanRef = (s) => (s||"").toUpperCase().replace(/\s+/g,"");
+    const validRef = (s) => /^[A-Z0-9]{20}$/.test(s);
+
+    $("btn").onclick = async () => {
+      const payload = {
+        address: $("address").value.trim(),
+        ref_catastral: cleanRef($("refc").value),
+        email: $("email").value.trim(),
+        city: $("city").value.trim(),
+        comunidad: $("ccaa").value.trim(),
+      };
+
+      const out = $("out");
+      out.className = ""; out.textContent = "";
+
+      if (!payload.address && !payload.ref_catastral) {
+        out.className = "err"; out.textContent = "Debes indicar dirección o referencia catastral.";
+        return;
+      }
+      if (payload.ref_catastral && !validRef(payload.ref_catastral)) {
+        out.className = "err"; out.textContent = "La referencia catastral debe tener 20 caracteres alfanuméricos.";
+        return;
+      }
+
+      out.className = "muted"; out.textContent = "Enviando…";
+      try {
+        const res = await fetch(CHECK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const j = await res.json();
+        if (!res.ok) throw new Error(j.error || ("HTTP " + res.status));
+        const statusUrl = `/api/cedula/check/${j.check_id}`;
+        out.className = "ok";
+        out.innerHTML = `✅ Verificación creada. ID: <code>${j.check_id}</code> — <a href="${statusUrl}" target="_blank" rel="noreferrer">Ver estado</a>
+          <button id="copy" style="margin-left:8px; padding:4px 8px; border-radius:8px; border:1px solid #cbd5e1; background:#fff; cursor:pointer;">Copiar ID</button>`;
+        document.getElementById("copy").onclick = async () => {
+          try { await navigator.clipboard.writeText(j.check_id); out.innerHTML += " <span class='muted'>(copiado)</span>"; } catch {}
+        };
+      } catch (e) {
+        out.className = "err"; out.textContent = "❌ " + (e.message || "Error desconocido");
+      }
+    };
+  </script>
+</body>
+</html>
