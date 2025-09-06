@@ -1,24 +1,53 @@
 # payments.py
+from flask import Blueprint, jsonify, request
 import os
-from flask import Blueprint, request, jsonify
-import stripe
 
-bp_pay = Blueprint("payments", __name__, url_prefix="/api/payments")
+try:
+    import stripe
+except Exception:
+    stripe = None
 
-# Clave secreta (SOLO en el BACKEND: Render u host Flask)
-# Configura: STRIPE_SECRET_KEY = sk_test_... / sk_live_...
-stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+bp_payments = Blueprint("payments", __name__, url_prefix="/api/payments")
 
-SUCCESS_URL = os.environ.get(
-    "STRIPE_SUCCESS_URL",
-    "https://spainroom.vercel.app/pago-exito?session_id={CHECKOUT_SESSION_ID}",
-)
-CANCEL_URL = os.environ.get(
-    "STRIPE_CANCEL_URL",
-    "https://spainroom.vercel.app/pago-cancelado",
-)
-CURRENCY = os.environ.get("STRIPE_CURRENCY", "eur")
+def stripe_is_configured():
+    return bool(os.getenv("STRIPE_SECRET_KEY")) and stripe is not None
 
+@bp_payments.get("/health")
+def payments_health():
+    return jsonify({"ok": True, "stripe_enabled": stripe_is_configured()})
+
+@bp_payments.post("/checkout/session")
+def create_checkout_session():
+    if not stripe_is_configured():
+        return jsonify({"ok": False, "error": "stripe_not_configured"}), 503
+
+    try:
+        stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+
+        amount_eur = request.json.get("amount_eur")
+        try:
+            amount_cents = int(round(float(amount_eur) * 100))
+        except Exception:
+            return jsonify({"ok": False, "error": "invalid_amount"}), 400
+        if amount_cents <= 0:
+            return jsonify({"ok": False, "error": "invalid_amount"}), 400
+
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{
+                "price_data": {
+                    "currency": "eur",
+                    "product_data": {"name": "Pago SpainRoom"},
+                    "unit_amount": amount_cents,
+                },
+                "quantity": 1,
+            }],
+            success_url=request.json.get("success_url", "https://spainroom.vercel.app/pago-ok"),
+            cancel_url=request.json.get("cancel_url", "https://spainroom.vercel.app/pago-cancel"),
+        )
+        return jsonify({"ok": True, "url": session.url})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @bp_pay.post("/create-checkout-session")
 def create_checkout_session():
@@ -72,3 +101,4 @@ def create_checkout_session():
         return jsonify({"id": session.id})
     except stripe.error.StripeError as e:
         return jsonify({"error": str(e)}), 400
+
