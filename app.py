@@ -1,3 +1,4 @@
+# app.py
 from flask import Flask, jsonify
 from flask_cors import CORS
 
@@ -5,77 +6,69 @@ def create_app():
     app = Flask(__name__)
     CORS(app, resources={r"/*": {"origins": "*"}})
 
-    # ---------- Rutas básicas ----------
-    @app.route("/")
-    def root():
-        return jsonify({"ok": True, "service": "BACKEND-SPAINROOM"})
-
-    @app.route("/health")
+    # ------------------- Health -------------------
+    @app.get("/health")
     def health():
         return jsonify({"ok": True, "service": "BACKEND-SPAINROOM"})
 
-    @app.get("/__routes")
-    def list_routes():
-        output = []
-        for rule in app.url_map.iter_rules():
-            methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
-            output.append({
-                "rule": str(rule),
-                "endpoint": rule.endpoint,
-                "methods": methods
-            })
-        return jsonify({"count": len(output), "routes": output})
-
-    # ---------- Defense ----------
+    # ------------------- Defense (opcional) -------------------
     try:
         import defense
-defense.init_defense(app)
-
-    else:
-        app.register_blueprint(bp_defense)
-        print("[DEFENSE] Activada.")
-
-    # ---------- Auth ----------
-    try:
-        from auth import bp_auth
+        if hasattr(defense, "bp_defense"):
+            app.register_blueprint(defense.bp_defense, url_prefix="/defense")
+        if hasattr(defense, "init_defense"):
+            defense.init_defense(app)  # ¡ojo: 'app', no 'aplicación'!
+        print("[DEFENSE] Activa.")
     except Exception as e:
-        print("[AUTH] No se pudo cargar:", e)
-    else:
-        app.register_blueprint(bp_auth, url_prefix="/api/auth")
+        print(f"[DEFENSE] No se pudo activar: {e}")
+
+    # ------------------- Auth -------------------
+    try:
+        import auth
+        if hasattr(auth, "bp_auth"):
+            app.register_blueprint(auth.bp_auth, url_prefix="/api/auth")
         print("[AUTH] Blueprint auth registrado.")
-
-    # ---------- Opportunities ----------
-    try:
-        from opportunities import bp_opps
     except Exception as e:
-        print("[OPPORTUNITIES] No se pudo cargar:", e)
-    else:
-        app.register_blueprint(bp_opps, url_prefix="/api/opps")
+        print(f"[AUTH] No se pudo cargar: {e}")
+
+    # ------------------- Oportunidades -------------------
+    try:
+        import opportunities
+        if hasattr(opportunities, "bp_opps"):
+            app.register_blueprint(opportunities.bp_opps, url_prefix="/api/opps")
         print("[OPPORTUNITIES] Blueprint registrado.")
-
-    # ---------- Payments ----------
-    try:
-        from payments import bp_payments
     except Exception as e:
-        print("[PAGOS] No se pudo cargar:", e)
-    else:
-        app.register_blueprint(bp_payments)
-        print("[PAGOS] Blueprint registrado.")
+        print(f"[OPPORTUNITIES] No se pudo cargar: {e}")
 
-    # ---------- Voice ----------
+    # ------------------- Pagos -------------------
     try:
-        from voice_bot import bp_voice
+        import payments
+        if hasattr(payments, "bp_payments"):
+            app.register_blueprint(payments.bp_payments, url_prefix="/api/payments")
+        print("[PAYMENTS] Blueprint registrado.")
     except Exception as e:
-        print("[VOICE] No se pudo cargar:", e)
-    else:
-        app.register_blueprint(bp_voice, url_prefix="/voice")
+        print(f"[PAYMENTS] No se pudo cargar: {e}")
+
+    # ------------------- Bot de voz -------------------
+    try:
+        import voice_bot
+        if hasattr(voice_bot, "bp_voice"):
+            app.register_blueprint(voice_bot.bp_voice, url_prefix="/voice")
         print("[VOICE] Blueprint voice registrado.")
+    except Exception as e:
+        print(f"[VOICE] No se pudo cargar: {e}")
+
+    # ------------------- Rutas raíz -------------------
+    @app.get("/")
+    def root():
+        # Página sencilla para confirmar que está levantado
+        return (
+            "<h1>SpainRoom Backend</h1>"
+            "<p>Usa <code>/health</code> para estado y los prefijos "
+            "<code>/api/*</code>, <code>/voice/*</code> para servicios.</p>"
+        ), 200
 
     return app
 
-
-# Necesario para Render con: gunicorn app:app
+# Para gunicorn: app:app
 app = create_app()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
