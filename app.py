@@ -28,9 +28,9 @@ def create_app():
 
     # ---------- Defense ----------
     try:
-        from defense import bp_defense
-    except Exception as e:
-        print("[DEFENSE] No se pudo activar:", e)
+        import defense
+defense.init_defense(app)
+
     else:
         app.register_blueprint(bp_defense)
         print("[DEFENSE] Activada.")
