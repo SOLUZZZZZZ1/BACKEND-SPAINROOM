@@ -46,12 +46,15 @@ def create_app():
     # Pagos
     # -------------------
     try:
-        from payments import bp_payments
-        app.register_blueprint(bp_payments, url_prefix="/api/payments")
-        print("[PAYMENTS] Blueprint registrado.")
-    except Exception as e:
-        print(f"[PAYMENTS] No se pudo cargar: {e}")
-
+    import payments
+    print("[PAGOS] keys:", sorted(k for k in dir(payments) if not k.startswith("_")))
+    from payments import bp_payments
+    app.register_blueprint(bp_payments)
+    print("[PAGOS] Blueprint registrado.")
+except Exception as e:
+    import traceback, sys
+    print("[PAGOS] No se pudo cargar:", e)
+    traceback.print_exc(file=sys.stdout)
     # -------------------
     # Bot de voz (Twilio)
     # -------------------
