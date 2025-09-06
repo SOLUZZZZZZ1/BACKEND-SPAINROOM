@@ -14,7 +14,7 @@ python-dotenv==1.0.1
 gunicorn==22.0.0
 
 # Pagos (Stripe)
-stripe==5.8.0
+stripe==7.11.0
 
 # Seguridad / defensa
 flask-limiter==3.7.0
