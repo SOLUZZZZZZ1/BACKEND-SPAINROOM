@@ -5,74 +5,77 @@ def create_app():
     app = Flask(__name__)
     CORS(app, resources={r"/*": {"origins": "*"}})
 
-    # -------------------
-    # Ruta básica de salud
-    # -------------------
+    # ---------- Rutas básicas ----------
+    @app.route("/")
+    def root():
+        return jsonify({"ok": True, "service": "BACKEND-SPAINROOM"})
+
     @app.route("/health")
     def health():
         return jsonify({"ok": True, "service": "BACKEND-SPAINROOM"})
 
-    # -------------------
-    # Defensa
-    # -------------------
-    try:
-        from defense import setup_defense
-        setup_defense(app)
-        print("[DEFENSE] Defensa activada.")
-    except Exception as e:
-        print(f"[DEFENSE] No se pudo activar: {e}")
+    @app.get("/__routes")
+    def list_routes():
+        output = []
+        for rule in app.url_map.iter_rules():
+            methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
+            output.append({
+                "rule": str(rule),
+                "endpoint": rule.endpoint,
+                "methods": methods
+            })
+        return jsonify({"count": len(output), "routes": output})
 
-    # -------------------
-    # Autenticación
-    # -------------------
+    # ---------- Defense ----------
+    try:
+        from defense import bp_defense
+    except Exception as e:
+        print("[DEFENSE] No se pudo activar:", e)
+    else:
+        app.register_blueprint(bp_defense)
+        print("[DEFENSE] Activada.")
+
+    # ---------- Auth ----------
     try:
         from auth import bp_auth
+    except Exception as e:
+        print("[AUTH] No se pudo cargar:", e)
+    else:
         app.register_blueprint(bp_auth, url_prefix="/api/auth")
         print("[AUTH] Blueprint auth registrado.")
-    except Exception as e:
-        print(f"[AUTH] No se pudo cargar: {e}")
 
-    # -------------------
-    # Oportunidades
-    # -------------------
+    # ---------- Opportunities ----------
     try:
         from opportunities import bp_opps
-        app.register_blueprint(bp_opps, url_prefix="/api/opportunities")
-        print("[OPPORTUNITIES] Blueprint registrado.")
     except Exception as e:
-        print(f"[OPPORTUNITIES] No se pudo cargar: {e}")
+        print("[OPPORTUNITIES] No se pudo cargar:", e)
+    else:
+        app.register_blueprint(bp_opps, url_prefix="/api/opps")
+        print("[OPPORTUNITIES] Blueprint registrado.")
 
-    # -------------------
-    # Pagos
-    # -------------------
+    # ---------- Payments ----------
     try:
-    import payments
-    print("[PAGOS] keys:", sorted(k for k in dir(payments) if not k.startswith("_")))
-    from payments import bp_payments
-    app.register_blueprint(bp_payments)
-    print("[PAGOS] Blueprint registrado.")
-except Exception as e:
-    import traceback, sys
-    print("[PAGOS] No se pudo cargar:", e)
-    traceback.print_exc(file=sys.stdout)
-    # -------------------
+        from payments import bp_payments
+    except Exception as e:
+        print("[PAGOS] No se pudo cargar:", e)
+    else:
+        app.register_blueprint(bp_payments)
+        print("[PAGOS] Blueprint registrado.")
 
-    # Bot de voz (Twilio)
-    # -------------------
+    # ---------- Voice ----------
     try:
         from voice_bot import bp_voice
+    except Exception as e:
+        print("[VOICE] No se pudo cargar:", e)
+    else:
         app.register_blueprint(bp_voice, url_prefix="/voice")
         print("[VOICE] Blueprint voice registrado.")
-    except Exception as e:
-        print(f"[VOICE] No se pudo cargar: {e}")
 
     return app
 
 
-# 👉 Objeto que usará Render con gunicorn app:app
+# Necesario para Render con: gunicorn app:app
 app = create_app()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
-
-   
