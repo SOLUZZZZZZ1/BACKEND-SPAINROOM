@@ -1,8 +1,11 @@
-from flask import Blueprint, request, Response
+from flask import Blueprint, request, Response, jsonify
 
-bp_voice = Blueprint("voice", __name__, url_prefix="/voice")
+bp_voice = Blueprint("voice", __name__)
 
-@bp_voice.post("/answer")
+@bp_voice.get("/health")
+def voice_health():
+    return jsonify({"ok": True, "service": "voice"}), 200
+
 def answer():
     twiml = """
     <Response>
