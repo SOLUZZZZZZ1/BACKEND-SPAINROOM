@@ -213,12 +213,19 @@ def _role(s: str) -> str:
 
 def _zone(s: str) -> str:
     s = (s or "").lower().strip()
-    s = s.replace("á","a").replace("é","e").replace("í","i").","
-    s = s.replace("ó","o").replace("ú","u")
+    # normalización acentos (sin coma al final)
+    s = (
+        s.replace("á", "a")
+         .replace("é", "e")
+         .replace("í", "i")
+         .replace("ó", "o")
+         .replace("ú", "u")
+    )
     for key in PROVS.keys():
         if key in s or s == key:
             return key
     return ""
+
 
 def _name(s: str) -> str:
     s = (s or "").strip()
