@@ -5,7 +5,7 @@ from flask import Flask, request, jsonify, Response
 import requests
 from math import radians, sin, cos, sqrt, atan2
 from urllib.parse import unquote_plus
-import os, time
+import os, time, random
 
 # =========================================================
 #  APP FLASK (Render usa gunicorn codigo_flask:app)
@@ -49,11 +49,9 @@ try:
         try:
             reason = _looks_malicious()  # devuelve str|None según defense.py
             if reason:
-                # Log y 403 sin cuerpo; no interrumpe tus logs
                 print(f"[DEFENSE] Bloqueado: {reason} {request.method} {request.path}", flush=True)
                 return ("", 403)
         except Exception as e:
-            # Nunca romper por el gate
             print(f"[DEFENSE] Warning: {e}", flush=True)
 
     print("[DEFENSE] Cortafuegos activo.", flush=True)
@@ -104,10 +102,10 @@ def search_jobs():
         return jsonify({"error": "Parámetros inválidos"}), 400
 
     ofertas = [
-        {"id": 1, "titulo": "Camarero/a",     "empresa": "Bar Central",   "lat": lat + 0.01,  "lng": lng + 0.01},
-        {"id": 2, "titulo": "Dependiente/a",  "empresa": "Tienda Local",  "lat": lat + 0.015, "lng": lng},
-        {"id": 3, "titulo": "Administrativo/a","empresa": "Gestoría",     "lat": lat - 0.02,  "lng": lng - 0.01},
-        {"id": 4, "titulo": "Carpintero/a",   "empresa": "Taller Madera", "lat": lat + 0.03,  "lng": lng + 0.02},
+        {"id": 1, "titulo": "Camarero/a",      "empresa": "Bar Central",   "lat": lat + 0.01,  "lng": lng + 0.01},
+        {"id": 2, "titulo": "Dependiente/a",   "empresa": "Tienda Local",  "lat": lat + 0.015, "lng": lng},
+        {"id": 3, "titulo": "Administrativo/a","empresa": "Gestoría",      "lat": lat - 0.02,  "lng": lng - 0.01},
+        {"id": 4, "titulo": "Carpintero/a",    "empresa": "Taller Madera", "lat": lat + 0.03,  "lng": lng + 0.02},
     ]
 
     resultados = []
@@ -125,6 +123,7 @@ def search_jobs():
 # =========================================================
 #  REGISTRO OPCIONAL DE TUS BLUEPRINTS (NO ROMPE SI NO ESTÁN)
 #  Mantenemos mensajes similares a tus logs anteriores
+#  (NO registramos el antiguo VOICE para evitar choque con /voice/* de abajo)
 # =========================================================
 def _try_register(label: str, import_path: str, attr: str = None, url_prefix: str = None, print_ok: str = None):
     """Registra un blueprint si existe sin romper el arranque."""
@@ -133,7 +132,6 @@ def _try_register(label: str, import_path: str, attr: str = None, url_prefix: st
         bp = getattr(module, attr) if attr else getattr(module, "bp", None)
         if bp is None:
             return
-        # Evitar doble registro
         if any(getattr(b, "name", "") == bp.name for b in app.blueprints.values()):
             return
         if url_prefix:
@@ -143,145 +141,185 @@ def _try_register(label: str, import_path: str, attr: str = None, url_prefix: st
         if print_ok:
             print(print_ok, flush=True)
     except Exception:
-        # No cortamos el arranque si falta
         pass
 
-# Si existen en tu proyecto, se registran; si no, se ignoran (sin romper):
-_try_register("DEFENSE",       "defense_bot",          "bp_defense",       "/defense",      "[DEFENSE] Activa.")
-_try_register("AUTH",          "auth",                 "bp_auth",          "/auth",         "[AUTH] Blueprint auth registrado.")
-_try_register("OPPORTUNITIES", "opportunities",        "bp_opportunities", "/opportunities","[OPPORTUNITIES] Blueprint registrado.")
-_try_register("PAYMENTS",      "payments",             "bp_payments",      "/payments",     "[PAYMENTS] Blueprint registrado.")
-# Si ya tienes voice_bot.py con bp_voice, lo registramos con /voice
-_try_register("VOICE",         "voice_bot",            "bp_voice",         "/voice",        "[VOICE] Blueprint voice registrado.")
+_try_register("AUTH",          "auth",          "bp_auth",          "/auth",          "[AUTH] Blueprint auth registrado.")
+_try_register("OPPORTUNITIES", "opportunities", "bp_opportunities", "/opportunities", "[OPPORTUNITIES] Blueprint registrado.")
+_try_register("PAYMENTS",      "payments",      "bp_payments",      "/payments",      "[PAYMENTS] Blueprint registrado.")
+# (no registramos VOICE externo aquí para no chocar con /voice/* de abajo)
 
 
 # =========================================================
-#  IVR / VOZ — FALLBACK EN ESTE MISMO ARCHIVO (si no hay voice_bot)
-#  → Activo solo si NO existe ruta /voice/answer tras los try_register
+#  IVR PERSONA NATURAL — /voice/*  (barge-in + cortes naturales)
 # =========================================================
-def _have_route(rule: str) -> bool:
-    try:
-        return any(getattr(r, "rule", "") == rule for r in app.url_map.iter_rules())
-    except Exception:
-        return False
 
-if not _have_route("/voice/answer"):
-    # --- Fallback mínimo (menú de intents + español/inglés) ---
-    def _twiml(body: str) -> Response:
-        body = body.strip()
-        if not body.startswith("<Response"):
-            body = f"<Response>{body}</Response>"
-        return Response(body, mimetype="text/xml")
+def _twiml(body: str) -> Response:
+    body = body.strip()
+    if not body.startswith("<Response"):
+        body = f"<Response>{body}</Response>"
+    return Response(body, mimetype="text/xml")
 
-    def _say_es(texto: str) -> str:
-        return f'<Say language="es-ES" voice="alice">{texto}</Say>'
+def _say_es(text: str) -> str:
+    return f'<Say language="es-ES" voice="alice">{text}</Say>'
 
-    def _say_en(texto: str) -> str:
-        return f'<Say language="en-US" voice="alice">{texto}</Say>'
+def _pause(sec=0.4) -> str:
+    return f'<Pause length="{max(0.2, min(2.0, sec))}"/>'
 
-    def _gather_es(action: str) -> str:
-        return (f'<Gather input="speech dtmf" language="es-ES" numDigits="1" '
-                f'timeout="5" action="{action}" method="POST">')
+def _gather_es(action: str, timeout="5", end_silence="auto",
+               hints: str = "propietario, inquilino, jaen, madrid, valencia, sevilla, barcelona, malaga, granada"):
+    # bargeIn permite interrumpir mientras habla
+    return (f'<Gather input="speech" language="es-ES" timeout="{timeout}" '
+            f'speechTimeout="{end_silence}" action="{action}" method="POST" '
+            f'bargeIn="true" actionOnEmptyResult="true" hints="{hints}">')
 
-    @app.get("/voice/health")
-    def _voice_health():
-        return jsonify(ok=True, service="voice_menu_fallback"), 200
+def _ack():
+    return random.choice(["vale", "ok", "perfecto", "genial", "ajá", "te sigo", "sí", "de una", "dale"])
 
-    @app.post("/voice/answer")
-    def _voice_answer():
-        twiml = f"""
-        <Response>
-          {_say_es("Bienvenido a SpainRoom. Pulsa 1 para español, 2 para inglés. "
-                   "También puedes decir reservas, propietarios, franquiciados u oportunidades.")}
-          <Pause length="1"/>
-          {_say_en("Welcome to SpainRoom. Press 1 for Spanish, 2 for English. "
-                   "You may also say reservations, landlords, franchisees or opportunities.")}
-          {_gather_es("/voice/lang-or-intent")}
-            {_say_es("Pulsa 1 para español, 2 para inglés, o di: reservas, propietarios, franquiciados u oportunidades.")}
-          </Gather>
-          {_say_es("No recibí respuesta.")}
-          <Redirect method="POST">/voice/fallback</Redirect>
-        </Response>
-        """
-        return _twiml(twiml)
+def _short():
+    return _pause(0.3)
 
-    def _intent_from_speech(s: str) -> str:
-        s = (s or "").lower().strip()
-        if "reserva" in s or "reser" in s: return "reservas"
-        if "propiet" in s or "dueñ" in s or "landlord" in s: return "propietarios"
-        if "franquici" in s or "franchise" in s: return "franquiciados"
-        if "oportunidad" in s or "opport" in s or "colabora" in s: return "oportunidades"
-        if s in {"1","spanish","español"}: return "lang_es"
-        if s in {"2","english","inglés","ingles"}: return "lang_en"
-        return ""
+# Memoria por llamada (producción: Redis/DB con TTL)
+_IVR_MEM = {}  # { CallSid: {"role":"", "zone":"", "name":""} }
 
-    def _route_lang(lang: str) -> str:
-        if lang == "es":
-            return (_say_es("Has elegido español.")
-                    + '<Redirect method="POST">/voice/loop?lang=es</Redirect>')
-        return (_say_en("You selected English.")
-                + '<Redirect method="POST">/voice/loop?lang=en</Redirect>')
+PROVS = {
+    "jaen": "Jaén", "madrid": "Madrid", "valencia": "Valencia", "sevilla": "Sevilla",
+    "barcelona": "Barcelona", "malaga": "Málaga", "granada": "Granada"
+}
+# Jaén con el número real que me diste (+34683634299)
+FRAN_MAP = {
+    "jaen":      {"name": "Jaén",          "phone": "+34683634299"},
+    "madrid":    {"name": "Madrid Centro", "phone": "+34600000001"},
+    "valencia":  {"name": "Valencia",      "phone": "+34600000003"},
+    "sevilla":   {"name": "Sevilla",       "phone": "+34600000004"},
+    "barcelona": {"name": "Barcelona",     "phone": "+34600000005"},
+    "malaga":    {"name": "Málaga",        "phone": "+34600000006"},
+    "granada":   {"name": "Granada",       "phone": "+34600000007"},
+}
 
-    def _route_intent(intent: str) -> str:
-        mapping = {
-            "reservas": _say_es("Reservas. Te enviaré un SMS con el enlace a la web."),
-            "propietarios": _say_es("Propietarios. Podemos verificar la cédula y subir tus viviendas."),
-            "franquiciados": _say_es("Franquiciados. Gestiona tu zona, propietarios e inquilinos."),
-            "oportunidades": _say_es("Oportunidades. Te contamos cómo colaborar con SpainRoom."),
-        }
-        msg = mapping.get(intent, _say_es("De acuerdo."))
-        return f"{msg}<Redirect method='POST'>/voice/loop</Redirect>"
+_YES = {"si","sí","vale","correcto","claro","ok","de acuerdo"}
+_NO  = {"no","negativo"}
 
-    @app.post("/voice/lang-or-intent")
-    def _voice_lang_or_intent():
-        digits = unquote_plus(request.form.get("Digits", ""))
-        speech = unquote_plus(request.form.get("SpeechResult", "")).lower().strip()
+def _yesno(s: str) -> str:
+    s = (s or "").lower().strip()
+    if any(w in s for w in _YES): return "yes"
+    if any(w in s for w in _NO):  return "no"
+    return ""
 
-        if digits == "1":
-            return _twiml(_route_lang("es"))
-        if digits == "2":
-            return _twiml(_route_lang("en"))
+def _role(s: str) -> str:
+    s = (s or "").lower()
+    if "propiet" in s or "dueñ" in s: return "propietario"
+    if "inquil"  in s or "alquil" in s: return "inquilino"
+    return ""
 
-        intent = _intent_from_speech(speech)
+def _zone(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = s.replace("á","a").replace("é","e").replace("í","i").","
+    s = s.replace("ó","o").replace("ú","u")
+    for key in PROVS.keys():
+        if key in s or s == key:
+            return key
+    return ""
 
-        if intent == "lang_es":
-            return _twiml(_route_lang("es"))
-        if intent == "lang_en":
-            return _twiml(_route_lang("en"))
+def _name(s: str) -> str:
+    s = (s or "").strip()
+    lower = s.lower()
+    for cue in ["me llamo", "soy", "mi nombre es"]:
+        if cue in lower:
+            after = s.lower().split(cue,1)[1].strip()
+            return after.title()[:60]
+    parts = [w for w in s.split() if len(w) > 1]
+    return parts[0].title()[:40] if parts else ""
 
-        if intent in {"reservas","propietarios","franquiciados","oportunidades"}:
-            return _twiml(_route_intent(intent))
+def _assign(zone_key: str):
+    return FRAN_MAP.get(zone_key or "", {"name": "Central SpainRoom", "phone": None})
 
-        # Reintento suave
-        twiml = ( _say_es("No te entendí bien. ¿Puedes repetir?")
-                  + _gather_es("/voice/lang-or-intent")
-                  + _say_es("Pulsa 1 para español, 2 para inglés, o di: reservas, propietarios, franquiciados u oportunidades.")
-                  + "</Gather>"
-                  + '<Redirect method="POST">/voice/fallback</Redirect>' )
-        return _twiml(twiml)
+@app.get("/voice/health")
+def _voice_health():
+    return jsonify(ok=True, service="voice"), 200
 
-    @app.post("/voice/loop")
-    def _voice_loop():
-        lang = request.args.get("lang", "es")
-        if lang == "en":
-            body = ( _say_en("Main menu. Say: reservations, landlords, franchisees or opportunities. "
-                             "Or press 1 for Spanish, 2 for English.")
-                     + _gather_es("/voice/lang-or-intent")
-                     + _say_en("Please say your option or press 1 Spanish, 2 English.")
-                     + "</Gather>" )
+@app.post("/voice/answer")
+def _voice_answer():
+    twiml = (
+        _say_es("Ey, ¿qué tal? Soy de SpainRoom.")
+        + _short()
+        + _say_es("Cuéntame rápido: ¿eres propietario o inquilino, y de qué provincia?")
+        + _gather_es("/voice/handle")
+        + _say_es("Por ejemplo: Soy inquilino en Jaen y me llamo Ana.")
+        + "</Gather>"
+        + _say_es("Uff, no pillé nada, vamos de nuevo.")
+        + '<Redirect method="POST">/voice/answer</Redirect>'
+    )
+    return _twiml(twiml)
+
+@app.post("/voice/handle")
+def _voice_handle():
+    call_id = unquote_plus(request.form.get("CallSid",""))
+    mem = _IVR_MEM.setdefault(call_id, {"role":"", "zone":"", "name":""})
+
+    speech = unquote_plus(request.form.get("SpeechResult",""))
+    speech_l = speech.lower().strip()
+
+    if not mem["role"]:
+        r = _role(speech_l)
+        if r: mem["role"] = r
+    if not mem["zone"]:
+        z = _zone(speech_l)
+        if z: mem["zone"] = z
+    if not mem["name"]:
+        n = _name(speech)
+        if n: mem["name"] = n
+
+    missing = []
+    if not mem["role"]: missing.append("rol")
+    if not mem["zone"]: missing.append("provincia")
+    if not mem["name"]: missing.append("nombre")
+
+    if missing:
+        ask = missing[0]
+        if ask == "rol":
+            tw = (_say_es(f"{_ack()}. ¿Eres propietario o inquilino?")
+                  + _gather_es("/voice/handle") + _say_es("Por ejemplo: soy propietario, o soy inquilino.") + "</Gather>")
+        elif ask == "provincia":
+            tw = (_say_es(f"{_ack()}. ¿De qué provincia me llamas?")
+                  + _gather_es("/voice/handle") + _say_es("Ejemplo: Jaen, Madrid, Valencia o Sevilla.") + "</Gather>")
         else:
-            body = ( _say_es("Menú principal. Di: reservas, propietarios, franquiciados u oportunidades. "
-                             "O pulsa 1 para español, 2 para inglés.")
-                     + _gather_es("/voice/lang-or-intent")
-                     + _say_es("Por favor, di tu opción o pulsa 1 o 2.")
-                     + "</Gather>" )
-        return _twiml(body)
+            tw = (_say_es(f"{_ack()}. ¿Cómo te llamas?")
+                  + _gather_es("/voice/handle") + _say_es("Ejemplo: me llamo Ana.") + "</Gather>")
+        return _twiml(tw)
 
-    @app.post("/voice/fallback")
-    def _voice_fallback():
-        return _twiml(_say_es("Vamos a intentarlo de nuevo.") + '<Redirect method="POST">/voice/answer</Redirect>')
+    zone_h = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
+    tw = (_say_es(f"{_ack()}. Perfecto {mem['name']}. Eres {mem['role']} en {zone_h}. ¿Te paso ahora con la persona de {zone_h}?")
+          + _gather_es("/voice/confirm") + _say_es("Solo dime: si o no.") + "</Gather>")
+    return _twiml(tw)
 
-    print("[VOICE] Fallback de voz activo en /voice/* (no se encontró voice_bot)", flush=True)
+@app.post("/voice/confirm")
+def _voice_confirm():
+    call_id = unquote_plus(request.form.get("CallSid",""))
+    mem = _IVR_MEM.get(call_id, {"role":"", "zone":"", "name":""})
+    yn = _yesno(unquote_plus(request.form.get("SpeechResult","")))
+    if yn == "yes":
+        fran = _assign(mem["zone"])
+        if fran and fran.get("phone"):
+            caller = os.getenv("TWILIO_VOICE_FROM", "+12252553716")
+            return _twiml(
+                _say_es(f"Genial, un segundo…")
+                + _short()
+                + f'<Dial callerId="{caller}"><Number>{fran["phone"]}</Number></Dial>'
+            )
+        return _twiml(
+            _say_es("No ubico al responsable ahora mismo. Déjame un mensaje y te devuelven la llamada.")
+            + '<Record maxLength="120" playBeep="true" action="/voice/answer" method="POST"/>'
+        )
+    elif yn == "no":
+        return _twiml(
+            _say_es("Ok, corrijamos eso. ¿De qué provincia me llamas?")
+            + _gather_es("/voice/handle") + _say_es("Ejemplo: Jaen, Madrid, Valencia o Sevilla.") + "</Gather>"
+        )
+    else:
+        return _twiml(
+            _say_es("Perdona, ¿me confirmas con un si o un no?")
+            + _gather_es("/voice/confirm") + _say_es("¿Vamos? Solo si o no.") + "</Gather>"
+        )
 
 
 # =========================================================
