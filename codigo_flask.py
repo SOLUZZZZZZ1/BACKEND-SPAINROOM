@@ -27,19 +27,16 @@ def health():
 try:
     import defense as _defense  # tu archivo defense.py
 
-    # 1) Rate-limit opcional (solo si defense expone Limiter y get_remote_address)
     Limiter = getattr(_defense, "Limiter", None)
     get_remote_address = getattr(_defense, "get_remote_address", None)
     if Limiter and get_remote_address:
-        # Si ya tienes Limiter global, comenta estas líneas
         limiter = Limiter(
             key_func=get_remote_address,
             app=app,
-            default_limits=["200 per minute"],  # ajusta a tu gusto
+            default_limits=["200 per minute"],
         )
         print("[DEFENSE] Rate limit activo.", flush=True)
 
-    # 2) Gate de defensa (antes de cualquier endpoint)
     _looks_malicious = getattr(_defense, "_looks_malicious", None)
 
     @app.before_request
@@ -47,7 +44,7 @@ try:
         if not _looks_malicious:
             return
         try:
-            reason = _looks_malicious()  # devuelve str|None según defense.py
+            reason = _looks_malicious()
             if reason:
                 print(f"[DEFENSE] Bloqueado: {reason} {request.method} {request.path}", flush=True)
                 return ("", 403)
@@ -61,7 +58,7 @@ except Exception as e:
 
 
 # =========================================================
-#  UTILS EXISTENTES — HAVERSINE, GEOCODER, JOBS
+#  UTILS — HAVERSINE, GEOCODER, JOBS
 # =========================================================
 def calcular_distancia(lat1, lon1, lat2, lon2):
     """Distancia en km (Haversine)."""
@@ -121,12 +118,10 @@ def search_jobs():
 
 
 # =========================================================
-#  REGISTRO OPCIONAL DE TUS BLUEPRINTS (NO ROMPE SI NO ESTÁN)
-#  Mantenemos mensajes similares a tus logs anteriores
-#  (NO registramos el antiguo VOICE para evitar choque con /voice/* de abajo)
+#  REGISTRO OPCIONAL DE OTROS BLUEPRINTS (NO ROMPE SI NO ESTÁN)
+#  (NO registramos VOICE externo para no chocar con /voice/* de abajo)
 # =========================================================
 def _try_register(label: str, import_path: str, attr: str = None, url_prefix: str = None, print_ok: str = None):
-    """Registra un blueprint si existe sin romper el arranque."""
     try:
         module = __import__(import_path, fromlist=['*'])
         bp = getattr(module, attr) if attr else getattr(module, "bp", None)
@@ -146,11 +141,11 @@ def _try_register(label: str, import_path: str, attr: str = None, url_prefix: st
 _try_register("AUTH",          "auth",          "bp_auth",          "/auth",          "[AUTH] Blueprint auth registrado.")
 _try_register("OPPORTUNITIES", "opportunities", "bp_opportunities", "/opportunities", "[OPPORTUNITIES] Blueprint registrado.")
 _try_register("PAYMENTS",      "payments",      "bp_payments",      "/payments",      "[PAYMENTS] Blueprint registrado.")
-# (no registramos VOICE externo aquí para no chocar con /voice/* de abajo)
+# (no VOICE externo para evitar choque)
 
 
 # =========================================================
-#  IVR PERSONA NATURAL — /voice/*  (barge-in + cortes naturales)
+#  IVR PERSONA NATURAL — /voice/*  (barge-in + variaciones, sin “pulsa 1/2”)
 # =========================================================
 
 def _twiml(body: str) -> Response:
@@ -165,27 +160,33 @@ def _say_es(text: str) -> str:
 def _pause(sec=0.4) -> str:
     return f'<Pause length="{max(0.2, min(2.0, sec))}"/>'
 
-def _gather_es(action: str, timeout="5", end_silence="auto",
-               hints: str = "propietario, inquilino, jaen, madrid, valencia, sevilla, barcelona, malaga, granada"):
-    # bargeIn permite interrumpir mientras habla
-    return (f'<Gather input="speech" language="es-ES" timeout="{timeout}" '
-            f'speechTimeout="{end_silence}" action="{action}" method="POST" '
-            f'bargeIn="true" actionOnEmptyResult="true" hints="{hints}">')
+def _gather_es(action: str, timeout="7", end_silence="auto",
+               hints: str = (
+                   "si, sí, no, propietario, inquilino, jaen, madrid, valencia, sevilla, "
+                   "barcelona, malaga, granada, soy, me llamo, mi nombre es"
+               ),
+               allow_dtmf: bool = False):
+    gather_input = "speech dtmf" if allow_dtmf else "speech"
+    return (
+        f'<Gather input="{gather_input}" language="es-ES" timeout="{timeout}" '
+        f'speechTimeout="{end_silence}" action="{action}" method="POST" '
+        f'actionOnEmptyResult="true" hints="{hints}">'
+    )
 
 def _ack():
     return random.choice(["vale", "ok", "perfecto", "genial", "ajá", "te sigo", "sí", "de una", "dale"])
 
 def _short():
-    return _pause(0.3)
+    return _pause(0.25)
 
 # Memoria por llamada (producción: Redis/DB con TTL)
-_IVR_MEM = {}  # { CallSid: {"role":"", "zone":"", "name":""} }
+_IVR_MEM = {}  # { CallSid: {"role":"", "zone":"", "name":"", "miss": 0} }
 
 PROVS = {
     "jaen": "Jaén", "madrid": "Madrid", "valencia": "Valencia", "sevilla": "Sevilla",
     "barcelona": "Barcelona", "malaga": "Málaga", "granada": "Granada"
 }
-# Jaén con el número real que me diste (+34683634299)
+# Jaén con el número real que nos diste
 FRAN_MAP = {
     "jaen":      {"name": "Jaén",          "phone": "+34683634299"},
     "madrid":    {"name": "Madrid Centro", "phone": "+34600000001"},
@@ -209,23 +210,28 @@ def _role(s: str) -> str:
     s = (s or "").lower()
     if "propiet" in s or "dueñ" in s: return "propietario"
     if "inquil"  in s or "alquil" in s: return "inquilino"
+    # frases comunes
+    if "busco" in s or "habitacion" in s or "habitación" in s: return "inquilino"
+    if "alquilar" in s and "habitacion" in s: return "inquilino"
     return ""
 
 def _zone(s: str) -> str:
     s = (s or "").lower().strip()
-    # normalización acentos (sin coma al final)
     s = (
-        s.replace("á", "a")
-         .replace("é", "e")
-         .replace("í", "i")
-         .replace("ó", "o")
-         .replace("ú", "u")
+        s.replace("á","a")
+         .replace("é","e")
+         .replace("í","i")
+         .replace("ó","o")
+         .replace("ú","u")
     )
+    aliases = {"barna": "barcelona", "md": "madrid", "vlc": "valencia", "sevill": "sevilla"}
+    for k, v in aliases.items():
+        if k in s:
+            s = v
     for key in PROVS.keys():
         if key in s or s == key:
             return key
     return ""
-
 
 def _name(s: str) -> str:
     s = (s or "").strip()
@@ -244,27 +250,37 @@ def _assign(zone_key: str):
 def _voice_health():
     return jsonify(ok=True, service="voice"), 200
 
+# Entrada natural con barge-in en las locuciones dentro del Gather
 @app.post("/voice/answer")
 def _voice_answer():
     twiml = (
-        _say_es("Ey, ¿qué tal? Soy de SpainRoom.")
-        + _short()
-        + _say_es("Cuéntame rápido: ¿eres propietario o inquilino, y de qué provincia?")
+        '<Response>'
         + _gather_es("/voice/handle")
-        + _say_es("Por ejemplo: Soy inquilino en Jaen y me llamo Ana.")
-        + "</Gather>"
-        + _say_es("Uff, no pillé nada, vamos de nuevo.")
+        + '<Say language="es-ES" voice="alice" bargeIn="true">'
+          'Ey, ¿qué tal? Soy de SpainRoom.'
+          '</Say>'
+        + _short()
+        + '<Say language="es-ES" voice="alice" bargeIn="true">'
+          'Cuéntame en una frase: ¿eres propietario o inquilino, y de qué provincia?'
+          '</Say>'
+        + _short()
+        + '<Say language="es-ES" voice="alice" bargeIn="true">'
+          'Por ejemplo: soy inquilino en Jaen y me llamo Ana.'
+          '</Say>'
+        + '</Gather>'
+        + _say_es('No te pillé. Vamos de nuevo.')
         + '<Redirect method="POST">/voice/answer</Redirect>'
+        + '</Response>'
     )
     return _twiml(twiml)
 
 @app.post("/voice/handle")
 def _voice_handle():
     call_id = unquote_plus(request.form.get("CallSid",""))
-    mem = _IVR_MEM.setdefault(call_id, {"role":"", "zone":"", "name":""})
+    mem = _IVR_MEM.setdefault(call_id, {"role":"", "zone":"", "name":"", "miss": 0})
 
     speech = unquote_plus(request.form.get("SpeechResult",""))
-    speech_l = speech.lower().strip()
+    speech_l = (speech or "").lower().strip()
 
     if not mem["role"]:
         r = _role(speech_l)
@@ -279,54 +295,103 @@ def _voice_handle():
     missing = []
     if not mem["role"]: missing.append("rol")
     if not mem["zone"]: missing.append("provincia")
-    if not mem["name"]: missing.append("nombre")
 
     if missing:
+        mem["miss"] = mem.get("miss", 0) + 1
         ask = missing[0]
         if ask == "rol":
-            tw = (_say_es(f"{_ack()}. ¿Eres propietario o inquilino?")
-                  + _gather_es("/voice/handle") + _say_es("Por ejemplo: soy propietario, o soy inquilino.") + "</Gather>")
-        elif ask == "provincia":
-            tw = (_say_es(f"{_ack()}. ¿De qué provincia me llamas?")
-                  + _gather_es("/voice/handle") + _say_es("Ejemplo: Jaen, Madrid, Valencia o Sevilla.") + "</Gather>")
+            tw = (
+                '<Response>'
+                + _gather_es("/voice/handle")
+                + f'<Say language="es-ES" voice="alice" bargeIn="true">{_ack()}. ¿Eres propietario o inquilino?</Say>'
+                + '</Gather>'
+                + '</Response>'
+            )
+            if mem["miss"] >= 2:
+                tw = (
+                    '<Response>'
+                    + _gather_es("/voice/handle")
+                    + '<Say language="es-ES" voice="alice" bargeIn="true">Dime solo “propietario” o “inquilino”.</Say>'
+                    + '</Gather>'
+                    + '</Response>'
+                )
         else:
-            tw = (_say_es(f"{_ack()}. ¿Cómo te llamas?")
-                  + _gather_es("/voice/handle") + _say_es("Ejemplo: me llamo Ana.") + "</Gather>")
+            tw = (
+                '<Response>'
+                + _gather_es("/voice/handle")
+                + f'<Say language="es-ES" voice="alice" bargeIn="true">{_ack()}. ¿De qué provincia me llamas?</Say>'
+                + '</Gather>'
+                + '</Response>'
+            )
+            if mem["miss"] >= 2:
+                tw = (
+                    '<Response>'
+                    + _gather_es("/voice/handle")
+                    + '<Say language="es-ES" voice="alice" bargeIn="true">Dime solo la provincia, por ejemplo: Jaen o Madrid.</Say>'
+                    + '</Gather>'
+                    + '</Response>'
+                )
         return _twiml(tw)
 
     zone_h = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
-    tw = (_say_es(f"{_ack()}. Perfecto {mem['name']}. Eres {mem['role']} en {zone_h}. ¿Te paso ahora con la persona de {zone_h}?")
-          + _gather_es("/voice/confirm") + _say_es("Solo dime: si o no.") + "</Gather>")
+    mem["miss"] = 0
+    tw = (
+        '<Response>'
+        + _gather_es("/voice/confirm", allow_dtmf=True)
+        + f'<Say language="es-ES" voice="alice" bargeIn="true">{_ack()}. '
+          f'Perfecto{(" " + mem["name"]) if mem["name"] else ""}. Eres {mem["role"]} en {zone_h}. '
+          '¿Te paso con la persona de tu zona?'
+          '</Say>'
+        + '</Gather>'
+        + '</Response>'
+    )
     return _twiml(tw)
 
 @app.post("/voice/confirm")
 def _voice_confirm():
     call_id = unquote_plus(request.form.get("CallSid",""))
-    mem = _IVR_MEM.get(call_id, {"role":"", "zone":"", "name":""})
+    mem = _IVR_MEM.get(call_id, {"role":"", "zone":"", "name":"", "miss": 0})
+
     yn = _yesno(unquote_plus(request.form.get("SpeechResult","")))
+    d = (request.form.get("Digits") or "").strip()
+    if d == "1": yn = "yes"
+    if d == "2": yn = "no"
+
     if yn == "yes":
         fran = _assign(mem["zone"])
         if fran and fran.get("phone"):
             caller = os.getenv("TWILIO_VOICE_FROM", "+12252553716")
             return _twiml(
-                _say_es(f"Genial, un segundo…")
+                '<Response>'
+                + '<Say language="es-ES" voice="alice" bargeIn="true">Genial, un segundo…</Say>'
                 + _short()
                 + f'<Dial callerId="{caller}"><Number>{fran["phone"]}</Number></Dial>'
+                + '</Response>'
             )
         return _twiml(
-            _say_es("No ubico al responsable ahora mismo. Déjame un mensaje y te devuelven la llamada.")
+            '<Response>'
+            + '<Say language="es-ES" voice="alice" bargeIn="true">No ubico al responsable ahora. Deja un mensaje y te devuelven la llamada.</Say>'
             + '<Record maxLength="120" playBeep="true" action="/voice/answer" method="POST"/>'
+            + '</Response>'
         )
-    elif yn == "no":
+
+    if yn == "no":
         return _twiml(
-            _say_es("Ok, corrijamos eso. ¿De qué provincia me llamas?")
-            + _gather_es("/voice/handle") + _say_es("Ejemplo: Jaen, Madrid, Valencia o Sevilla.") + "</Gather>"
+            '<Response>'
+            + _gather_es("/voice/handle")
+            + '<Say language="es-ES" voice="alice" bargeIn="true">Vale, dime solo la provincia y seguimos.</Say>'
+            + '</Gather>'
+            + '</Response>'
         )
-    else:
-        return _twiml(
-            _say_es("Perdona, ¿me confirmas con un si o un no?")
-            + _gather_es("/voice/confirm") + _say_es("¿Vamos? Solo si o no.") + "</Gather>"
-        )
+
+    # no entendido → repregunta muy corta
+    return _twiml(
+        '<Response>'
+        + _gather_es("/voice/confirm", allow_dtmf=True)
+        + '<Say language="es-ES" voice="alice" bargeIn="true">¿Sí o no? (También 1 o 2.)</Say>'
+        + '</Gather>'
+        + '</Response>'
+    )
 
 
 # =========================================================
