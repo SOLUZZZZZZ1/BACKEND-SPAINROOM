@@ -22,7 +22,6 @@ def health():
 
 # =========================================================
 #  DEFENSE: cortafuegos ligero y rate-limit (si está disponible)
-#  * No rompe si falta defense.py o si ya tienes Limiter en otro módulo
 # =========================================================
 try:
     import defense as _defense  # tu archivo defense.py
@@ -145,8 +144,10 @@ _try_register("PAYMENTS",      "payments",      "bp_payments",      "/payments",
 
 
 # =========================================================
-#  IVR PERSONA NATURAL — /voice/*  (barge-in + variaciones, sin “pulsa 1/2”)
+#  IVR PERSONA NATURAL — /voice/*  (voz neural + SSML + barge-in)
 # =========================================================
+
+TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Lucia")  # alternativas: Polly.Conchita, Polly.Enrique
 
 def _twiml(body: str) -> Response:
     body = body.strip()
@@ -154,30 +155,43 @@ def _twiml(body: str) -> Response:
         body = f"<Response>{body}</Response>"
     return Response(body, mimetype="text/xml")
 
-def _say_es(text: str) -> str:
-    return f'<Say language="es-ES" voice="alice">{text}</Say>'
+def _say_es_ssml(text: str) -> str:
+    """
+    Voz neural con SSML (estilo conversacional) — suena mucho más natural.
+    """
+    ssml = (
+        '<speak>'
+        ' <amazon:domain name="conversational">'
+        '  <prosody rate="medium" pitch="+2%">'
+        f'   {text}'
+        '  </prosody>'
+        ' </amazon:domain>'
+        '</speak>'
+    )
+    return f'<Say language="es-ES" voice="{TTS_VOICE}">{ssml}</Say>'
 
-def _pause(sec=0.4) -> str:
+def _line(*opciones: str) -> str:
+    return random.choice(opciones)
+
+def _pause(sec=0.3) -> str:
     return f'<Pause length="{max(0.2, min(2.0, sec))}"/>'
 
-def _gather_es(action: str, timeout="7", end_silence="auto",
-               hints: str = (
-                   "si, sí, no, propietario, inquilino, jaen, madrid, valencia, sevilla, "
-                   "barcelona, malaga, granada, soy, me llamo, mi nombre es"
-               ),
-               allow_dtmf: bool = False):
+def _gather_es(action: str,
+               timeout="8",
+               end_silence="auto",
+               hints=("sí, si, no, propietario, inquilino, jaen, madrid, valencia, sevilla, "
+                      "barcelona, malaga, granada, soy, me llamo, mi nombre es"),
+               allow_dtmf: bool=False) -> str:
     gather_input = "speech dtmf" if allow_dtmf else "speech"
     return (
         f'<Gather input="{gather_input}" language="es-ES" timeout="{timeout}" '
-        f'speechTimeout="{end_silence}" action="{action}" method="POST" '
-        f'actionOnEmptyResult="true" hints="{hints}">'
+        f'speechTimeout="{end_silence}" speechModel="phone_call" '
+        f'action="{action}" method="POST" actionOnEmptyResult="true" hints="{hints}">'
     )
 
 def _ack():
     return random.choice(["vale", "ok", "perfecto", "genial", "ajá", "te sigo", "sí", "de una", "dale"])
 
-def _short():
-    return _pause(0.25)
 
 # Memoria por llamada (producción: Redis/DB con TTL)
 _IVR_MEM = {}  # { CallSid: {"role":"", "zone":"", "name":"", "miss": 0} }
@@ -186,7 +200,7 @@ PROVS = {
     "jaen": "Jaén", "madrid": "Madrid", "valencia": "Valencia", "sevilla": "Sevilla",
     "barcelona": "Barcelona", "malaga": "Málaga", "granada": "Granada"
 }
-# Jaén con el número real que nos diste
+# Jaén con el número real
 FRAN_MAP = {
     "jaen":      {"name": "Jaén",          "phone": "+34683634299"},
     "madrid":    {"name": "Madrid Centro", "phone": "+34600000001"},
@@ -210,7 +224,6 @@ def _role(s: str) -> str:
     s = (s or "").lower()
     if "propiet" in s or "dueñ" in s: return "propietario"
     if "inquil"  in s or "alquil" in s: return "inquilino"
-    # frases comunes
     if "busco" in s or "habitacion" in s or "habitación" in s: return "inquilino"
     if "alquilar" in s and "habitacion" in s: return "inquilino"
     return ""
@@ -253,26 +266,18 @@ def _voice_health():
 # Entrada natural con barge-in en las locuciones dentro del Gather
 @app.post("/voice/answer")
 def _voice_answer():
-    twiml = (
+    tw = (
         '<Response>'
         + _gather_es("/voice/handle")
-        + '<Say language="es-ES" voice="alice" bargeIn="true">'
-          'Ey, ¿qué tal? Soy de SpainRoom.'
-          '</Say>'
-        + _short()
-        + '<Say language="es-ES" voice="alice" bargeIn="true">'
-          'Cuéntame en una frase: ¿eres propietario o inquilino, y de qué provincia?'
-          '</Say>'
-        + _short()
-        + '<Say language="es-ES" voice="alice" bargeIn="true">'
-          'Por ejemplo: soy inquilino en Jaen y me llamo Ana.'
-          '</Say>'
+        + _say_es_ssml(_line("Hola, ¿cómo vas? Soy de SpainRoom.",
+                             "¡Ey! Soy de SpainRoom, cuéntame."))
+        + _say_es_ssml("Dime en una frase: ¿eres propietario o inquilino, y de qué provincia?")
         + '</Gather>'
-        + _say_es('No te pillé. Vamos de nuevo.')
+        + _say_es_ssml("No te pillé, vamos otra vez.")
         + '<Redirect method="POST">/voice/answer</Redirect>'
         + '</Response>'
     )
-    return _twiml(twiml)
+    return _twiml(tw)
 
 @app.post("/voice/handle")
 def _voice_handle():
@@ -280,13 +285,13 @@ def _voice_handle():
     mem = _IVR_MEM.setdefault(call_id, {"role":"", "zone":"", "name":"", "miss": 0})
 
     speech = unquote_plus(request.form.get("SpeechResult",""))
-    speech_l = (speech or "").lower().strip()
+    s = (speech or "").lower().strip()
 
     if not mem["role"]:
-        r = _role(speech_l)
+        r = _role(s)
         if r: mem["role"] = r
     if not mem["zone"]:
-        z = _zone(speech_l)
+        z = _zone(s)
         if z: mem["zone"] = z
     if not mem["name"]:
         n = _name(speech)
@@ -297,40 +302,26 @@ def _voice_handle():
     if not mem["zone"]: missing.append("provincia")
 
     if missing:
-        mem["miss"] = mem.get("miss", 0) + 1
+        mem["miss"] += 1
         ask = missing[0]
         if ask == "rol":
             tw = (
                 '<Response>'
                 + _gather_es("/voice/handle")
-                + f'<Say language="es-ES" voice="alice" bargeIn="true">{_ack()}. ¿Eres propietario o inquilino?</Say>'
+                + _say_es_ssml(_line("¿Eres propietario o inquilino?",
+                                     "Vale, ¿propietario o inquilino?"))
                 + '</Gather>'
                 + '</Response>'
             )
-            if mem["miss"] >= 2:
-                tw = (
-                    '<Response>'
-                    + _gather_es("/voice/handle")
-                    + '<Say language="es-ES" voice="alice" bargeIn="true">Dime solo “propietario” o “inquilino”.</Say>'
-                    + '</Gather>'
-                    + '</Response>'
-                )
         else:
             tw = (
                 '<Response>'
                 + _gather_es("/voice/handle")
-                + f'<Say language="es-ES" voice="alice" bargeIn="true">{_ack()}. ¿De qué provincia me llamas?</Say>'
+                + _say_es_ssml(_line("¿De qué provincia me llamas?",
+                                     "Dime solo la provincia, porfa."))
                 + '</Gather>'
                 + '</Response>'
             )
-            if mem["miss"] >= 2:
-                tw = (
-                    '<Response>'
-                    + _gather_es("/voice/handle")
-                    + '<Say language="es-ES" voice="alice" bargeIn="true">Dime solo la provincia, por ejemplo: Jaen o Madrid.</Say>'
-                    + '</Gather>'
-                    + '</Response>'
-                )
         return _twiml(tw)
 
     zone_h = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
@@ -338,10 +329,11 @@ def _voice_handle():
     tw = (
         '<Response>'
         + _gather_es("/voice/confirm", allow_dtmf=True)
-        + f'<Say language="es-ES" voice="alice" bargeIn="true">{_ack()}. '
-          f'Perfecto{(" " + mem["name"]) if mem["name"] else ""}. Eres {mem["role"]} en {zone_h}. '
-          '¿Te paso con la persona de tu zona?'
-          '</Say>'
+        + _say_es_ssml(_line(
+            f"{_line('Genial','Perfecto','Vale')}. {mem['name'] + ', ' if mem['name'] else ''}"
+            f"{'propietario' if mem['role']=='propietario' else 'inquilino'} en {zone_h}. "
+            "¿Te paso con la persona de tu zona?",
+            f"{mem['name'] + ', ' if mem['name'] else ''}¿te va bien que te pase ya con {zone_h}?"))
         + '</Gather>'
         + '</Response>'
     )
@@ -353,7 +345,7 @@ def _voice_confirm():
     mem = _IVR_MEM.get(call_id, {"role":"", "zone":"", "name":"", "miss": 0})
 
     yn = _yesno(unquote_plus(request.form.get("SpeechResult","")))
-    d = (request.form.get("Digits") or "").strip()
+    d  = (request.form.get("Digits") or "").strip()
     if d == "1": yn = "yes"
     if d == "2": yn = "no"
 
@@ -363,14 +355,14 @@ def _voice_confirm():
             caller = os.getenv("TWILIO_VOICE_FROM", "+12252553716")
             return _twiml(
                 '<Response>'
-                + '<Say language="es-ES" voice="alice" bargeIn="true">Genial, un segundo…</Say>'
-                + _short()
+                + _say_es_ssml("Genial, un segundo…")
+                + _pause(0.25)
                 + f'<Dial callerId="{caller}"><Number>{fran["phone"]}</Number></Dial>'
                 + '</Response>'
             )
         return _twiml(
             '<Response>'
-            + '<Say language="es-ES" voice="alice" bargeIn="true">No ubico al responsable ahora. Deja un mensaje y te devuelven la llamada.</Say>'
+            + _say_es_ssml("No ubico al responsable ahora mismo. Te dejo buzón.")
             + '<Record maxLength="120" playBeep="true" action="/voice/answer" method="POST"/>'
             + '</Response>'
         )
@@ -379,16 +371,16 @@ def _voice_confirm():
         return _twiml(
             '<Response>'
             + _gather_es("/voice/handle")
-            + '<Say language="es-ES" voice="alice" bargeIn="true">Vale, dime solo la provincia y seguimos.</Say>'
+            + _say_es_ssml("Vale, dime de qué provincia y lo ajusto.")
             + '</Gather>'
             + '</Response>'
         )
 
-    # no entendido → repregunta muy corta
+    # No entendido → repregunta brevísima (voz o DTMF opcional)
     return _twiml(
         '<Response>'
         + _gather_es("/voice/confirm", allow_dtmf=True)
-        + '<Say language="es-ES" voice="alice" bargeIn="true">¿Sí o no? (También 1 o 2.)</Say>'
+        + _say_es_ssml("¿sí o no?")
         + '</Gather>'
         + '</Response>'
     )
