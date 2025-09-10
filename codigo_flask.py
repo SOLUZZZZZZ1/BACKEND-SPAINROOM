@@ -1,7 +1,7 @@
 # codigo_flask.py
 # SpainRoom · Backend principal (Render: gunicorn codigo_flask:app)
 # - Defensa (WAF ligero) embebida y ACTIVA (no inspecciona /voice, /health, /__routes)
-# - IVR voz natural /voice/* (Polly + SSML + barge-in), rutas GET/POST blindadas
+# - IVR voz natural /voice/* (Polly.Conchita + SSML compatible + barge-in), rutas GET/POST blindadas
 # - Root y fallback siempre devuelven TwiML (adiós “goodbye”)
 # - Geocoder / Jobs (mock con Haversine)
 
@@ -140,7 +140,6 @@ def _secure_headers(resp):
     resp.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
     return resp
 
-# Health de defensa (para comprobar activación)
 @app.get("/defense/health")
 def defense_health():
     return jsonify(ok=True, defense="registered", skips=list(DEF_CFG["SKIP_PREFIXES"])), 200
@@ -193,10 +192,10 @@ def search_jobs():
     return jsonify(res)
 
 # =========================================================
-#  IVR PERSONA NATURAL /voice/*  (Polly + SSML + barge-in, GET/POST blindado)
+#  IVR PERSONA NATURAL /voice/*  (Polly.Conchita + SSML compatible, GET/POST blindado)
 # =========================================================
 VOICE_PREFIX = "/voice"
-TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Lucia")
+TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Conchita")  # voz soportada por Twilio
 TWILIO_CALLER = os.getenv("TWILIO_VOICE_FROM", "+12252553716")
 
 def _twiml(body: str) -> Response:
@@ -205,16 +204,8 @@ def _twiml(body: str) -> Response:
     return Response(body, mimetype="text/xml")
 
 def _say_es_ssml(text: str) -> str:
-    ssml = (
-        '<speak>'
-        ' <amazon:domain name="conversational">'
-        '  <prosody rate="medium" pitch="+2%">'
-        f'   {text}'
-        '  </prosody>'
-        ' </amazon:domain>'
-        '</speak>'
-    )
-    return f'<Say language="es-ES" voice="{TTS_VOICE}">{ssml}</Say>'
+    # SSML compatible (sin amazon:domain)
+    return f'<Say language="es-ES" voice="{TTS_VOICE}"><prosody rate="medium" pitch="+2%">{text}</prosody></Say>'
 
 def _line(*opts): return random.choice(opts)
 def _pause(sec=0.3): return f'<Pause length="{max(0.2, min(2.0, sec))}"/>'
@@ -224,8 +215,9 @@ def _gather_es(action: str, timeout="8", end_silence="auto",
                       "barcelona, malaga, granada, soy, me llamo, mi nombre es"),
                allow_dtmf: bool=False) -> str:
     gather_input = "speech dtmf" if allow_dtmf else "speech"
+    # bargeIn en <Gather> (no en <Say>)
     return (f'<Gather input="{gather_input}" language="es-ES" timeout="{timeout}" '
-            f'speechTimeout="{end_silence}" speechModel="phone_call" '
+            f'speechTimeout="{end_silence}" speechModel="phone_call" bargeIn="true" '
             f'action="{action}" method="POST" actionOnEmptyResult="true" hints="{hints}">')
 
 def _ack(): return _line("vale","ok","perfecto","genial","ajá","te sigo","sí","de una","dale")
@@ -330,9 +322,9 @@ def voice_handle():
 
     zone_h = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
     role_label = "propietario" if mem["role"] == "propietario" else "inquilino"
-    name_part = (mem["name"] + ", ") if mem["name"] else ""
-    confirm_1 = f"{_line('Genial','Perfecto','Vale')}. {name_part}{role_label} en {zone_h}. ¿Te paso con la persona de tu zona?"
-    confirm_2 = f"{name_part}¿te va bien que te pase ya con {zone_h}?"
+    name_part  = (mem["name"] + ", ") if mem["name"] else ""
+    confirm_1  = f"{_line('Genial','Perfecto','Vale')}. {name_part}{role_label} en {zone_h}. ¿Te paso con la persona de tu zona?"
+    confirm_2  = f"{name_part}¿te va bien que te pase ya con {zone_h}?"
     confirm_text = _line(confirm_1, confirm_2)
 
     tw = ("<Response>" + _gather_es("/voice/confirm", allow_dtmf=True)
@@ -357,7 +349,7 @@ def voice_confirm():
     if yn == "yes":
         fran = _assign(mem["zone"])
         if fran and fran.get("phone"):
-            return _twiml("<Response>"+_say_es_ssml("Genial, un segundo…")+_pause(0.25)
+            return _twiml("<Response>"+_say_es_ssml("Genial, un segundo…")+_pause(0.3)
                           + f'<Dial callerId="{TWILIO_CALLER}"><Number>{fran["phone"]}</Number></Dial>'
                           + "</Response>")
         return _twiml("<Response>"+_say_es_ssml("No ubico al responsable ahora mismo. Te dejo buzón.")
