@@ -205,7 +205,8 @@ def _voice_health():
     return jsonify(ok=True, service="voice"), 200
 
 
-@app.post(f"{VOICE_PREFIX}/answer")
+# === BLINDADO: acepta GET y POST (por si Twilio llega en GET)
+@app.route(f"{VOICE_PREFIX}/answer", methods=["GET", "POST"])
 def _voice_answer():
     tw = (
         "<Response>"
@@ -221,8 +222,13 @@ def _voice_answer():
     return _twiml(tw)
 
 
-@app.post(f"{VOICE_PREFIX}/handle")
+@app.route(f"{VOICE_PREFIX}/handle", methods=["GET", "POST"])
 def _voice_handle():
+    if request.method == "GET":
+        # Si Twilio pegó en GET por error, devuelve TwiML y re-entra por POST
+        return _twiml(_say_es_ssml("Te escucho…") +
+                      f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>')
+
     call_id = unquote_plus(request.form.get("CallSid", ""))
     mem = _IVR_MEM.setdefault(call_id, {"role": "", "zone": "", "name": "", "miss": 0})
 
@@ -282,8 +288,18 @@ def _voice_handle():
     return _twiml(tw)
 
 
-@app.post(f"{VOICE_PREFIX}/confirm")
+@app.route(f"{VOICE_PREFIX}/confirm", methods=["GET", "POST"])
 def _voice_confirm():
+    if request.method == "GET":
+        # Repregunta muy breve para GETs accidentales
+        return _twiml(
+            "<Response>"
+            + _gather_es(f"{VOICE_PREFIX}/confirm", allow_dtmf=True)
+            + _say_es_ssml("¿sí o no?")
+            + "</Gather>"
+            + "</Response>"
+        )
+
     call_id = unquote_plus(request.form.get("CallSid", ""))
     mem = _IVR_MEM.get(call_id, {"role": "", "zone": "", "name": "", "miss": 0})
 
@@ -312,7 +328,7 @@ def _voice_confirm():
     if yn == "no":
         return _twiml(
             "<Response>"
-            + _gather_es(f"{VOICE_PREFIX}/handle")
+            + _gather_es(f"{VOICE_PREFIX}/handle}")
             + _say_es_ssml("Vale, dime de qué provincia y lo ajusto.")
             + "</Gather>"
             + "</Response>"
@@ -339,7 +355,7 @@ def _root_safe():
                       f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>')
     return ("", 404)
 
-@app.post(f"{VOICE_PREFIX}/fallback")
+@app.route(f"{VOICE_PREFIX}/fallback", methods=["GET", "POST"])
 def _voice_fallback():
     return _twiml(_say_es_ssml("Uff, un segundo…") +
                   f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>')
