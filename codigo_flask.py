@@ -280,27 +280,27 @@ def _name(s: str) -> str:
 def _assign(zone_key: str):
     return FRAN_MAP.get(zone_key or "", {"name":"Central SpainRoom","phone":None})
 
-@app.route(f"{VOICE_PREFIX}/health", methods=["GET"])
-def voice_health(): 
+@app.route("/voice/health", methods=["GET"])
+def voice_health():
     return jsonify(ok=True, service="voice"), 200
 
 # ACEPTA GET y POST (blindado)
-@app.route(f"{VOICE_PREFIX}/answer", methods=["GET","POST"])
+@app.route("/voice/answer", methods=["GET","POST"])
 def voice_answer():
     tw = ("<Response>"
-          + _gather_es(f"{VOICE_PREFIX}/handle}")
+          + _gather_es("/voice/handle")
           + _say_es_ssml(_line("Hola, ¿cómo vas? Soy de SpainRoom.","¡Ey! Soy de SpainRoom, cuéntame."))
           + _say_es_ssml("Dime en una frase: ¿eres propietario o inquilino, y de qué provincia?")
           + "</Gather>"
           + _say_es_ssml("No te pillé, vamos otra vez.")
-          + f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>'
+          + '<Redirect method="POST">/voice/answer</Redirect>'
           + "</Response>")
     return _twiml(tw)
 
-@app.route(f"{VOICE_PREFIX}/handle", methods=["GET","POST"])
+@app.route("/voice/handle", methods=["GET","POST"])
 def voice_handle():
     if request.method == "GET":
-        return _twiml(_say_es_ssml("Te escucho…") + f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>')
+        return _twiml(_say_es_ssml("Te escucho…") + '<Redirect method="POST">/voice/answer</Redirect>')
     call_id = unquote_plus(request.form.get("CallSid",""))
     mem = _IVR_MEM.setdefault(call_id, {"role":"", "zone":"", "name":"", "miss":0})
     speech = unquote_plus(request.form.get("SpeechResult","")); s = (speech or "").lower().strip()
@@ -319,11 +319,11 @@ def voice_handle():
     if missing:
         mem["miss"] += 1; ask = missing[0]
         if ask == "rol":
-            tw = ("<Response>" + _gather_es(f"{VOICE_PREFIX}/handle")
+            tw = ("<Response>" + _gather_es("/voice/handle")
                   + _say_es_ssml(_line("¿Eres propietario o inquilino?","Vale, ¿propietario o inquilino?"))
                   + "</Gather></Response>")
         else:
-            tw = ("<Response>" + _gather_es(f"{VOICE_PREFIX}/handle")
+            tw = ("<Response>" + _gather_es("/voice/handle")
                   + _say_es_ssml(_line("¿De qué provincia me llamas?","Dime solo la provincia, porfa."))
                   + "</Gather></Response>")
         return _twiml(tw)
@@ -335,15 +335,15 @@ def voice_handle():
     confirm_2 = f"{name_part}¿te va bien que te pase ya con {zone_h}?"
     confirm_text = _line(confirm_1, confirm_2)
 
-    tw = ("<Response>" + _gather_es(f"{VOICE_PREFIX}/confirm", allow_dtmf=True)
+    tw = ("<Response>" + _gather_es("/voice/confirm", allow_dtmf=True)
           + _say_es_ssml(confirm_text)
           + "</Gather></Response>")
     return _twiml(tw)
 
-@app.route(f"{VOICE_PREFIX}/confirm", methods=["GET","POST"])
+@app.route("/voice/confirm", methods=["GET","POST"])
 def voice_confirm():
     if request.method == "GET":
-        return _twiml("<Response>"+_gather_es(f"{VOICE_PREFIX}/confirm", allow_dtmf=True)
+        return _twiml("<Response>"+_gather_es("/voice/confirm", allow_dtmf=True)
                       + _say_es_ssml("¿sí o no?") + "</Gather></Response>")
 
     call_id = unquote_plus(request.form.get("CallSid",""))
@@ -361,14 +361,14 @@ def voice_confirm():
                           + f'<Dial callerId="{TWILIO_CALLER}"><Number>{fran["phone"]}</Number></Dial>'
                           + "</Response>")
         return _twiml("<Response>"+_say_es_ssml("No ubico al responsable ahora mismo. Te dejo buzón.")
-                      + f'<Record maxLength="120" playBeep="true" action="{VOICE_PREFIX}/answer" method="POST"/>'
+                      + '<Record maxLength="120" playBeep="true" action="/voice/answer" method="POST"/>'
                       + "</Response>")
 
     if yn == "no":
-        return _twiml("<Response>"+_gather_es(f"{VOICE_PREFIX}/handle")
+        return _twiml("<Response>"+_gather_es("/voice/handle")
                       + _say_es_ssml("Vale, dime de qué provincia y lo ajusto.") + "</Gather></Response>")
 
-    return _twiml("<Response>"+_gather_es(f"{VOICE_PREFIX}/confirm", allow_dtmf=True)
+    return _twiml("<Response>"+_gather_es("/voice/confirm", allow_dtmf=True)
                   + _say_es_ssml("¿sí o no?") + "</Gather></Response>")
 
 # Root y fallback siempre con TwiML válido (nunca 404 para Twilio)
@@ -376,13 +376,13 @@ def voice_confirm():
 def root_safe():
     if request.method == "POST":
         return _twiml(_say_es_ssml("Hola, te atiendo ahora mismo.")
-                      + f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>')
+                      + '<Redirect method="POST">/voice/answer</Redirect>')
     return ("", 404)
 
-@app.route(f"{VOICE_PREFIX}/fallback", methods=["GET","POST"])
+@app.route("/voice/fallback", methods=["GET","POST"])
 def voice_fallback():
     return _twiml(_say_es_ssml("Uff, un segundo…")
-                  + f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>')
+                  + '<Redirect method="POST">/voice/answer</Redirect>')
 
 # Diagnóstico de rutas
 @app.get("/__routes")
