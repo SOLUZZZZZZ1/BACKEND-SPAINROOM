@@ -1,9 +1,11 @@
 # codigo_flask.py
 # SpainRoom · Backend principal (Render: gunicorn codigo_flask:app)
 # - Defensa (WAF ligero) embebida y ACTIVA (no inspecciona /voice, /health, /__routes)
-# - IVR voz natural /voice/* (Polly.Conchita + SSML compatible + barge-in), rutas GET/POST blindadas
-# - SIEMPRE RECADO: graba mensaje, crea Tarea y avisa por SMS (sin transferir)
-# - Endpoints: /tasks/list (GET) para pendientes; geocoder/jobs de ejemplo
+# - IVR /voice/*: formulario conversacional PASO A PASO (rol→población→nombre→teléfono→nota)
+# - Un solo <Say> por turno (sin micro-cortes), barge-in y timeout generoso
+# - Tarea pendiente con resumen + transcripción; SMS a franquiciados (multi-destino)
+# - Endpoints: /tasks/list (ver pendientes), /voice/* flujo completo
+# - Geocoder/Jobs de ejemplo
 
 from flask import Flask, request, jsonify, Response
 import requests, json, os, re, random
@@ -147,7 +149,6 @@ def defense_health():
 def health():
     return jsonify(ok=True, service="BACKEND-SPAINROOM"), 200
 
-# Geocoder / Jobs — demo
 def calcular_distancia(lat1, lon1, lat2, lon2):
     R = 6371
     dlat = radians(lat2 - lat1); dlon = radians(lon2 - lon1)
@@ -206,6 +207,7 @@ try:
             phone    = db.Column(db.String(32))
             assignees= db.Column(db.String(256))  # CSV de phones
             recording= db.Column(db.String(512))
+            transcript = db.Column(db.Text)       # NUEVO: transcript unido
             status   = db.Column(db.String(32), default="pending")
             created_at = db.Column(db.DateTime, default=datetime.utcnow)
         with app.app_context():
@@ -213,20 +215,22 @@ try:
 except Exception as e:
     _jlog("db_init_skip", error=str(e))
 
-def _save_task(call_sid, role, zone, name, phone, assignees, recording_url):
+def _save_task(call_sid, role, zone, name, phone, assignees, recording_url, transcript_text):
     task = {
         "created_at": datetime.utcnow().isoformat()+"Z",
         "call_sid": call_sid, "role": role, "zone": zone, "name": name,
         "phone": phone, "assignees": assignees, "recording": recording_url,
-        "status": "pending"
+        "transcript": transcript_text, "status": "pending"
     }
     if db:
         try:
             t = Task(call_sid=call_sid, role=role, zone=zone, name=name,
-                     phone=phone, assignees=",".join(assignees), recording=recording_url)
+                     phone=phone, assignees=",".join(assignees),
+                     recording=recording_url, transcript=transcript_text)
             db.session.add(t); db.session.commit(); return
         except Exception as e:
             _jlog("task_db_fail", error=str(e))
+    # fallback JSONL
     try:
         with open(TASKS_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(task, ensure_ascii=False)+"\n")
@@ -244,8 +248,8 @@ def tasks_list():
                     "id": t.id, "call_sid": t.call_sid, "role": t.role, "zone": t.zone,
                     "name": t.name, "phone": t.phone,
                     "assignees": t.assignees.split(",") if t.assignees else [],
-                    "recording": t.recording, "status": t.status,
-                    "created_at": t.created_at.isoformat()+"Z"
+                    "recording": t.recording, "transcript": t.transcript,
+                    "status": t.status, "created_at": t.created_at.isoformat()+"Z"
                 })
         except Exception as e:
             _jlog("task_list_db_fail", error=str(e))
@@ -272,7 +276,7 @@ def _send_sms(to_e164: str, body: str):
         _jlog("sms_fail", error=str(e), to=to_e164)
 
 # =========================================================
-#  VOZ — SIEMPRE RECADO (sin transferir). Más natural (un solo <Say> por turno)
+#  VOZ — FORMULARIO CONVERSACIONAL (rol→población→nombre→teléfono→nota)
 # =========================================================
 VOICE_PREFIX = "/voice"
 TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Conchita")
@@ -284,23 +288,28 @@ def _twiml(body: str) -> Response:
     return Response(body, mimetype="text/xml")
 
 def _say_es_ssml(text: str) -> str:
-    # Un único <Say> con <prosody>: suena continuo, sin micro-cortes
+    # Un único <Say> con <prosody> (sin cortes)
     return f'<Say language="es-ES" voice="{TTS_VOICE}"><prosody rate="medium" pitch="+2%">{text}</prosody></Say>'
 
 def _line(*opts): return random.choice(opts)
 
 def _gather_es(action: str, timeout="10", end_silence="auto",
                hints=("sí, si, no, propietario, inquilino, jaen, madrid, valencia, sevilla, "
-                      "barcelona, malaga, granada, soy, me llamo, mi nombre es"),
+                      "barcelona, malaga, granada, soy, me llamo, mi nombre es, "
+                      "uno,dos,tres,cuatro,cinco,seis,siete,ocho,nueve,cero"),
                allow_dtmf: bool=False) -> str:
     mode = "speech dtmf" if allow_dtmf else "speech"
     return (f'<Gather input="{mode}" language="es-ES" timeout="{timeout}" '
             f'speechTimeout="{end_silence}" speechModel="phone_call" bargeIn="true" '
             f'action="{action}" method="POST" actionOnEmptyResult="true" hints="{hints}">')
 
-_IVR_MEM = {}  # CallSid -> { role, zone, name, miss }
+# Estado por llamada
+# step: ask_role → ask_city → ask_name → ask_phone → ask_note → confirm → done
+_IVR_MEM = {}  # CallSid -> { step, role, zone, name, phone, note, transcript:[] }
+
 PROVS = {"jaen":"Jaén","madrid":"Madrid","valencia":"Valencia","sevilla":"Sevilla",
          "barcelona":"Barcelona","malaga":"Málaga","granada":"Granada"}
+
 FRAN_MAP = {
     "jaen":{"name":"Jaén","phones":["+34683634299"]},
     "madrid":{"name":"Madrid Centro","phones":["+34600000001"]},
@@ -311,38 +320,46 @@ FRAN_MAP = {
     "granada":{"name":"Granada","phones":["+34600000007"]},
 }
 
-def _yesno(s: str) -> str:
-    s = (s or "").lower().strip()
-    if any(w in s for w in {"si","sí","vale","correcto","claro","ok","de acuerdo"}): return "yes"
-    if any(w in s for w in {"no","negativo"}): return "no"
-    return ""
-
-def _role(s: str) -> str:
+def _normalize(s: str) -> str:
     s = (s or "").lower()
-    if "propiet" in s or "dueñ" in s: return "propietario"
-    if "inquil" in s or "alquil" in s or "habitacion" in s or "habitación" in s or "busco" in s: return "inquilino"
+    for a,b in (("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u")): s = s.replace(a,b)
+    return s.strip()
+
+def _parse_role(s: str) -> str:
+    s = _normalize(s)
+    if "propiet" in s or "duen" in s: return "propietario"
+    if "inquil" in s or "alquil" in s or "habitacion" in s: return "inquilino"
     return ""
 
-def _zone(s: str) -> str:
-    s = (s or "").lower().strip()
-    for a,b in (("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u")): s = s.replace(a,b)
-    for k,v in {"barna":"barcelona","md":"madrid","vlc":"valencia","sevill":"sevilla"}.items():
+def _parse_city(s: str) -> str:
+    s = _normalize(s)
+    alias = {"barna":"barcelona","md":"madrid","vlc":"valencia","sevill":"sevilla"}
+    for k,v in alias.items():
         if k in s: s = v
     for key in PROVS.keys():
         if key in s or s == key: return key
     return ""
 
-def _name(s: str) -> str:
-    s = (s or "").strip(); low = s.lower()
-    for cue in ["me llamo","soy","mi nombre es"]:
-        if cue in low:
-            return s.lower().split(cue,1)[1].strip().title()[:60]
-    parts = [w for w in s.split() if len(w)>1]
-    return parts[0].title()[:40] if parts else ""
+def _parse_name(s: str) -> str:
+    s = (s or "").strip().title()
+    return s[:80]
+
+def _parse_phone(s: str, digits: str) -> str:
+    # Preferir DTMF si lo hay
+    d = re.sub(r"\D","", digits or "")
+    if len(d) >= 9: return "+34"+d if not d.startswith("34") and not d.startswith("+") else ("+"+d if not d.startswith("+") else d)
+    # Intentar extraer de voz
+    s = _normalize(s)
+    # Mapear palabras a dígitos básicos
+    repl = {"uno":"1","dos":"2","tres":"3","cuatro":"4","cinco":"5","seis":"6","siete":"7","ocho":"8","nueve":"9","cero":"0"}
+    for k,v in repl.items(): s = s.replace(k, v)
+    d = re.sub(r"\D","", s)
+    if len(d) >= 9: return "+34"+d if not d.startswith("34") and not d.startswith("+") else ("+"+d if not d.startswith("+") else d)
+    return ""
 
 def _assign_targets(zone_key: str):
-    data = FRAN_MAP.get(zone_key or "")
-    return (data.get("phones") if data else []) or []
+    data = FRAN_MAP.get(zone_key or "", {})
+    return data.get("phones", [])
 
 @app.get("/voice/health")
 def voice_health():
@@ -350,67 +367,129 @@ def voice_health():
 
 @app.route("/voice/answer", methods=["GET","POST"])
 def voice_answer():
-    # Un solo <Say> fluido
-    texto = ("Hola, soy de SpainRoom. Cuéntame en una frase si eres propietario o inquilino "
-             "y de qué población hablamos.")
-    tw = "<Response>" + _gather_es("/voice/handle") + _say_es_ssml(texto) + "</Gather>" \
+    call_id = unquote_plus(request.form.get("CallSid","") or request.args.get("CallSid","") or "")
+    _IVR_MEM[call_id] = {"step":"ask_role","role":"","zone":"","name":"","phone":"","note":"",
+                         "transcript":[]}
+    texto = ("Hola, soy de SpainRoom. Empezamos: ¿eres propietario o inquilino y de qué población hablamos?")
+    tw = "<Response>"+ _gather_es("/voice/next") + _say_es_ssml(texto) + "</Gather>" \
          + _say_es_ssml("No te escuché bien, vamos otra vez.") \
          + '<Redirect method="POST">/voice/answer</Redirect></Response>'
     return _twiml(tw)
 
-@app.route("/voice/handle", methods=["GET","POST"])
-def voice_handle():
-    if request.method == "GET":
-        return _twiml(_say_es_ssml("Te escucho…") + '<Redirect method="POST">/voice/answer</Redirect>')
+@app.route("/voice/next", methods=["POST"])
+def voice_next():
     call_id = unquote_plus(request.form.get("CallSid",""))
-    mem = _IVR_MEM.setdefault(call_id, {"role":"", "zone":"", "name":"", "miss":0})
-    speech = unquote_plus(request.form.get("SpeechResult","")); s = (speech or "").lower().strip()
+    speech  = unquote_plus(request.form.get("SpeechResult",""))
+    digits  = request.form.get("Digits","")
+    mem = _IVR_MEM.setdefault(call_id, {"step":"ask_role","role":"","zone":"","name":"","phone":"","note":"","transcript":[]})
+    s = (speech or "").strip()
+    if s: mem["transcript"].append(s)
 
-    if not mem["role"]:
-        r = _role(s);  mem["role"] = r or mem["role"]
-    if not mem["zone"]:
-        z = _zone(s);  mem["zone"] = z or mem["zone"]
-    if not mem["name"]:
-        n = _name(speech); mem["name"] = n or mem["name"]
+    step = mem["step"]
 
-    falta = "rol" if not mem["role"] else ("provincia" if not mem["zone"] else "")
-    if falta:
-        prompt = "¿Eres propietario o inquilino?" if falta=="rol" else "¿De qué población hablamos?"
-        tw = "<Response>" + _gather_es("/voice/handle") + _say_es_ssml(prompt) + "</Gather></Response>"
-        return _twiml(tw)
+    # ---- ASK ROLE ----
+    if step == "ask_role":
+        r = _parse_role(s)
+        if not r:
+            return _twiml("<Response>"+ _gather_es("/voice/next") +
+                          _say_es_ssml("¿Eres propietario o inquilino?") + "</Gather></Response>")
+        mem["role"] = r
+        mem["step"] = "ask_city"
 
-    # Slots listos → recado
-    zona = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
-    rol  = "propietario" if mem["role"]=="propietario" else "inquilino"
-    texto = (f"{mem['name']+', ' if mem['name'] else ''}{rol} en {zona}. "
-             "Déjame un recado: tu nombre, teléfono si es otro, y el motivo de la llamada.")
-    tw = "<Response>" + _say_es_ssml(texto) \
-         + '<Record maxLength="60" playBeep="true" action="/voice/recado-done" method="POST" />' \
-         + "</Response>"
-    return _twiml(tw)
+    # ---- ASK CITY ----
+    if mem["step"] == "ask_city":
+        c = _parse_city(s)
+        if not c:
+            pregunta = ("¿En qué población está el inmueble que quieres alquilar?"
+                        if mem["role"]=="propietario"
+                        else "¿En qué población quieres alquilar?")
+            return _twiml("<Response>"+ _gather_es("/voice/next") +
+                          _say_es_ssml(pregunta) + "</Gather></Response>")
+        mem["zone"] = c
+        mem["step"] = "ask_name"
 
-@app.post("/voice/recado-done")
-def voice_recado_done():
-    call_id  = unquote_plus(request.form.get("CallSid",""))
-    from_num = request.form.get("From","")
-    rec_url  = request.form.get("RecordingUrl","")
-    mem = _IVR_MEM.get(call_id, {"role":"", "zone":"", "name":"", "miss":0})
-    role, zone, name = mem.get("role",""), mem.get("zone",""), mem.get("name","")
+    # ---- ASK NAME ----
+    if mem["step"] == "ask_name":
+        if not s:
+            return _twiml("<Response>"+ _gather_es("/voice/next") +
+                          _say_es_ssml("¿Cuál es tu nombre completo?") + "</Gather></Response>")
+        mem["name"] = _parse_name(s)
+        mem["step"] = "ask_phone"
 
-    targets = _assign_targets(zone)
-    if not targets:
-        _jlog("no_targets_for_zone", zone=zone)
+    # ---- ASK PHONE ----
+    if mem["step"] == "ask_phone":
+        phone = _parse_phone(s, digits)
+        if not phone:
+            return _twiml("<Response>"+ _gather_es("/voice/next", allow_dtmf=True) +
+                          _say_es_ssml("¿Cuál es un teléfono de contacto? Puedes decirlo o marcarlo en el teclado.") +
+                          "</Gather></Response>")
+        mem["phone"] = phone
+        mem["step"] = "ask_note"
 
-    _save_task(call_id, role, zone, name, from_num, targets, rec_url)
+    # ---- ASK NOTE ----
+    if mem["step"] == "ask_note":
+        if not s:
+            return _twiml("<Response>"+ _gather_es("/voice/next") +
+                          _say_es_ssml("Cuéntame brevemente el motivo de la llamada.") +
+                          "</Gather></Response>")
+        mem["note"] = s
+        mem["step"] = "confirm"
 
-    resumen = (f"SpainRoom: {role or 'cliente'} en {PROVS.get(zone, zone or 'zona')}."
-               f" Nombre: {name or 'N/D'}. Tel: {from_num or 'N/D'}. Recado: {rec_url or 'N/D'}")
-    for to in targets:
+    # ---- CONFIRM ----
+    if mem["step"] == "confirm":
+        zona = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
+        rol  = "propietario" if mem["role"]=="propietario" else "inquilino"
+        resumen = f"{mem['name']}, {rol} en {zona}, teléfono {mem['phone']}. ¿Está correcto?"
+        return _twiml("<Response>"+ _gather_es("/voice/confirm-summary", allow_dtmf=True) +
+                      _say_es_ssml(resumen) + "</Gather></Response>")
+
+    # fallback
+    return _twiml("<Response>"+ _gather_es("/voice/next") +
+                  _say_es_ssml("Seguimos. ¿Me repites, por favor?") + "</Gather></Response>")
+
+@app.post("/voice/confirm-summary")
+def voice_confirm_summary():
+    call_id = unquote_plus(request.form.get("CallSid",""))
+    speech  = unquote_plus(request.form.get("SpeechResult",""))
+    digits  = request.form.get("Digits","")
+    yn = "yes" if (digits=="1" or re.search(r"\b(si|sí|vale|correcto|claro|ok)\b", (speech or "").lower())) else \
+         ("no" if (digits=="2" or re.search(r"\bno\b", (speech or "").lower())) else "")
+
+    mem = _IVR_MEM.get(call_id, None)
+    if not mem:  # volver al inicio
+        return _twiml('<Response><Redirect method="POST">/voice/answer</Redirect></Response>')
+
+    if yn == "no":
+        # Preguntar qué corregimos (simple: volver a población → nombre → teléfono)
+        mem["step"] = "ask_city"
+        pregunta = ("Vamos a corregirlo. ¿En qué población está el inmueble?"
+                    if mem["role"]=="propietario"
+                    else "Vamos a corregirlo. ¿En qué población quieres alquilar?")
+        return _twiml("<Response>"+ _gather_es("/voice/next") +
+                      _say_es_ssml(pregunta) + "</Gather></Response>")
+
+    if yn != "yes":
+        return _twiml("<Response>"+ _gather_es("/voice/confirm-summary", allow_dtmf=True) +
+                      _say_es_ssml("¿Me confirmas, por favor? Di sí o no, o pulsa 1 o 2.") +
+                      "</Gather></Response>")
+
+    # Confirmado → crear tarea y despedir
+    zona_lbl = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
+    assignees = _assign_targets(mem["zone"])
+    transcript_text = " | ".join([t for t in mem.get("transcript",[]) if t])
+
+    _save_task(call_id=call_id, role=mem["role"], zone=mem["zone"], name=mem["name"],
+               phone=mem["phone"], assignees=assignees, recording_url="", transcript_text=transcript_text)
+
+    # SMS resumen
+    resumen = (f"SpainRoom: {mem['role']} en {zona_lbl}. "
+               f"Nombre: {mem['name'] or 'N/D'}. Tel: {mem['phone'] or 'N/D'}. Nota: {mem['note'] or 'N/D'}")
+    for to in assignees:
         _send_sms(to, resumen)
 
-    tw = "<Response>" + _say_es_ssml("Gracias, ya tengo tu recado. Te llamarán desde tu zona en breve.") \
-         + "<Hangup/></Response>"
-    return _twiml(tw)
+    gracias = "Perfecto, ya tengo todo. La persona de tu zona te llamará en breve. ¡Gracias!"
+    del _IVR_MEM[call_id]  # cerrar memoria de la llamada
+    return _twiml("<Response>"+ _say_es_ssml(gracias) + "<Hangup/></Response>")
 
 # Root y fallback
 @app.route("/", methods=["GET","POST"])
@@ -422,7 +501,8 @@ def root_safe():
 
 @app.route("/voice/fallback", methods=["GET","POST"])
 def voice_fallback():
-    return _twiml(_say_es_ssml("Un segundo, por favor.") + '<Redirect method="POST">/voice/answer</Redirect>')
+    return _twiml(_say_es_ssml("Un segundo, por favor.")
+                  + '<Redirect method="POST">/voice/answer</Redirect>')
 
 # Diagnóstico
 @app.get("/__routes")
