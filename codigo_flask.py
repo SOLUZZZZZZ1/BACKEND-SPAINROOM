@@ -2,8 +2,8 @@
 # SpainRoom · Backend principal (Render: gunicorn codigo_flask:app)
 # - Defensa (WAF ligero) embebida y ACTIVA (no inspecciona /voice, /health, /__routes)
 # - IVR voz natural /voice/* (Polly.Conchita + SSML compatible + barge-in), rutas GET/POST blindadas
-# - Root y fallback siempre TwiML
-# - Post-Dial fallback: si no contestan → mensaje + buzón
+# - Root y fallback siempre devuelven TwiML (adiós “goodbye”)
+# - Dial con action after-dial → si falla, buzón automático
 # - Geocoder / Jobs (mock con Haversine)
 
 from flask import Flask, request, jsonify, Response
@@ -14,7 +14,10 @@ import os, re, random, json
 
 app = Flask(__name__)
 
-# ========================== DEFENSA (WAF) ==========================
+# =========================================================
+#  DEFENSA (WAF ligero embebido) — ACTIVA
+#  (No inspecciona /voice/*, /health ni /__routes)
+# =========================================================
 DEF_CFG = {
     "MAX_BODY": int(os.getenv("DEFENSE_MAX_BODY", "524288")),
     "ALLOW_METHODS": set((os.getenv("DEFENSE_ALLOW_METHODS", "GET,POST,OPTIONS")).split(",")),
@@ -30,9 +33,11 @@ DEF_CFG = {
     "SKIP_PREFIXES": [p.strip() for p in os.getenv("DEFENSE_SKIP_PREFIXES", "/voice,/__routes,/health").split(",") if p.strip()],
 }
 
-_SQLI = [r"(?i)\bunion\b.+\bselect\b", r"(?i)\b(select|insert|update|delete)\b.+\bfrom\b",
-         r"(?i)\bor\s+1=1\b", r"(?i)\bsleep\(", r"(?i)information_schema", r"(?i)load_file\("]
-_XSS  = [r"(?i)<script\b", r"(?i)javascript:", r"(?i)onerror\s*="]
+_SQLI = [
+    r"(?i)\bunion\b.+\bselect\b", r"(?i)\b(select|insert|update|delete)\b.+\bfrom\b",
+    r"(?i)\bor\s+1=1\b", r"(?i)\bsleep\(", r"(?i)information_schema", r"(?i)load_file\(",
+]
+_XSS = [r"(?i)<script\b", r"(?i)javascript:", r"(?i)onerror\s*="]
 _TRAV = [r"\.\./", r"%2e%2e%2f", r"\x00"]
 _BADH = ["X-Original-URL", "X-Override-URL"]
 
@@ -45,9 +50,11 @@ def _ip():
 def _jlog(event, **kw):
     try:
         from datetime import datetime, timezone
-        payload = {"ts": datetime.now(tz=timezone.utc).isoformat(),
-                   "event": event, "ip": _ip(), "path": request.path,
-                   "method": request.method, "rid": request.headers.get("X-Request-ID", "")}
+        payload = {
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "event": event, "ip": _ip(), "path": request.path,
+            "method": request.method, "rid": request.headers.get("X-Request-ID", "")
+        }
         payload.update(kw)
         print(json.dumps(payload, ensure_ascii=False), flush=True)
     except Exception:
@@ -110,7 +117,7 @@ def _body_ok():
 
 @app.before_request
 def _waf_gate():
-    if _skip():
+    if _skip():  # /voice, /health, /__routes
         return
     score, reasons = 0, []
     for chk in (_host_ok, _ua_ok, _size_ok, _ct_ok, _badh_ok, _trav_ok, _qs_ok, _body_ok):
@@ -138,15 +145,20 @@ def _secure_headers(resp):
 def defense_health():
     return jsonify(ok=True, defense="registered", skips=list(DEF_CFG["SKIP_PREFIXES"])), 200
 
-# ========================== SALUD ==========================
+# =========================================================
+#  SALUD GENERAL
+# =========================================================
 @app.get("/health")
 def health():
     return jsonify(ok=True, service="BACKEND-SPAINROOM"), 200
 
-# ========================== UTILS ==========================
+# =========================================================
+#  UTILS — HAVERSINE, GEOCODER, JOBS
+# =========================================================
 def calcular_distancia(lat1, lon1, lat2, lon2):
     R = 6371
-    dlat = radians(lat2 - lat1); dlon = radians(lon2 - lon1)
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
     a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
@@ -180,9 +192,12 @@ def search_jobs():
             res.append({"id":o["id"],"titulo":o["titulo"],"empresa":o["empresa"],"distancia_km":round(dist,2)})
     return jsonify(res)
 
-# ========================== IVR /voice/* ==========================
+# =========================================================
+#  IVR PERSONA NATURAL /voice/*  (Polly.Conchita + SSML compatible, GET/POST blindado)
+#  Dial con after-dial → si falla, buzón
+# =========================================================
 VOICE_PREFIX = "/voice"
-TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Conchita")  # Twilio-compatible
+TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Conchita")
 TWILIO_CALLER = os.getenv("TWILIO_VOICE_FROM", "+12252553716")
 
 def _twiml(body: str) -> Response:
@@ -191,7 +206,7 @@ def _twiml(body: str) -> Response:
     return Response(body, mimetype="text/xml")
 
 def _say_es_ssml(text: str) -> str:
-    # SSML 100% compatible con Twilio (sin amazon:*)
+    # SSML compatible con Twilio (sin amazon:domain)
     return f'<Say language="es-ES" voice="{TTS_VOICE}"><prosody rate="medium" pitch="+2%">{text}</prosody></Say>'
 
 def _line(*opts): return random.choice(opts)
@@ -209,7 +224,6 @@ def _gather_es(action: str, timeout="8", end_silence="auto",
 def _ack(): return _line("vale","ok","perfecto","genial","ajá","te sigo","sí","de una","dale")
 
 _IVR_MEM = {}  # CallSid -> { role, zone, name, miss }
-
 PROVS = {"jaen":"Jaén","madrid":"Madrid","valencia":"Valencia","sevilla":"Sevilla",
          "barcelona":"Barcelona","malaga":"Málaga","granada":"Granada"}
 FRAN_MAP = {
@@ -262,5 +276,141 @@ def _assign(zone_key: str):
 def voice_health():
     return jsonify(ok=True, service="voice"), 200
 
-# GET/POST blindado
-@app.route("/voice/answer", methods=["GET
+# === /voice/answer (GET/POST) ===
+@app.route("/voice/answer", methods=["GET","POST"])
+def voice_answer():
+    tw = ("<Response>"
+          + _gather_es("/voice/handle")
+          + _say_es_ssml(_line("Hola, ¿cómo vas? Soy de SpainRoom.","¡Ey! Soy de SpainRoom, cuéntame."))
+          + _say_es_ssml("Dime en una frase: ¿eres propietario o inquilino, y de qué provincia?")
+          + "</Gather>"
+          + _say_es_ssml("No te pillé, vamos otra vez.")
+          + '<Redirect method="POST">/voice/answer</Redirect>'
+          + "</Response>")
+    return _twiml(tw)
+
+# === /voice/handle (GET/POST) ===
+@app.route("/voice/handle", methods=["GET","POST"])
+def voice_handle():
+    if request.method == "GET":
+        return _twiml(_say_es_ssml("Te escucho…") + '<Redirect method="POST">/voice/answer</Redirect>')
+
+    call_id = unquote_plus(request.form.get("CallSid",""))
+    mem = _IVR_MEM.setdefault(call_id, {"role":"", "zone":"", "name":"", "miss":0})
+    speech = unquote_plus(request.form.get("SpeechResult","")); s = (speech or "").lower().strip()
+
+    if not mem["role"]:
+        r = _role(s);  mem["role"] = r or mem["role"]
+    if not mem["zone"]:
+        z = _zone(s);  mem["zone"] = z or mem["zone"]
+    if not mem["name"]:
+        n = _name(speech); mem["name"] = n or mem["name"]
+
+    missing = []
+    if not mem["role"]: missing.append("rol")
+    if not mem["zone"]: missing.append("provincia")
+
+    if missing:
+        mem["miss"] += 1; ask = missing[0]
+        if ask == "rol":
+            tw = ("<Response>" + _gather_es("/voice/handle")
+                  + _say_es_ssml(_line("¿Eres propietario o inquilino?","Vale, ¿propietario o inquilino?"))
+                  + "</Gather></Response>")
+        else:
+            tw = ("<Response>" + _gather_es("/voice/handle")
+                  + _say_es_ssml(_line("¿De qué provincia me llamas?","Dime solo la provincia, porfa."))
+                  + "</Gather></Response>")
+        return _twiml(tw)
+
+    zone_h = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
+    role_label = "propietario" if mem["role"] == "propietario" else "inquilino"
+    name_part  = (mem["name"] + ", ") if mem["name"] else ""
+    confirm_1  = f"{_line('Genial','Perfecto','Vale')}. {name_part}{role_label} en {zone_h}. ¿Te paso con la persona de tu zona?"
+    confirm_2  = f"{name_part}¿te va bien que te pase ya con {zone_h}?"
+    confirm_text = _line(confirm_1, confirm_2)
+
+    tw = ("<Response>" + _gather_es("/voice/confirm", allow_dtmf=True)
+          + _say_es_ssml(confirm_text)
+          + "</Gather></Response>")
+    return _twiml(tw)
+
+# === /voice/confirm (GET/POST) + after-dial ===
+@app.route("/voice/confirm", methods=["GET","POST"])
+def voice_confirm():
+    if request.method == "GET":
+        return _twiml("<Response>"+_gather_es("/voice/confirm", allow_dtmf=True)
+                      + _say_es_ssml("¿sí o no?") + "</Gather></Response>")
+
+    call_id = unquote_plus(request.form.get("CallSid",""))
+    mem = _IVR_MEM.get(call_id, {"role":"", "zone":"", "name":"", "miss":0})
+
+    yn  = _yesno(unquote_plus(request.form.get("SpeechResult","")))
+    d   = (request.form.get("Digits") or "").strip()
+    if d == "1": yn = "yes"
+    if d == "2": yn = "no"
+
+    if yn == "yes":
+        fran = _assign(mem["zone"])
+        if fran and fran.get("phone"):
+            # action -> after-dial: si falla o no contesta, buzón
+            return _twiml(
+                "<Response>"
+                + _say_es_ssml("Genial, un segundo…") + _pause(0.3)
+                + f'<Dial callerId="{TWILIO_CALLER}" action="/voice/after-dial" method="POST" timeout="20">'
+                + f'  <Number statusCallback="/voice/dial-status" statusCallbackEvent="initiated ringing answered completed">{fran["phone"]}</Number>'
+                + "</Dial>"
+                + "</Response>"
+            )
+        return _twiml("<Response>"+_say_es_ssml("No ubico al responsable ahora mismo. Te dejo buzón.")
+                      + '<Record maxLength="120" playBeep="true" action="/voice/answer" method="POST"/>'
+                      + "</Response>")
+
+    if yn == "no":
+        return _twiml("<Response>"+_gather_es("/voice/handle")
+                      + _say_es_ssml("Vale, dime de qué provincia y lo ajusto.") + "</Gather></Response>")
+
+    return _twiml("<Response>"+_gather_es("/voice/confirm", allow_dtmf=True)
+                  + _say_es_ssml("¿sí o no?") + "</Gather></Response>")
+
+# Callback tras el Dial: si falla, buzón
+@app.route("/voice/after-dial", methods=["POST"])
+def voice_after_dial():
+    dial_status = request.form.get("DialCallStatus","")  # completed, busy, failed, no-answer
+    if dial_status == "completed":
+        return _twiml("<Response><Hangup/></Response>")
+    # Si no se completó la transferencia → buzón
+    return _twiml(
+        "<Response>"
+        + _say_es_ssml("Ahora mismo no pudieron atenderte. Déjame un mensaje y te devolvemos la llamada.")
+        + '<Record maxLength="120" playBeep="true" action="/voice/answer" method="POST"/>'
+        + "</Response>"
+    )
+
+# (Opcional) status de la llamada de salida (logs)
+@app.route("/voice/dial-status", methods=["POST"])
+def voice_dial_status():
+    # Puedes guardar request.form si quieres auditoría
+    print("[DIAL-STATUS]", dict(request.form), flush=True)
+    return ("", 204)
+
+# Root y fallback con TwiML válido
+@app.route("/", methods=["GET","POST"])
+def root_safe():
+    if request.method == "POST":
+        return _twiml(_say_es_ssml("Hola, te atiendo ahora mismo.")
+                      + '<Redirect method="POST">/voice/answer</Redirect>')
+    return ("", 404)
+
+@app.route("/voice/fallback", methods=["GET","POST"])
+def voice_fallback():
+    return _twiml(_say_es_ssml("Uff, un segundo…")
+                  + '<Redirect method="POST">/voice/answer</Redirect>')
+
+# Diagnóstico de rutas
+@app.get("/__routes")
+def __routes():
+    return {"routes":[f"{r.endpoint} -> {r.rule}" for r in app.url_map.iter_rules()]}, 200
+
+# MAIN local
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5001, debug=True)
