@@ -5,7 +5,7 @@ from flask import Flask, request, jsonify, Response
 import requests
 from math import radians, sin, cos, sqrt, atan2
 from urllib.parse import unquote_plus
-import os, time, random
+import os, random
 
 # =========================================================
 #  APP FLASK (Render usa gunicorn codigo_flask:app)
@@ -21,43 +21,7 @@ def health():
 
 
 # =========================================================
-#  DEFENSE: cortafuegos ligero y rate-limit (si está disponible)
-# =========================================================
-try:
-    import defense as _defense  # tu archivo defense.py
-
-    Limiter = getattr(_defense, "Limiter", None)
-    get_remote_address = getattr(_defense, "get_remote_address", None)
-    if Limiter and get_remote_address:
-        limiter = Limiter(
-            key_func=get_remote_address,
-            app=app,
-            default_limits=["200 per minute"],
-        )
-        print("[DEFENSE] Rate limit activo.", flush=True)
-
-    _looks_malicious = getattr(_defense, "_looks_malicious", None)
-
-    @app.before_request
-    def _defense_gate():
-        if not _looks_malicious:
-            return
-        try:
-            reason = _looks_malicious()
-            if reason:
-                print(f"[DEFENSE] Bloqueado: {reason} {request.method} {request.path}", flush=True)
-                return ("", 403)
-        except Exception as e:
-            print(f"[DEFENSE] Warning: {e}", flush=True)
-
-    print("[DEFENSE] Cortafuegos activo.", flush=True)
-
-except Exception as e:
-    print(f"[DEFENSE] No activo (sin romper): {e}", flush=True)
-
-
-# =========================================================
-#  UTILS — HAVERSINE, GEOCODER, JOBS
+#  UTILS — HAVERSINE, GEOCODER, JOBS (lo de siempre)
 # =========================================================
 def calcular_distancia(lat1, lon1, lat2, lon2):
     """Distancia en km (Haversine)."""
@@ -76,7 +40,7 @@ def geocode():
         return jsonify({"error": "Falta parámetro address"}), 400
 
     url = f"https://nominatim.openstreetmap.org/search?q={address}&format=json&limit=1"
-    headers = {"User-Agent": "SpainRoom/1.0"}  # Nominatim exige User-Agent
+    headers = {"User-Agent": "SpainRoom/1.0"}
     r = requests.get(url, headers=headers, timeout=10)
 
     if r.status_code != 200 or not r.json():
@@ -117,37 +81,13 @@ def search_jobs():
 
 
 # =========================================================
-#  REGISTRO OPCIONAL DE OTROS BLUEPRINTS (NO ROMPE SI NO ESTÁN)
-#  (NO registramos VOICE externo para no chocar con /voice/* de abajo)
-# =========================================================
-def _try_register(label: str, import_path: str, attr: str = None, url_prefix: str = None, print_ok: str = None):
-    try:
-        module = __import__(import_path, fromlist=['*'])
-        bp = getattr(module, attr) if attr else getattr(module, "bp", None)
-        if bp is None:
-            return
-        if any(getattr(b, "name", "") == bp.name for b in app.blueprints.values()):
-            return
-        if url_prefix:
-            app.register_blueprint(bp, url_prefix=url_prefix)
-        else:
-            app.register_blueprint(bp)
-        if print_ok:
-            print(print_ok, flush=True)
-    except Exception:
-        pass
-
-_try_register("AUTH",          "auth",          "bp_auth",          "/auth",          "[AUTH] Blueprint auth registrado.")
-_try_register("OPPORTUNITIES", "opportunities", "bp_opportunities", "/opportunities", "[OPPORTUNITIES] Blueprint registrado.")
-_try_register("PAYMENTS",      "payments",      "bp_payments",      "/payments",      "[PAYMENTS] Blueprint registrado.")
-# (no VOICE externo para evitar choque)
-
-
-# =========================================================
 #  IVR PERSONA NATURAL — /voice/*  (voz neural + SSML + barge-in)
+#  (El bot NO hace defensa: si tienes WAF/limiter, excluye estas rutas allí)
 # =========================================================
 
+VOICE_PREFIX = "/voice"
 TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Lucia")  # alternativas: Polly.Conchita, Polly.Enrique
+TWILIO_CALLER = os.getenv("TWILIO_VOICE_FROM", "+12252553716")  # callerId en el Dial
 
 def _twiml(body: str) -> Response:
     body = body.strip()
@@ -157,7 +97,8 @@ def _twiml(body: str) -> Response:
 
 def _say_es_ssml(text: str) -> str:
     """
-    Voz neural con SSML (estilo conversacional) — suena mucho más natural.
+    Voz neural con SSML (estilo conversacional) — suena más humana en Twilio.
+    Requiere voice="Polly.*".
     """
     ssml = (
         '<speak>'
@@ -192,8 +133,7 @@ def _gather_es(action: str,
 def _ack():
     return random.choice(["vale", "ok", "perfecto", "genial", "ajá", "te sigo", "sí", "de una", "dale"])
 
-
-# Memoria por llamada (producción: Redis/DB con TTL)
+# Memoria por llamada (producción: Redis/DB con TTL si quieres)
 _IVR_MEM = {}  # { CallSid: {"role":"", "zone":"", "name":"", "miss": 0} }
 
 PROVS = {
@@ -211,8 +151,8 @@ FRAN_MAP = {
     "granada":   {"name": "Granada",       "phone": "+34600000007"},
 }
 
-_YES = {"si","sí","vale","correcto","claro","ok","de acuerdo"}
-_NO  = {"no","negativo"}
+_YES = {"si", "sí", "vale", "correcto", "claro", "ok", "de acuerdo"}
+_NO  = {"no", "negativo"}
 
 def _yesno(s: str) -> str:
     s = (s or "").lower().strip()
@@ -259,32 +199,34 @@ def _name(s: str) -> str:
 def _assign(zone_key: str):
     return FRAN_MAP.get(zone_key or "", {"name": "Central SpainRoom", "phone": None})
 
-@app.get("/voice/health")
+
+@app.get(f"{VOICE_PREFIX}/health")
 def _voice_health():
     return jsonify(ok=True, service="voice"), 200
 
-# Entrada natural con barge-in en las locuciones dentro del Gather
-@app.post("/voice/answer")
+
+@app.post(f"{VOICE_PREFIX}/answer")
 def _voice_answer():
     tw = (
-        '<Response>'
-        + _gather_es("/voice/handle")
+        "<Response>"
+        + _gather_es(f"{VOICE_PREFIX}/handle")
         + _say_es_ssml(_line("Hola, ¿cómo vas? Soy de SpainRoom.",
                              "¡Ey! Soy de SpainRoom, cuéntame."))
         + _say_es_ssml("Dime en una frase: ¿eres propietario o inquilino, y de qué provincia?")
-        + '</Gather>'
+        + "</Gather>"
         + _say_es_ssml("No te pillé, vamos otra vez.")
-        + '<Redirect method="POST">/voice/answer</Redirect>'
-        + '</Response>'
+        + f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>'
+        + "</Response>"
     )
     return _twiml(tw)
 
-@app.post("/voice/handle")
-def _voice_handle():
-    call_id = unquote_plus(request.form.get("CallSid",""))
-    mem = _IVR_MEM.setdefault(call_id, {"role":"", "zone":"", "name":"", "miss": 0})
 
-    speech = unquote_plus(request.form.get("SpeechResult",""))
+@app.post(f"{VOICE_PREFIX}/handle")
+def _voice_handle():
+    call_id = unquote_plus(request.form.get("CallSid", ""))
+    mem = _IVR_MEM.setdefault(call_id, {"role": "", "zone": "", "name": "", "miss": 0})
+
+    speech = unquote_plus(request.form.get("SpeechResult", ""))
     s = (speech or "").lower().strip()
 
     if not mem["role"]:
@@ -306,84 +248,101 @@ def _voice_handle():
         ask = missing[0]
         if ask == "rol":
             tw = (
-                '<Response>'
-                + _gather_es("/voice/handle")
+                "<Response>"
+                + _gather_es(f"{VOICE_PREFIX}/handle")
                 + _say_es_ssml(_line("¿Eres propietario o inquilino?",
                                      "Vale, ¿propietario o inquilino?"))
-                + '</Gather>'
-                + '</Response>'
+                + "</Gather>"
+                + "</Response>"
             )
         else:
             tw = (
-                '<Response>'
-                + _gather_es("/voice/handle")
+                "<Response>"
+                + _gather_es(f"{VOICE_PREFIX}/handle")
                 + _say_es_ssml(_line("¿De qué provincia me llamas?",
                                      "Dime solo la provincia, porfa."))
-                + '</Gather>'
-                + '</Response>'
+                + "</Gather>"
+                + "</Response>"
             )
         return _twiml(tw)
 
     zone_h = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
     mem["miss"] = 0
     tw = (
-        '<Response>'
-        + _gather_es("/voice/confirm", allow_dtmf=True)
+        "<Response>"
+        + _gather_es(f"{VOICE_PREFIX}/confirm", allow_dtmf=True)
         + _say_es_ssml(_line(
             f"{_line('Genial','Perfecto','Vale')}. {mem['name'] + ', ' if mem['name'] else ''}"
             f"{'propietario' if mem['role']=='propietario' else 'inquilino'} en {zone_h}. "
             "¿Te paso con la persona de tu zona?",
             f"{mem['name'] + ', ' if mem['name'] else ''}¿te va bien que te pase ya con {zone_h}?"))
-        + '</Gather>'
-        + '</Response>'
+        + "</Gather>"
+        + "</Response>"
     )
     return _twiml(tw)
 
-@app.post("/voice/confirm")
-def _voice_confirm():
-    call_id = unquote_plus(request.form.get("CallSid",""))
-    mem = _IVR_MEM.get(call_id, {"role":"", "zone":"", "name":"", "miss": 0})
 
-    yn = _yesno(unquote_plus(request.form.get("SpeechResult","")))
-    d  = (request.form.get("Digits") or "").strip()
+@app.post(f"{VOICE_PREFIX}/confirm")
+def _voice_confirm():
+    call_id = unquote_plus(request.form.get("CallSid", ""))
+    mem = _IVR_MEM.get(call_id, {"role": "", "zone": "", "name": "", "miss": 0})
+
+    yn  = _yesno(unquote_plus(request.form.get("SpeechResult", "")))
+    d   = (request.form.get("Digits") or "").strip()
     if d == "1": yn = "yes"
     if d == "2": yn = "no"
 
     if yn == "yes":
         fran = _assign(mem["zone"])
         if fran and fran.get("phone"):
-            caller = os.getenv("TWILIO_VOICE_FROM", "+12252553716")
             return _twiml(
-                '<Response>'
+                "<Response>"
                 + _say_es_ssml("Genial, un segundo…")
                 + _pause(0.25)
-                + f'<Dial callerId="{caller}"><Number>{fran["phone"]}</Number></Dial>'
-                + '</Response>'
+                + f'<Dial callerId="{TWILIO_CALLER}"><Number>{fran["phone"]}</Number></Dial>'
+                + "</Response>"
             )
         return _twiml(
-            '<Response>'
+            "<Response>"
             + _say_es_ssml("No ubico al responsable ahora mismo. Te dejo buzón.")
-            + '<Record maxLength="120" playBeep="true" action="/voice/answer" method="POST"/>'
-            + '</Response>'
+            + f'<Record maxLength="120" playBeep="true" action="{VOICE_PREFIX}/answer" method="POST"/>'
+            + "</Response>"
         )
 
     if yn == "no":
         return _twiml(
-            '<Response>'
-            + _gather_es("/voice/handle")
+            "<Response>"
+            + _gather_es(f"{VOICE_PREFIX}/handle")
             + _say_es_ssml("Vale, dime de qué provincia y lo ajusto.")
-            + '</Gather>'
-            + '</Response>'
+            + "</Gather>"
+            + "</Response>"
         )
 
-    # No entendido → repregunta brevísima (voz o DTMF opcional)
+    # No entendido → repregunta brevísima
     return _twiml(
-        '<Response>'
-        + _gather_es("/voice/confirm", allow_dtmf=True)
+        "<Response>"
+        + _gather_es(f"{VOICE_PREFIX}/confirm", allow_dtmf=True)
         + _say_es_ssml("¿sí o no?")
-        + '</Gather>'
-        + '</Response>'
+        + "</Gather>"
+        + "</Response>"
     )
+
+
+# =========================================================
+#  ROOT y FALLBACK seguros (Twilio jamás verá 404)
+# =========================================================
+@app.route("/", methods=["GET", "POST"])
+def _root_safe():
+    # Si Twilio pega al root por error, devuelve TwiML y redirige al flujo
+    if request.method == "POST":
+        return _twiml(_say_es_ssml("Hola, te atiendo ahora mismo.") +
+                      f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>')
+    return ("", 404)
+
+@app.post(f"{VOICE_PREFIX}/fallback")
+def _voice_fallback():
+    return _twiml(_say_es_ssml("Uff, un segundo…") +
+                  f'<Redirect method="POST">{VOICE_PREFIX}/answer</Redirect>')
 
 
 # =========================================================
