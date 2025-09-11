@@ -1,8 +1,8 @@
 # SpainRoom · Backend principal (Render: gunicorn codigo_flask:app)
 # - Voz por turnos (SSML natural sin <speak> ni amazon:*), _twiml seguro
-# - WAF embebido (no inspecciona /voice, /health, /__routes)
-# - Tareas JSONL + UI /admin/tasks + SMS a franquiciados
-# - Territorios (microzonas + rejilla) para enrutar leads
+# - Captura robusta de POBLACIÓN: heurística + geocodificación del texto (Nominatim)
+# - Rellena varios slots si el usuario los dice juntos (rol, población, nombre, teléfono)
+# - WAF (no inspecciona /voice), Tareas JSONL + UI /admin/tasks + SMS, Territorios (microzonas + rejilla)
 
 from flask import Flask, request, jsonify, Response, Response as _FlaskResponse, has_request_context
 import requests, json, os, re, random, tempfile, shutil
@@ -182,7 +182,7 @@ def geocode():
 def _ssml(text: str) -> str:
     """
     [[b300]] -> <break time="300ms"/>, [[digits:600123123]] -> <say-as interpret-as="digits">...</say-as>
-    (No usamos <speak>; Twilio soporta <prosody>/<break>/<say-as> directamente dentro de <Say>)
+    (No usamos <speak>; Twilio soporta <prosody>/<break>/<say-as> dentro de <Say>)
     """
     s=text
     s=re.sub(r"\[\[b(\d{2,4})\]\]", lambda m:f'<break time="{m.group(1)}ms"/>', s)
@@ -393,7 +393,23 @@ def _parse_phone(s:str, digits:str)->str:
     if len(d)>=9: return "+34"+d if not d.startswith(("34","+")) else ("+"+d if not d.startswith("+") else d)
     return ""
 
-_IVR_MEM = {}  # CallSid -> { step, role, zone, name, phone, note, transcript:[], miss }
+def _geocode_guess(text: str):
+    """Intenta geocodificar la frase completa (España) y devuelve slug, lat, lng o (None, None, None)."""
+    q=(text or "").strip()
+    if len(q)<3: return None,None,None
+    try:
+        url=f"https://nominatim.openstreetmap.org/search?q={q}, España&format=json&limit=1"
+        r=requests.get(url, headers={"User-Agent":"SpainRoom/1.0"}, timeout=8)
+        if r.status_code==200 and r.json():
+            d=r.json()[0]; name=d.get("display_name","").split(",")[0]
+            return _slug_city(name), float(d["lat"]), float(d["lon"])
+    except Exception as e:
+        _jlog("geocode_guess_error", error=str(e))
+    return None,None,None
+
+# Memoria de llamada: almacenamos lat/lng cuando geocodificamos
+# step: ask_role → ask_city → ask_name → ask_phone → ask_note → confirm → done
+_IVR_MEM = {}  # CallSid -> { step, role, zone, name, phone, note, transcript:[], miss, geo_lat, geo_lng }
 
 @app.get("/voice/health")
 def voice_health(): return jsonify(ok=True, service="voice"), 200
@@ -401,7 +417,8 @@ def voice_health(): return jsonify(ok=True, service="voice"), 200
 @app.route("/voice/answer", methods=["GET","POST"])
 def voice_answer():
     call_id = unquote_plus(request.form.get("CallSid","") or request.args.get("CallSid","") or "")
-    _IVR_MEM[call_id]={"step":"ask_role","role":"","zone":"","name":"","phone":"","note":"","miss":0,"transcript":[]}
+    _IVR_MEM[call_id]={"step":"ask_role","role":"","zone":"","name":"","phone":"","note":"",
+                       "miss":0,"transcript":[],"geo_lat":None,"geo_lng":None}
     texto=_line(
         "Hola [[b200]] soy de SpainRoom. ¿Eres propietario o inquilino [[b200]] y de qué población hablamos?",
         "¡Hola! [[b150]] Cuéntame en una frase [[b150]] si eres propietario o inquilino [[b150]] y la población."
@@ -415,11 +432,34 @@ def voice_answer():
 def voice_next():
     call_id=unquote_plus(request.form.get("CallSid",""))
     speech =unquote_plus(request.form.get("SpeechResult","")); digits=request.form.get("Digits","")
-    mem=_IVR_MEM.setdefault(call_id,{"step":"ask_role","role":"","zone":"","name":"","phone":"","note":"","miss":0,"transcript":[]})
+    mem=_IVR_MEM.setdefault(call_id,{"step":"ask_role","role":"","zone":"","name":"",
+                                     "phone":"","note":"","miss":0,"transcript":[],"geo_lat":None,"geo_lng":None})
     s=(speech or "").strip()
     if s: mem["transcript"].append(s)
+
+    # ------ RELLENO RÁPIDO DE SLOTS (si el usuario dice cosas de más) ------
+    if not mem["role"]:
+        rr=_parse_role(s)
+        if rr: mem["role"]=rr
+    if not mem["zone"]:
+        cc=_parse_city(s)
+        if cc:
+            mem["zone"]=cc
+        else:
+            # Intento de geocodificar el texto si tiene pinta de lugar
+            z,lt,lg=_geocode_guess(s)
+            if z:
+                mem["zone"]=z; mem["geo_lat"]=lt; mem["geo_lng"]=lg
+    if not mem["name"]:
+        if any(k in s.lower() for k in ["me llamo","soy","mi nombre"]):
+            mem["name"]=_parse_name(re.sub(r"(?i).*(me llamo|soy|mi nombre es)\s*","",s,1))
+    if not mem["phone"]:
+        ph=_parse_phone(s,digits)
+        if ph: mem["phone"]=ph
+
     step=mem["step"]
 
+    # ------ Small-talk ------
     kind=smalltalk_kind(s)
     if kind=='greeting':
         return _twiml("<Response>"+ _gather_es("/voice/next") +
@@ -438,54 +478,51 @@ def voice_next():
                       _say_es_ssml("¡A ti! [[b120]] Seguimos [[b100]] ¿propietario o inquilino y de qué población?") +
                       "</Gather></Response>")
 
+    # ------ Flujo por pasos ------
     if step=="ask_role":
-        r=_parse_role(s)
-        if not r:
+        if not mem["role"]:
             mem["miss"]+=1
             prompt="¿Eres propietario o inquilino?" if mem["miss"]<2 else "Solo dime [[b120]] propietario [[b120]] o inquilino."
             return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml(prompt)+"</Gather></Response>")
-        mem["role"]=r; mem["step"]="ask_city"; mem["miss"]=0
+        mem["step"]="ask_city"; mem["miss"]=0
 
     if mem["step"]=="ask_city":
-        c=_parse_city(s)
-        if not c or c in ("", "de", "la", "el"):
+        if not mem["zone"]:
             mem["miss"]+=1
             pregunta = ("¿En qué población está el inmueble?" if mem["role"]=="propietario"
                         else "¿En qué población quieres alquilar?")
             if mem["miss"]>=2: pregunta = "Solo la población [[b120]] por ejemplo Jaén o Madrid."
             return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml(pregunta)+"</Gather></Response>")
-        mem["zone"]=c; mem["step"]="ask_name"; mem["miss"]=0
+        mem["step"]="ask_name"; mem["miss"]=0
 
     if mem["step"]=="ask_name":
-        if not s:
+        if not mem["name"]:
             mem["miss"]+=1
             return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml("¿Cuál es tu nombre completo?")+" </Gather></Response>")
-        mem["name"]=_parse_name(s); mem["step"]="ask_phone"; mem["miss"]=0
+        mem["step"]="ask_phone"; mem["miss"]=0
 
     if mem["step"]=="ask_phone":
-        phone=_parse_phone(s, digits)
-        if not phone:
+        if not mem["phone"]:
             mem["miss"]+=1
             txt="¿Cuál es un teléfono de contacto? [[b180]] Puedes decirlo o marcarlo en el teclado."
             if mem["miss"]>=2: txt="Marca ahora tu número [[b150]] o díctalo despacio."
             return _twiml("<Response>"+ _gather_es("/voice/next", allow_dtmf=True)+ _say_es_ssml(txt)+"</Gather></Response>")
-        mem["phone"]=phone; mem["step"]="ask_note"; mem["miss"]=0
+        mem["step"]="ask_note"; mem["miss"]=0
 
     if mem["step"]=="ask_note":
-        if not s:
+        if not mem["note"]:
             mem["miss"]+=1
             return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml("Cuéntame brevemente el motivo de la llamada.")+"</Gather></Response>")
-        mem["note"]=s; mem["step"]='confirm'; mem["miss"]=0
+        mem["step"]='confirm'; mem["miss"]=0
 
     if mem["step"]=="confirm":
-        zona = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
+        zona_lbl = mem["zone"].title().replace("-", " ")
         phone_digits = re.sub(r"\D","", mem["phone"] or "")
         phone_ssml = f"[[digits:{phone_digits}]]" if phone_digits else (mem["phone"] or "no consta")
-        resumen = f"{mem['name'] or 'sin nombre'}, {_line('vale','perfecto','de acuerdo')} [[b120]] " \
-                  f"{'propietario' if mem['role']=='propietario' else 'inquilino'} en {zona}. Teléfono {phone_ssml}. " \
-                  f"¿Está correcto?"
+        resumen = f"{mem['name'] or 'sin nombre'}, {('propietario' if mem['role']=='propietario' else 'inquilino')} en {zona_lbl}. Teléfono {phone_ssml}. ¿Está correcto?"
         return _twiml("<Response>"+ _gather_es("/voice/confirm-summary", allow_dtmf=True)+ _say_es_ssml(resumen)+"</Gather></Response>")
 
+    # fallback
     return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml("Seguimos [[b120]] ¿me repites, por favor?")+"</Gather></Response>")
 
 @app.post("/voice/confirm-summary")
@@ -508,23 +545,24 @@ def voice_confirm_summary():
                       _say_es_ssml("¿Me confirmas [[b120]] por favor? Di sí o no [[b120]] o pulsa 1 o 2.")
                       +"</Gather></Response>")
 
-    zona_lbl = PROVS.get(mem["zone"], mem["zone"].title() or "tu zona")
-    lat=lng=None; city_query = mem["zone"]
-    if city_query and city_query not in PROVS:
-        lt,lg=_geocode_city(city_query); lat,lng=lt,lg
-    if (lat is None or lng is None) and city_query in PROVS:
-        lt,lg=_geocode_city(PROVS[city_query]); lat,lng=lt,lg
+    # Asignación por territorio (usar geo_lat/lng si ya lo calculamos)
+    lt = mem.get("geo_lat"); lg = mem.get("geo_lng")
+    if lt is None or lg is None:
+        # último intento de geocode del slug/etiqueta que tengamos
+        gname = mem["zone"].replace("-", " ")
+        lt,lg=_geocode_city(gname)
     phones, owner = ([], "unassigned")
-    if (lat is not None) and (lng is not None):
-        phones, owner = _find_assignees_by_latlng(lat,lng,_slug_city(city_query))
+    if (lt is not None) and (lg is not None):
+        phones, owner = _find_assignees_by_latlng(lt,lg,_slug_city(mem["zone"]))
     assignees = phones if phones else [CENTRAL_PHONE]
 
     transcript_text = " | ".join([t for t in mem.get("transcript",[]) if t])
     _save_task(call_sid=call_id, role=mem["role"], zone=mem["zone"], name=mem["name"],
                phone=mem["phone"], assignees=assignees, recording_url="", transcript_text=transcript_text)
 
-    resumen = (f"SpainRoom: {mem['role']} en {zona_lbl}. Nombre: {mem['name'] or 'N/D'}. "
-               f"Tel: {mem['phone'] or 'N/D'}. Nota: {mem['note'] or 'N/D'}. Destino: {owner}")
+    resumen = (f"SpainRoom: {mem['role']} en {mem['zone'].title().replace('-',' ')}. "
+               f"Nombre: {mem['name'] or 'N/D'}. Tel: {mem['phone'] or 'N/D'}. "
+               f"Nota: {mem['note'] or 'N/D'}. Destino: {owner}")
     for to in assignees:
         try:
             from twilio.rest import Client
@@ -561,25 +599,25 @@ body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b1118;col
 header{padding:16px 18px;background:#0b1118;position:sticky;top:0;border-bottom:1px solid #1b2a3a}
 .wrap{max-width:1120px;margin:20px auto;padding:0 14px}
 .card{background:var(--card);border:1px solid #1b2a3a;border-radius:12px;padding:16px}
-.row{display:flex;gap:12px;flex-wrap:wrap}
+row{display:flex;gap:12px;flex-wrap:wrap}
 table{width:100%;border-collapse:collapse;margin-top:10px}
 th,td{padding:9px;border-bottom:1px solid #1b2a3a;font-size:14px}
-th{color:var(--muted);text-align:left}
+th{color:#9fb0c3;text-align:left}
 tr:hover{background:#0e1722}
-button,select,input,textarea{background:#0e1620;border:1px solid #1b2a3a;color:var(--txt);border-radius:10px;padding:10px}
-button{background:var(--btn);border:0;cursor:pointer}
+button,select,input,textarea{background:#0e1620;border:1px solid #1b2a3a;color:#e7eef7;border-radius:10px;padding:10px}
+button{background:#2563eb;border:0;cursor:pointer}
 .pill{padding:4px 8px;border-radius:18px;font-size:12px}
 .pending{background:#1f2a37}.done{background:#0b3b2f}
 .toast{position:fixed;right:14px;bottom:14px;background:#0e1620;border:1px solid #1b2a3a;border-radius:10px;padding:10px 14px}
 </style></head><body>
 <header><h2 style="margin:0">SpainRoom · Tareas</h2></header>
 <div class="wrap"><div class="card">
-  <div class="row" style="align-items:end">
+  <div class="row" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     <div><label>Zona</label><br/><select id="fZone"><option value="">(todas)</option></select></div>
     <div><label>Estado</label><br/><select id="fStatus"><option value="">(todos)</option><option>pending</option><option>done</option></select></div>
     <div style="margin-left:auto"><button id="refresh">Actualizar</button></div>
   </div>
-  <div class="row">
+  <div class="row" style="display:flex;gap:12px;flex-wrap:wrap">
     <div style="flex:2;min-width:520px">
       <table id="tbl"><thead><tr><th>Fecha</th><th>Rol</th><th>Zona</th><th>Nombre</th><th>Teléfono</th><th>Estado</th><th>Ver</th></tr></thead><tbody></tbody></table>
     </div>
