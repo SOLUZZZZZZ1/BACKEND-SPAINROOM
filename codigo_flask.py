@@ -16,7 +16,6 @@ app = FastAPI(title="SpainRoom Voice Gateway")
 
 # ======= Util =======
 def resample_pcm16(pcm: bytes, src_hz: int, dst_hz: int) -> bytes:
-    """Re-muestreo PCM16 con stdlib (audioop)."""
     if src_hz == dst_hz or not pcm:
         return pcm
     out, _ = audioop.ratecv(pcm, 2, 1, src_hz, dst_hz, None)
@@ -33,7 +32,7 @@ def diag_key():
 
 @app.post("/diag/stream-log")
 async def stream_log(req: Request):
-    """Recibe eventos del <Stream> (start/media/stop)."""
+    """Recibe eventos del Stream (start/stop/error)."""
     try:
         if req.headers.get("content-type", "").startswith("application/json"):
             data = await req.json()
@@ -53,14 +52,12 @@ def voice_say():
 
 @app.post("/voice/answer")
 def voice_answer():
-    """TwiML bidireccional con callback de eventos para depurar."""
+    """TwiML de stream bidireccional (¡sin track!) con callback para logs."""
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="wss://backend-spainroom.onrender.com{TWILIO_WS_PATH}"
-            track="both_tracks"
-            statusCallback="https://backend-spainroom.onrender.com/diag/stream-log"
-            statusCallbackEvent="start mark media stop" />
+            statusCallback="https://backend-spainroom.onrender.com/diag/stream-log" />
   </Connect>
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
@@ -80,7 +77,7 @@ async def twilio_stream(ws_twilio: WebSocket):
 
     try:
         async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as ws_ai:
-            # Configurar sesión: audio 16k, VAD y reglas de idioma
+            # Sesión: audio 16k + VAD + idioma auto
             await ws_ai.send(json.dumps({
                 "type": "session.update",
                 "session": {
@@ -96,7 +93,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                 }
             }))
 
-            # Saludo inicial para verificar audio de salida
+            # Saludo inicial (garantiza voz de salida)
             await ws_ai.send(json.dumps({
                 "type": "response.create",
                 "response": {
@@ -105,13 +102,12 @@ async def twilio_stream(ws_twilio: WebSocket):
                 }
             }))
 
-            # --- Tarea: del modelo -> Twilio ---
+            # --- Modelo -> Twilio (audio de salida) ---
             async def ai_to_twilio():
                 try:
                     async for raw in ws_ai:
                         evt = json.loads(raw)
                         if evt.get("type") == "response.audio.delta":
-                            # PCM16 16k -> PCM16 8k -> µ-law 8k -> base64 -> Twilio
                             pcm16_16k = base64.b64decode(evt["audio"])
                             pcm16_8k = resample_pcm16(pcm16_16k, 16000, 8000)
                             ulaw = audioop.lin2ulaw(pcm16_8k, 2)
@@ -123,12 +119,11 @@ async def twilio_stream(ws_twilio: WebSocket):
                                     "media": {"payload": payload}
                                 }))
                 except Exception:
-                    # No caigas por cortes de red/audio
                     pass
 
             task = asyncio.create_task(ai_to_twilio())
 
-            # --- Bucle: Twilio -> modelo ---
+            # --- Twilio -> Modelo (audio de entrada) ---
             try:
                 while True:
                     text = await ws_twilio.receive_text()
@@ -139,7 +134,6 @@ async def twilio_stream(ws_twilio: WebSocket):
                         stream_sid = msg["start"]["streamSid"]
 
                     elif ev == "media":
-                        # base64(µ-law 8k) -> µ-law -> PCM16 8k -> PCM16 16k -> base64 -> modelo
                         ulaw_b64 = msg["media"]["payload"]
                         ulaw = base64.b64decode(ulaw_b64)
                         pcm16_8k = audioop.ulaw2lin(ulaw, 2)
@@ -153,7 +147,6 @@ async def twilio_stream(ws_twilio: WebSocket):
                         break
 
             except WebSocketDisconnect:
-                # Llamada colgada desde Twilio
                 pass
             finally:
                 task.cancel()
@@ -161,7 +154,6 @@ async def twilio_stream(ws_twilio: WebSocket):
                     await task
 
     except Exception as e:
-        # Error de conexión con OpenAI o durante el puente
         with contextlib.suppress(Exception):
             await ws_twilio.send_text(json.dumps({"event": "error", "message": str(e)}))
         with contextlib.suppress(Exception):
