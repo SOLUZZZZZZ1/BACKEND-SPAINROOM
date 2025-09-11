@@ -1,12 +1,13 @@
-# SpainRoom · Backend principal (Render: gunicorn codigo_flask:app)
-# - Voz por turnos (SSML natural sin <speak> ni amazon:*), _twiml seguro
-# - Captura robusta de POBLACIÓN: heurística + geocodificación del texto (Nominatim)
-# - Rellena varios slots si el usuario los dice juntos (rol, población, nombre, teléfono)
-# - WAF (no inspecciona /voice), Tareas JSONL + UI /admin/tasks + SMS, Territorios (microzonas + rejilla)
+# SpainRoom · Backend (Render: gunicorn codigo_flask:app)
+# - Voz por turnos (SSML sin <speak> ni amazon:*), _twiml seguro (adiós 'goodbye')
+# - Captura robusta de población y nombre (heurística + geocodificación; fallback en 'ask_name')
+# - Rellena varios slots si el usuario los dice de golpe (rol/ciudad/nombre/teléfono)
+# - WAF mínimo (no inspecciona /voice), Tareas JSONL + UI /admin/tasks, Territorios (demo)
+# Start Command: gunicorn codigo_flask:app --preload --bind 0.0.0.0:$PORT
 
 from flask import Flask, request, jsonify, Response, Response as _FlaskResponse, has_request_context
 import requests, json, os, re, random, tempfile, shutil
-from math import radians, sin, cos, sqrt, atan2, floor
+from math import floor
 from urllib.parse import unquote_plus
 from datetime import datetime, timezone
 
@@ -16,9 +17,8 @@ app = Flask(__name__)
 CENTRAL_PHONE = os.getenv("CENTRAL_PHONE", "+12252553716")
 SMS_FROM      = os.getenv("TWILIO_MESSAGING_FROM", "+12252553716")
 VOICE_FROM    = os.getenv("TWILIO_VOICE_FROM", "+12252553716")
-TTS_VOICE     = os.getenv("TTS_VOICE", "Polly.Conchita")   # compatible Twilio-Polly
+TTS_VOICE     = os.getenv("TTS_VOICE", "Polly.Conchita")
 TERR_FILE     = os.getenv("TERR_FILE", "/tmp/spainroom_territories.json")
-TERR_TOKEN    = os.getenv("TERR_TOKEN", "")
 GRID_SIZE_DEG = float(os.getenv("GRID_SIZE_DEG", "0.05"))  # ≈5–6 km
 TASKS_FILE    = "/tmp/spainroom_tasks.jsonl"
 
@@ -34,158 +34,46 @@ def _now_iso(): return datetime.now(tz=timezone.utc).isoformat()
 DEF_CFG = {
     "MAX_BODY": int(os.getenv("DEFENSE_MAX_BODY", "524288")),
     "ALLOW_METHODS": set((os.getenv("DEFENSE_ALLOW_METHODS", "GET,POST,OPTIONS")).split(",")),
-    "ALLOW_CT": set(ct.strip().lower() for ct in os.getenv(
-        "DEFENSE_ALLOW_CT",
-        "application/json,application/x-www-form-urlencoded,multipart/form-data,text/xml,application/xml"
-    ).split(",")),
-    "BLOCKED_UA": set(ua.strip().lower() for ua in os.getenv(
-        "DEFENSE_BLOCKED_UA", "sqlmap,nmap,nikto,dirbuster,acunetix").split(",")),
-    "STRICT_HOSTS": [h.strip().lower() for h in os.getenv("DEFENSE_HOSTS", "").split(",") if h.strip()],
-    "TRUST_PROXY": os.getenv("DEFENSE_TRUST_PROXY", "true").lower() == "true",
     "ANOMALY_THRESHOLD": int(os.getenv("DEFENSE_ANOMALY_THRESHOLD", "8")),
     "SKIP_PREFIXES": [p.strip() for p in os.getenv("DEFENSE_SKIP_PREFIXES", "/voice,/__routes,/health").split(",") if p.strip()],
 }
-_SQLI = [r"(?i)\bunion\b.+\bselect\b", r"(?i)\b(select|insert|update|delete)\b.+\bfrom\b",
-         r"(?i)\bor\s+1=1\b", r"(?i)\bsleep\(", r"(?i)information_schema", r"(?i)load_file\("]
-_XSS  = [r"(?i)<script\b", r"(?i)javascript:", r"(?i)onerror\s*="]
-_TRAV = [r"\.\./", r"%2e%2e%2f", r"\x00"]
-_BADH = ["X-Original-URL", "X-Override-URL"]
+_SQLI = [r"(?i)\bunion\b.+\bselect\b", r"(?i)\bor\s+1=1\b"]
+_XSS  = [r"(?i)<script\b", r"(?i)javascript:"]
 
-def _ip():
-    if has_request_context():
-        if DEF_CFG["TRUST_PROXY"]:
-            xf = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-            return xf or (request.remote_addr or "")
-        return request.remote_addr or ""
-    return "-"
-
-def _jlog(event, **kw):
-    payload = {
-        "ts": _now_iso(),
-        "event": event,
-        "ip": _ip(),
-        "path": request.path if has_request_context() else "-",
-        "method": request.method if has_request_context() else "-",
-        "rid": (request.headers.get("X-Request-ID", "") if has_request_context() else "")
-    }
-    payload.update(kw)
-    try: print(json.dumps(payload, ensure_ascii=False), flush=True)
-    except Exception: print(str(payload), flush=True)
-
-def _skip_waf():
+def _waf_skip():
     if not has_request_context(): return True
-    p = request.path or ""
-    return any(p.startswith(pref) for pref in DEF_CFG["SKIP_PREFIXES"])
-
-def _host_ok():
-    if not DEF_CFG["STRICT_HOSTS"] or not has_request_context(): return None
-    host = (request.headers.get("Host") or "").split(":")[0].lower().strip()
-    return None if host in DEF_CFG["STRICT_HOSTS"] else f"host_not_allowed:{host}"
-
-def _ua_ok():
-    if not has_request_context(): return None
-    ua = (request.headers.get("User-Agent") or "").lower()
-    for bad in DEF_CFG["BLOCKED_UA"]:
-        if bad and bad in ua: return f"ua_blocked:{bad}"
-    return None
-
-def _size_ok():
-    if not has_request_context(): return None
-    cl = request.content_length or 0
-    if not cl or cl <= DEF_CFG["MAX_BODY"]: return None
-    return f"body_too_large:{cl}"
-
-def _ct_ok():
-    if not has_request_context(): return None
-    if request.method in ("GET","HEAD","OPTIONS"): return None
-    ct = (request.headers.get("Content-Type","") or "").split(";")[0].strip().lower()
-    return None if (not ct or ct in DEF_CFG["ALLOW_CT"]) else f"bad_content_type:{ct}"
-
-def _badh_ok():
-    if not has_request_context(): return None
-    for h in _BADH:
-        if h in request.headers: return f"bad_header:{h}"
-    return None
-
-def _hit(pats, text):
-    if not text: return None
-    for p in pats:
-        if re.search(p, text): return p
-    return None
-
-def _qs_ok():
-    if not has_request_context(): return None
-    qs = request.query_string.decode("utf-8","ignore")
-    if _hit(_SQLI, qs): return "sqli_qs"
-    if _hit(_XSS, qs):  return "xss_qs"
-    return None
-
-def _trav_ok():
-    if not has_request_context(): return None
-    return "traversal_path" if _hit(_TRAV, (request.path or "").lower()) else None
-
-def _body_ok():
-    if not has_request_context(): return None
-    try:
-        raw = request.get_data(cache=False, as_text=True)[:4096]
-    except Exception:
-        return None
-    if _hit(_SQLI, raw): return "sqli_body"
-    if _hit(_XSS, raw):  return "xss_body"
-    return None
+    path = request.path or ""
+    return any(path.startswith(p) for p in DEF_CFG["SKIP_PREFIXES"])
 
 @app.before_request
-def _waf_gate():
-    if _skip_waf(): return
-    score, reasons = 0, []
-    for chk in (_host_ok, _ua_ok, _size_ok, _ct_ok, _badh_ok, _trav_ok, _qs_ok, _body_ok):
-        r = chk()
-        if r:
-            reasons.append(r)
-            score += 2 if chk in (_host_ok,_ua_ok,_size_ok,_ct_ok,_badh_ok) else 3
-    if request.method not in DEF_CFG["ALLOW_METHODS"]:
-        reasons.append(f"method_not_allowed:{request.method}"); score += 2
-    if score >= DEF_CFG["ANOMALY_THRESHOLD"]:
-        _jlog("waf_block", reason=",".join(reasons), score=score)
-        return Response(status=403)
+def _waf():
+    if _waf_skip(): return
+    score=0
+    if request.method not in DEF_CFG["ALLOW_METHODS"]: score+=2
+    q = request.query_string.decode("utf-8","ignore")
+    b = (request.get_data(cache=False, as_text=True) or "")[:2048]
+    if any(re.search(p,q) for p in _SQLI+_XSS): score+=3
+    if any(re.search(p,b) for p in _SQLI+_XSS): score+=3
+    if score >= DEF_CFG["ANOMALY_THRESHOLD"]: return Response(status=403)
 
 @app.after_request
-def _secure_headers(resp):
-    resp.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
-    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("Referrer-Policy", "no-referrer")
-    resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-    resp.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-    return resp
+def _sec(r):
+    r.headers.setdefault("Strict-Transport-Security","max-age=63072000; includeSubDomains; preload")
+    r.headers.setdefault("X-Content-Type-Options","nosniff")
+    r.headers.setdefault("X-Frame-Options","DENY")
+    r.headers.setdefault("Referrer-Policy","no-referrer")
+    r.headers.setdefault("Permissions-Policy","geolocation=(), microphone=(), camera=()")
+    r.headers.setdefault("Content-Security-Policy","default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+    return r
 
 # -------------------- Salud --------------------
 @app.get("/health")
 def health(): return jsonify(ok=True, service="BACKEND-SPAINROOM"), 200
 
-# -------------------- Geocode demo --------------------
-def calcular_distancia(lat1, lon1, lat2, lon2):
-    R=6371; dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
-    a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
-    return 2*atan2(sqrt(a), sqrt(1-a))*R
-
-@app.get("/api/geocode")
-def geocode():
-    address = request.args.get("address")
-    if not address: return jsonify({"error":"Falta parámetro address"}), 400
-    url=f"https://nominatim.openstreetmap.org/search?q={address}&format=json&limit=1"
-    r=requests.get(url,headers={"User-Agent":"SpainRoom/1.0"},timeout=10)
-    if r.status_code!=200 or not r.json(): return jsonify({"error":"No se pudo geocodificar"}), 500
-    d=r.json()[0]; return jsonify({"lat":float(d["lat"]), "lng":float(d["lon"]) })
-
-# -------------------- VOZ (SSML natural, sin <speak> ni amazon:*) --------------------
+# -------------------- SSML helpers --------------------
 def _ssml(text: str) -> str:
-    """
-    [[b300]] -> <break time="300ms"/>, [[digits:600123123]] -> <say-as interpret-as="digits">...</say-as>
-    (No usamos <speak>; Twilio soporta <prosody>/<break>/<say-as> dentro de <Say>)
-    """
     s=text
-    s=re.sub(r"\[\[b(\d{2,4})\]\]", lambda m:f'<break time="{m.group(1)}ms"/>', s)
+    s=re.sub(r"\[\[b(\d{2,4})\]\]", lambda m:f'<break time="{m.group(1)}ms"/>', s)  # [[b250]]
     s=re.sub(r"\[\[digits:([\d\s\+]+)\]\]", lambda m:f'<say-as interpret-as="digits">{m.group(1)}</say-as>', s)
     return f'<prosody rate="medium" pitch="+2%">{s}</prosody>'
 
@@ -194,25 +82,311 @@ def _say_es_ssml(text: str) -> str:
 
 def _line(*opts): return random.choice([o for o in opts if o])
 
-def _gather_es(action: str, timeout="10", end_silence="auto",
-               hints=("sí, si, no, propietario, inquilino, jaen, madrid, valencia, sevilla, "
-                      "barcelona, malaga, granada, soy, me llamo, mi nombre es, "
-                      "uno,dos,tres,cuatro,cinco,seis,siete,ocho,nueve,cero"),
-               allow_dtmf: bool=False) -> str:
+def _gather_es(action: str, timeout="10", end_silence="auto", allow_dtmf=False) -> str:
+    hints=("sí, si, no, propietario, inquilino, jaen, madrid, valencia, sevilla, "
+           "barcelona, malaga, granada, soy, me llamo, mi nombre es, uno,dos,tres,cuatro,cinco, "
+           "seis,siete,ocho,nueve,cero")
     mode="speech dtmf" if allow_dtmf else "speech"
     return (f'<Gather input="{mode}" language="es-ES" timeout="{timeout}" '
             f'speechTimeout="{end_silence}" speechModel="phone_call" bargeIn="true" '
             f'action="{action}" method="POST" actionOnEmptyResult="true" hints="{hints}">')
 
-# -------------------- Tareas (JSONL) --------------------
-def _save_task(call_sid, role, zone, name, phone, assignees, recording_url, transcript_text):
-    task={"created_at":_now_iso(),"call_sid":call_sid,"role":role,"zone":zone,
-          "name":name,"phone":phone,"assignees":assignees,"recording":recording_url,
-          "transcript":transcript_text,"status":"pending"}
-    try:
-        with open(TASKS_FILE,"a",encoding="utf-8") as f: f.write(json.dumps(task,ensure_ascii=False)+"\n")
-    except Exception as e: _jlog("task_file_fail", error=str(e))
+# -------------------- Territorios (demo) --------------------
+PROVS = {"jaen":"Jaén","madrid":"Madrid","valencia":"Valencia","sevilla":"Sevilla","barcelona":"Barcelona","malaga":"Málaga","granada":"Granada"}
 
+def _slug(s:str)->str:
+    s=(s or "").lower().strip()
+    for a,b in {"á":"a","é":"e","í":"i","ó":"o","ú":"u","ü":"u","ñ":"n"}.items(): s=s.replace(a,b)
+    return re.sub(r"[^a-z0-9]+","-",s).strip("-")
+
+def _tile_key(lat:float,lng:float,size:float=GRID_SIZE_DEG)->str:
+    return f"tile_{size:.3f}_{floor(lat/size)}_{floor(lng/size)}"
+
+def _territories_load():
+    if os.path.exists(TERR_FILE):
+        try:
+            with open(TERR_FILE,"r",encoding="utf-8") as f: return json.load(f)
+        except: pass
+    return {"tiles":{}, "microzones":[]}  # demo vacío
+
+def _in_bbox(lat,lng,b): return (b[0] <= lat <= b[2]) and (b[1] <= lng <= b[3])
+
+def _geocode_city(city:str):
+    try:
+        url=f"https://nominatim.openstreetmap.org/search?q={city}, España&format=json&limit=1"
+        r=requests.get(url, headers={"User-Agent":"SpainRoom/1.0"}, timeout=8)
+        if r.status_code==200 and r.json():
+            d=r.json()[0]; return float(d["lat"]), float(d["lon"])
+    except: pass
+    return None,None
+
+TERR=_territories_load()
+
+def _find_phones(lat,lng,city_slug):
+    for mz in TERR.get("microzones",[]):
+        if mz.get("city")==city_slug and _in_bbox(lat,lng,mz.get("bbox",[0,0,0,0])):
+            return mz.get("phones") or [], f"{mz.get('city')}::{mz.get('name')}"
+    key=_tile_key(lat,lng)
+    if key in TERR.get("tiles",{}):
+        t=TERR["tiles"][key]; return t.get("phones") or [], key
+    return [], "unassigned"
+
+# -------------------- Parsers --------------------
+def _norm(s:str)->str:
+    s=(s or "").lower().strip()
+    for a,b in {"á":"a","é":"e","í":"i","ó":"o","ú":"u","ü":"u","ñ":"n"}.items(): s=s.replace(a,b)
+    return s
+
+def _role(s:str)->str:
+    s=_norm(s)
+    if "propiet" in s or "duen" in s: return "propietario"
+    if "inquil" in s or "alquil" in s or "habitacion" in s: return "inquilino"
+    return ""
+
+def _city(s:str)->str:
+    s=_norm(s)
+    alias={"barna":"barcelona","md":"madrid","vlc":"valencia","sevill":"sevilla"}
+    for k,v in alias.items():
+        if k in s: s=v
+    for key in PROVS.keys():
+        if key in s or s==key: return key
+    return ""
+
+def _name_from_cued(s:str)->str:
+    """Intenta extraer el nombre cuando hay pistas (me llamo/mi nombre es/soy …)."""
+    s=(s or "")
+    m=re.search(r"(?i)(me llamo|mi nombre es|soy)\s+(.+)", s)
+    if not m: return ""
+    tail=m.group(2)
+    # Cortar si aparecen marcadores de teléfono o 'tel'
+    tail=re.split(r"(?i)(mi\s*telefono|mi\s*teléfono|telefono|tel\.?|móvil|movil)", tail)[0]
+    # Quitar dígitos y signos
+    tail=re.sub(r"[\d\+\-\.\(\)]"," ", tail)
+    # Coger hasta 3 tokens (nombre y apellidos cortos)
+    tokens=[t for t in re.split(r"\s+", tail.strip()) if len(t)>0][:3]
+    return " ".join(tokens).title()
+
+def _name_from_free(s:str)->str:
+    """Si el usuario dice solo 'Luis' o 'Luis Pérez'."""
+    s=(s or "").strip()
+    # Si contiene palabras de teléfono, no lo tratamos como nombre
+    if re.search(r"(?i)(telefono|tel\.?|m(ó|o)vil|movil|\d)", s): return ""
+    # Si es muy largo > 4 palabras, no es nombre libre
+    tokens=[t for t in re.split(r"\s+", s) if t]
+    if 1 <= len(tokens) <= 4:
+        # Descartar palabras sueltas comunes
+        bad={"soy","me","llamo","nombre","mi","es","el","la","de"}
+        if all(t.lower() not in bad for t in tokens):
+            return " ".join(tokens).title()
+    return ""
+
+def _phone_from(s:str, digits:str)->str:
+    d=re.sub(r"\D","", digits or "")
+    if len(d)>=9: return "+34"+d if not d.startswith(("34","+")) else ("+"+d if not d.startswith("+") else d)
+    s=_norm(s)
+    for k,v in {"uno":"1","dos":"2","tres":"3","cuatro":"4","cinco":"5","seis":"6","siete":"7","ocho":"8","nueve":"9","cero":"0"}.items():
+        s=s.replace(k,v)
+    d=re.sub(r"\D","", s)
+    if len(d)>=9: return "+34"+d if not d.startswith(("34","+")) else ("+"+d if not d.startswith("+") else d)
+    return ""
+
+def _geocode_guess(text:str):
+    q=(text or "").strip()
+    if len(q)<3: return None,None,None
+    try:
+        url=f"https://nominatim.openstreetmap.org/search?q={q}, España&format=json&limit=1"
+        r=requests.get(url, headers={"User-Agent":"SpainRoom/1.0"}, timeout=8)
+        if r.status_code==200 and r.json():
+            d=r.json()[0]; name=d.get("display_name","").split(",")[0]
+            return _slug(name), float(d["lat"]), float(d["lon"])
+    except: pass
+    return None,None,None
+
+# -------------------- Estado por llamada --------------------
+# step: ask_role → ask_city → ask_name → ask_phone → ask_note → confirm
+_IVR = {}  # CallSid -> { step, role, zone, name, phone, note, transcript:[], miss, geo_lat, geo_lng }
+
+@app.get("/voice/health")
+def voice_health(): return jsonify(ok=True, service="voice"), 200
+
+@app.route("/voice/answer", methods=["GET","POST"])
+def voice_answer():
+    cid = unquote_plus(request.form.get("CallSid","") or request.args.get("CallSid","") or "")
+    _IVR[cid]={"step":"ask_role","role":"","zone":"","name":"","phone":"","note":"",
+               "miss":0,"transcript":[],"geo_lat":None,"geo_lng":None}
+    text=_line(
+        "Hola [[b200]] soy de SpainRoom. ¿Eres propietario o inquilino [[b200]] y de qué población hablamos?",
+        "¡Hola! [[b150]] Cuéntame en una frase [[b150]] si eres propietario o inquilino [[b150]] y la población."
+    )
+    return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml(text)+"</Gather>"
+                  +_say_es_ssml("No te escuché bien [[b200]] vamos otra vez.")
+                  +'<Redirect method="POST">/voice/answer</Redirect></Response>')
+
+def _advance(mem):
+    if mem["step"]=="ask_role" and mem["role"]: mem["step"]="ask_city"; mem["miss"]=0
+    if mem["step"]=="ask_city" and mem["zone"]: mem["step"]="ask_name"; mem["miss"]=0
+    if mem["step"]=="ask_name" and mem["name"]: mem["step"]="ask_phone"; mem["miss"]=0
+    if mem["step"]=="ask_phone" and mem["phone"]: mem["step"]="ask_note"; mem["miss"]=0
+    if mem["step"]=="ask_note" and mem["note"]: mem["step"]="confirm"; mem["miss"]=0
+
+@app.route("/voice/next", methods=["POST"])
+def voice_next():
+    cid = unquote_plus(request.form.get("CallSid",""))
+    speech = unquote_plus(request.form.get("SpeechResult","")); digits=request.form.get("Digits","")
+    mem=_IVR.setdefault(cid,{"step":"ask_role","role":"","zone":"","name":"",
+                             "phone":"","note":"","miss":0,"transcript":[],"geo_lat":None,"geo_lng":None})
+    s=(speech or "").strip()
+    if s: mem["transcript"].append(s)
+
+    # ---- Relleno rápido (aunque no sea el paso actual) ----
+    if not mem["role"]:
+        r=_role(s)
+        if r: mem["role"]=r
+    if not mem["zone"]:
+        c=_city(s)
+        if c: mem["zone"]=c
+        else:
+            z,lt,lg=_geocode_guess(s)
+            if z: mem["zone"]=z; mem["geo_lat"]=lt; mem["geo_lng"]=lg
+    if not mem["name"]:
+        n=_name_from_cued(s) or _name_from_free(s)
+        if n: mem["name"]=n
+    if not mem["phone"]:
+        ph=_phone_from(s,digits)
+        if ph: mem["phone"]=ph
+
+    # ---- Adelanta pasos con lo capturado ----
+    _advance(mem)
+
+    # ---- Small-talk SOLO si falta rol/ciudad y estamos en esos pasos ----
+    kind=None
+    if (mem["step"]=="ask_role" and not mem["role"]) or (mem["step"]=="ask_city" and not mem["zone"]):
+        kk=s.lower()
+        if any(k in kk for k in ['hola','buenas','qué tal','que tal']): kind='greeting'
+        elif any(k in kk for k in ['buen dia','buen día','tiempo','clima']): kind='weather'
+        elif any(k in kk for k in ['hora es','qué hora']): kind='time'
+        elif any(k in kk for k in ['gracias','muchas gracias']): kind='thanks'
+    if kind=='greeting':
+        return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml("Hola [[b150]] encantada. ¿Eres propietario o inquilino [[b150]] y de qué población?")+"</Gather></Response>")
+    if kind=='weather':
+        return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml("¡Qué bien! [[b150]] Dime [[b120]] ¿eres propietario o inquilino y en qué población?")+"</Gather></Response>")
+    if kind=='time':
+        return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml("Estoy aquí ahora mismo para ayudarte [[b150]] ¿propietario o inquilino [[b120]] y de qué población?")+"</Gather></Response>")
+    if kind=='thanks':
+        return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml("¡A ti! [[b120]] Seguimos [[b100]] ¿propietario o inquilino y de qué población?")+"</Gather></Response>")
+
+    # ---- Flujo por pasos ----
+    st=mem["step"]
+    if st=="ask_role":
+        if not mem["role"]:
+            mem["miss"]+=1
+            prompt="¿Eres propietario o inquilino?" if mem["miss"]<2 else "Solo dime [[b120]] propietario [[b120]] o inquilino."
+            return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml(prompt)+"</Gather></Response>")
+        mem["step"]="ask_city"; mem["miss"]=0; st="ask_city"
+
+    if st=="ask_city":
+        if not mem["zone"]:
+            mem["miss"]+=1
+            pregunta=("¿En qué población está el inmueble?" if mem["role"]=="propietario" else "¿En qué población quieres alquilar?")
+            if mem["miss"]>=2: pregunta="Solo la población [[b120]] por ejemplo Jaén o Madrid."
+            return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml(pregunta)+"</Gather></Response>")
+        mem["step"]="ask_name"; mem["miss"]=0; st="ask_name"
+
+    if st=="ask_name":
+        # Fallback directo: si dice solo "Luis" o "Luis Pérez", tómalo como nombre
+        if not mem["name"] and s:
+            n=_name_from_cued(s) or _name_from_free(s)
+            if n: mem["name"]=n
+        if not mem["name"]:
+            mem["miss"]+=1
+            return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml("¿Cuál es tu nombre completo?")+" </Gather></Response>")
+        mem["step"]="ask_phone"; mem["miss"]=0; st="ask_phone"
+
+    if st=="ask_phone":
+        if not mem["phone"]:
+            mem["miss"]+=1
+            txt="¿Cuál es un teléfono de contacto? [[b180]] Puedes decirlo o marcarlo en el teclado."
+            if mem["miss"]>=2: txt="Marca ahora tu número [[b150]] o díctalo despacio."
+            return _twiml("<Response>"+_gather_es("/voice/next", allow_dtmf=True)+_say_es_ssml(txt)+"</Gather></Response>")
+        mem["step"]="ask_note"; mem["miss"]=0; st="ask_note"
+
+    if st=="ask_note":
+        if not mem["note"]:
+            mem["miss"]+=1
+            return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml("Cuéntame brevemente el motivo de la llamada.")+"</Gather></Response>")
+        mem["step"]="confirm"; mem["miss"]=0; st="confirm"
+
+    if st=="confirm":
+        zona_lbl = mem["zone"].title().replace("-", " ")
+        phone_digits = re.sub(r"\D","", mem["phone"] or "")
+        phone_ssml = f"[[digits:{phone_digits}]]" if phone_digits else (mem["phone"] or "no consta")
+        resumen = f"{mem['name'] or 'sin nombre'}, {('propietario' if mem['role']=='propietario' else 'inquilino')} en {zona_lbl}. Teléfono {phone_ssml}. ¿Está correcto?"
+        return _twiml("<Response>"+_gather_es("/voice/confirm-summary", allow_dtmf=True)+_say_es_ssml(resumen)+"</Gather></Response>")
+
+    # fallback
+    return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml("Seguimos [[b120]] ¿me repites, por favor?")+"</Gather></Response>")
+
+@app.post("/voice/confirm-summary")
+def voice_confirm_summary():
+    cid=unquote_plus(request.form.get("CallSid",""))
+    speech=unquote_plus(request.form.get("SpeechResult","")); digits=request.form.get("Digits","")
+    yn="yes" if (digits=="1" or re.search(r"\b(si|sí|vale|correcto|claro|ok)\b",(speech or "").lower())) else \
+       ("no" if (digits=="2" or re.search(r"\bno\b",(speech or "").lower())) else "")
+    mem=_IVR.get(cid)
+    if not mem: return _twiml('<Response><Redirect method="POST">/voice/answer</Redirect></Response>')
+    if yn=="no":
+        mem["step"]="ask_city"; mem["miss"]=0
+        pregunta=("Vamos a corregirlo [[b120]] ¿en qué población está el inmueble?"
+                  if mem["role"]=="propietario" else "Vamos a corregirlo [[b120]] ¿en qué población quieres alquilar?")
+        return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml(pregunta)+"</Gather></Response>")
+    if yn!="yes":
+        return _twiml("<Response>"+_gather_es("/voice/confirm-summary", allow_dtmf=True)+
+                      _say_es_ssml("¿Me confirmas [[b120]] por favor? Di sí o no [[b120]] o pulsa 1 o 2.")+"</Gather></Response>")
+
+    # Asignación (demo): geocode final si hace falta
+    lt,lg = None,None
+    if mem.get("geo_lat") is not None and mem.get("geo_lng") is not None:
+        lt,lg = mem["geo_lat"], mem["geo_lng"]
+    else:
+        lt,lg=_geocode_city(mem["zone"].replace("-"," "))
+    phones, owner = ([], "unassigned")
+    if (lt is not None) and (lg is not None):
+        # Territorios demo (sin DB): si no hay, va a CENTRAL
+        # Para España completa: poblar TERR con /territories/claim (tile/bbox)
+        phones, owner = _find_phones(lt,lg,_slug(mem["zone"]))
+    assignees = phones if phones else [CENTRAL_PHONE]
+
+    transcript_text = " | ".join([t for t in mem.get("transcript",[]) if t])
+    _save_task(call_sid=cid, role=mem["role"], zone=mem["zone"], name=mem["name"],
+               phone=mem["phone"], assignees=assignees, recording_url="", transcript_text=transcript_text)
+
+    resumen=(f"SpainRoom: {mem['role']} en {mem['zone'].title().replace('-',' ')}. "
+             f"Nombre: {mem['name'] or 'N/D'}. Tel: {mem['phone'] or 'N/D'}. Nota: {mem['note'] or 'N/D'}. Destino: {owner}")
+    for to in assignees:
+        try:
+            from twilio.rest import Client
+            Client(os.getenv("TWILIO_ACCOUNT_SID",""), os.getenv("TWILIO_AUTH_TOKEN","")).messages.create(
+                from_=SMS_FROM, to=to, body=resumen
+            )
+        except: pass
+
+    thanks=_line("Perfecto, ya tengo todo [[b150]] la persona de tu zona te llamará en breve. ¡Gracias!",
+                 "Gracias [[b150]] te llamarán desde tu zona en breve.")
+    del _IVR[cid]
+    return _twiml("<Response>"+_say_es_ssml(thanks)+"<Hangup/></Response>")
+
+# -------------------- Root / fallback --------------------
+@app.route("/", methods=["GET","POST"])
+def root_safe():
+    if request.method=="POST":
+        return _twiml(_say_es_ssml("Hola, te atiendo ahora mismo.")+'<Redirect method="POST">/voice/answer</Redirect>')
+    return ("",404)
+
+@app.route("/voice/fallback", methods=["GET","POST"])
+def voice_fallback():
+    return _twiml(_say_es_ssml("Un segundo, por favor.")+'<Redirect method="POST">/voice/answer</Redirect>')
+
+# -------------------- Tareas JSONL (UI) --------------------
 @app.get("/tasks/list")
 def tasks_list():
     out=[]
@@ -220,7 +394,7 @@ def tasks_list():
         if os.path.exists(TASKS_FILE):
             with open(TASKS_FILE,"r",encoding="utf-8") as f:
                 for line in f: out.append(json.loads(line))
-    except Exception as e: _jlog("task_list_file_fail", error=str(e))
+    except: pass
     return jsonify(out),200
 
 @app.post("/tasks/update")
@@ -242,8 +416,8 @@ def tasks_update():
         if last_idx==-1: return jsonify(ok=False,error="task_not_found"),404
         tasks[last_idx]["status"]=status
         if notes:
-            oldt=tasks[last_idx].get("transcript","")
-            tasks[last_idx]["transcript"]=(oldt + (" | " if oldt else "") + f"NOTA: {notes}")[:4000]
+            old=tasks[last_idx].get("transcript","")
+            tasks[last_idx]["transcript"]=(old+(" | " if old else "")+f"NOTA: {notes}")[:4000]
         with tempfile.NamedTemporaryFile("w",delete=False,encoding="utf-8") as tmp:
             for obj in tasks: tmp.write(json.dumps(obj,ensure_ascii=False)+"\n")
             tmp_path=tmp.name
@@ -251,373 +425,30 @@ def tasks_update():
     except Exception as e:
         return jsonify(ok=False,error=str(e)),500
 
-# -------------------- Territorios (microzonas + rejilla) --------------------
-PROVS = {"jaen":"Jaén","madrid":"Madrid","valencia":"Valencia","sevilla":"Sevilla",
-         "barcelona":"Barcelona","malaga":"Málaga","granada":"Granada"}
-
-def _slug_city(s:str)->str:
-    s=(s or "").lower().strip()
-    repl={"á":"a","é":"e","í":"i","ó":"o","ú":"u","ü":"u","ñ":"n"}
-    for k,v in repl.items(): s=s.replace(k,v)
-    return re.sub(r"[^a-z0-9]+","-",s).strip("-")
-
-def _tile_key(lat:float,lng:float,size:float=GRID_SIZE_DEG)->str:
-    lat_i=floor(lat/size); lng_i=floor(lng/size)
-    return f"tile_{size:.3f}_{lat_i}_{lng_i}"
-
-def _load_territories():
-    if os.path.exists(TERR_FILE):
-        try:
-            with open(TERR_FILE,"r",encoding="utf-8") as f: return json.load(f)
-        except: pass
-    return {"tiles":{}, "microzones":[]}
-
-def _save_territories(obj):
-    try:
-        with open(TERR_FILE,"w",encoding="utf-8") as f: json.dump(obj,f,ensure_ascii=False,indent=2)
-    except Exception as e: _jlog("territories_save_err", error=str(e))
-
-TERR=_load_territories()
-
-def _point_in_bbox(lat,lng,b): return (b[0] <= lat <= b[2]) and (b[1] <= lng <= b[3])
-
-def _geocode_city(city:str):
-    url=f"https://nominatim.openstreetmap.org/search?q={city}, España&format=json&limit=1"
-    r=requests.get(url,headers={"User-Agent":"SpainRoom/1.0"},timeout=10)
-    if r.status_code==200 and r.json():
-        d=r.json()[0]; return float(d["lat"]), float(d["lon"])
-    return None,None
-
-def _find_assignees_by_latlng(lat,lng,city_slug):
-    for mz in TERR.get("microzones",[]):
-        if mz.get("city")==city_slug and _point_in_bbox(lat,lng,mz.get("bbox",[0,0,0,0])):
-            return (mz.get("phones") or []), f"{mz.get('city')}::{mz.get('name')}"
-    key=_tile_key(lat,lng)
-    if key in TERR.get("tiles",{}):
-        t=TERR["tiles"][key]; return (t.get("phones") or []), key
-    return [], "unassigned"
-
-@app.get("/territories/list")
-def terr_list(): return jsonify(TERR),200
-
-@app.get("/territories/lookup")
-def terr_lookup():
-    city=request.args.get("city","").strip()
-    lat=request.args.get("lat"); lng=request.args.get("lng")
-    if city and not (lat and lng):
-        lt,lg=_geocode_city(city); 
-        if lt is None: return jsonify(ok=False,error="geocode_failed"),400
-        lat,lng=lt,lg
-    try:
-        lat=float(lat); lng=float(lng)
-    except: return jsonify(ok=False,error="lat_lng_required"),400
-    phones, owner=_find_assignees_by_latlng(lat,lng,_slug_city(city) if city else "")
-    return jsonify(ok=True, lat=lat, lng=lng, owner=owner, phones=phones),200
-
-def _auth_terr():
-    if not TERR_TOKEN: return True
-    return request.headers.get("X-Admin-Token","")==TERR_TOKEN
-
-@app.post("/territories/claim")
-def terr_claim():
-    if not _auth_terr(): return jsonify(ok=False,error="unauthorized"),403
-    payload=request.get_json(force=True) or {}
-    mode=payload.get("mode")  # "tile" | "bbox"
-    label=payload.get("label",""); phones=payload.get("phones") or []
-    if mode=="tile":
-        lat=float(payload.get("lat")); lng=float(payload.get("lng"))
-        size=float(payload.get("size", GRID_SIZE_DEG))
-        key=_tile_key(lat,lng,size); TERR["tiles"][key]={"label":label,"phones":phones}
-        _save_territories(TERR); return jsonify(ok=True,key=key),200
-    elif mode=="bbox":
-        city=_slug_city(payload.get("city","")); bbox=payload.get("bbox")  # [minlat,minlng,maxlat,maxlng]
-        if not (city and isinstance(bbox,list) and len(bbox)==4): return jsonify(ok=False,error="invalid_bbox"),400
-        TERR["microzones"].append({"city":city,"name":label,"bbox":bbox,"phones":phones})
-        _save_territories(TERR); return jsonify(ok=True),200
-    return jsonify(ok=False,error="mode_required"),400
-
-@app.post("/territories/unclaim")
-def terr_unclaim():
-    if not _auth_terr(): return jsonify(ok=False,error="unauthorized"),403
-    payload=request.get_json(force=True) or {}
-    mode=payload.get("mode")
-    if mode=="tile":
-        key=payload.get("key","")
-        if key in TERR.get("tiles",{}): TERR["tiles"].pop(key,None); _save_territories(TERR); return jsonify(ok=True),200
-        return jsonify(ok=False,error="not_found"),404
-    elif mode=="bbox":
-        city=_slug_city(payload.get("city","")); name=payload.get("label","")
-        arr=TERR.get("microzones",[]); n=len(arr)
-        TERR["microzones"]=[mz for mz in arr if not (mz.get("city")==city and mz.get("name")==name)]
-        if len(TERR["microzones"])<n: _save_territories(TERR); return jsonify(ok=True),200
-        return jsonify(ok=False,error="not_found"),404
-    return jsonify(ok=False,error="mode_required"),400
-
-# -------------------- VOZ: formulario por turnos --------------------
-def smalltalk_kind(s: str):
-    s=(s or '').lower()
-    if any(p in s for p in ['hola','buenas','qué tal','que tal']): return 'greeting'
-    if any(p in s for p in ['hace buen dia','buen día','tiempo','clima']): return 'weather'
-    if any(p in s for p in ['hora es','qué hora']): return 'time'
-    if any(p in s for p in ['gracias','muchas gracias']): return 'thanks'
-    return ''
-
-def _normalize(s:str)->str:
-    s=(s or "").lower().strip()
-    for a,b in (("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("ü","u"),("ñ","n")): s=s.replace(a,b)
-    return s
-
-def _parse_role(s:str)->str:
-    s=_normalize(s)
-    if "propiet" in s or "duen" in s: return "propietario"
-    if "inquil" in s or "alquil" in s or "habitacion" in s: return "inquilino"
-    return ""
-
-def _parse_city(s:str)->str:
-    s=_normalize(s)
-    alias={"barna":"barcelona","md":"madrid","vlc":"valencia","sevill":"sevilla"}
-    for k,v in alias.items():
-        if k in s: s=v
-    for key in PROVS.keys():
-        if key in s or s==key: return key
-    return _slug_city(s) if s else ""
-
-def _parse_name(s:str)->str: return (s or "").strip().title()[:80]
-
-def _parse_phone(s:str, digits:str)->str:
-    d=re.sub(r"\D","", digits or "")
-    if len(d)>=9: return "+34"+d if not d.startswith(("34","+")) else ("+"+d if not d.startswith("+") else d)
-    s=_normalize(s); repl={"uno":"1","dos":"2","tres":"3","cuatro":"4","cinco":"5","seis":"6","siete":"7","ocho":"8","nueve":"9","cero":"0"}
-    for k,v in repl.items(): s=s.replace(k,v)
-    d=re.sub(r"\D","", s)
-    if len(d)>=9: return "+34"+d if not d.startswith(("34","+")) else ("+"+d if not d.startswith("+") else d)
-    return ""
-
-def _geocode_guess(text: str):
-    """Intenta geocodificar la frase completa (España) y devuelve slug, lat, lng o (None, None, None)."""
-    q=(text or "").strip()
-    if len(q)<3: return None,None,None
-    try:
-        url=f"https://nominatim.openstreetmap.org/search?q={q}, España&format=json&limit=1"
-        r=requests.get(url, headers={"User-Agent":"SpainRoom/1.0"}, timeout=8)
-        if r.status_code==200 and r.json():
-            d=r.json()[0]; name=d.get("display_name","").split(",")[0]
-            return _slug_city(name), float(d["lat"]), float(d["lon"])
-    except Exception as e:
-        _jlog("geocode_guess_error", error=str(e))
-    return None,None,None
-
-# Memoria de llamada: almacenamos lat/lng cuando geocodificamos
-# step: ask_role → ask_city → ask_name → ask_phone → ask_note → confirm → done
-_IVR_MEM = {}  # CallSid -> { step, role, zone, name, phone, note, transcript:[], miss, geo_lat, geo_lng }
-
-@app.get("/voice/health")
-def voice_health(): return jsonify(ok=True, service="voice"), 200
-
-@app.route("/voice/answer", methods=["GET","POST"])
-def voice_answer():
-    call_id = unquote_plus(request.form.get("CallSid","") or request.args.get("CallSid","") or "")
-    _IVR_MEM[call_id]={"step":"ask_role","role":"","zone":"","name":"","phone":"","note":"",
-                       "miss":0,"transcript":[],"geo_lat":None,"geo_lng":None}
-    texto=_line(
-        "Hola [[b200]] soy de SpainRoom. ¿Eres propietario o inquilino [[b200]] y de qué población hablamos?",
-        "¡Hola! [[b150]] Cuéntame en una frase [[b150]] si eres propietario o inquilino [[b150]] y la población."
-    )
-    tw="<Response>"+ _gather_es("/voice/next") + _say_es_ssml(texto) + "</Gather>" \
-       + _say_es_ssml("No te escuché bien [[b200]] vamos otra vez.") \
-       + '<Redirect method="POST">/voice/answer</Redirect></Response>'
-    return _twiml(tw)
-
-@app.route("/voice/next", methods=["POST"])
-def voice_next():
-    call_id=unquote_plus(request.form.get("CallSid",""))
-    speech =unquote_plus(request.form.get("SpeechResult","")); digits=request.form.get("Digits","")
-    mem=_IVR_MEM.setdefault(call_id,{"step":"ask_role","role":"","zone":"","name":"",
-                                     "phone":"","note":"","miss":0,"transcript":[],"geo_lat":None,"geo_lng":None})
-    s=(speech or "").strip()
-    if s: mem["transcript"].append(s)
-
-    # ------ RELLENO RÁPIDO DE SLOTS (si el usuario dice cosas de más) ------
-    if not mem["role"]:
-        rr=_parse_role(s)
-        if rr: mem["role"]=rr
-    if not mem["zone"]:
-        cc=_parse_city(s)
-        if cc:
-            mem["zone"]=cc
-        else:
-            # Intento de geocodificar el texto si tiene pinta de lugar
-            z,lt,lg=_geocode_guess(s)
-            if z:
-                mem["zone"]=z; mem["geo_lat"]=lt; mem["geo_lng"]=lg
-    if not mem["name"]:
-        if any(k in s.lower() for k in ["me llamo","soy","mi nombre"]):
-            mem["name"]=_parse_name(re.sub(r"(?i).*(me llamo|soy|mi nombre es)\s*","",s,1))
-    if not mem["phone"]:
-        ph=_parse_phone(s,digits)
-        if ph: mem["phone"]=ph
-
-    step=mem["step"]
-
-    # ------ Small-talk ------
-    kind=smalltalk_kind(s)
-    if kind=='greeting':
-        return _twiml("<Response>"+ _gather_es("/voice/next") +
-                      _say_es_ssml("Hola [[b150]] encantada. ¿Eres propietario o inquilino [[b150]] y de qué población?") +
-                      "</Gather></Response>")
-    if kind=='weather':
-        return _twiml("<Response>"+ _gather_es("/voice/next") +
-                      _say_es_ssml("¡Qué bien! [[b150]] Dime [[b120]] ¿eres propietario o inquilino y en qué población?") +
-                      "</Gather></Response>")
-    if kind=='time':
-        return _twiml("<Response>"+ _gather_es("/voice/next") +
-                      _say_es_ssml("Estoy aquí ahora mismo para ayudarte [[b150]] ¿propietario o inquilino [[b120]] y de qué población?") +
-                      "</Gather></Response>")
-    if kind=='thanks':
-        return _twiml("<Response>"+ _gather_es("/voice/next") +
-                      _say_es_ssml("¡A ti! [[b120]] Seguimos [[b100]] ¿propietario o inquilino y de qué población?") +
-                      "</Gather></Response>")
-
-    # ------ Flujo por pasos ------
-    if step=="ask_role":
-        if not mem["role"]:
-            mem["miss"]+=1
-            prompt="¿Eres propietario o inquilino?" if mem["miss"]<2 else "Solo dime [[b120]] propietario [[b120]] o inquilino."
-            return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml(prompt)+"</Gather></Response>")
-        mem["step"]="ask_city"; mem["miss"]=0
-
-    if mem["step"]=="ask_city":
-        if not mem["zone"]:
-            mem["miss"]+=1
-            pregunta = ("¿En qué población está el inmueble?" if mem["role"]=="propietario"
-                        else "¿En qué población quieres alquilar?")
-            if mem["miss"]>=2: pregunta = "Solo la población [[b120]] por ejemplo Jaén o Madrid."
-            return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml(pregunta)+"</Gather></Response>")
-        mem["step"]="ask_name"; mem["miss"]=0
-
-    if mem["step"]=="ask_name":
-        if not mem["name"]:
-            mem["miss"]+=1
-            return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml("¿Cuál es tu nombre completo?")+" </Gather></Response>")
-        mem["step"]="ask_phone"; mem["miss"]=0
-
-    if mem["step"]=="ask_phone":
-        if not mem["phone"]:
-            mem["miss"]+=1
-            txt="¿Cuál es un teléfono de contacto? [[b180]] Puedes decirlo o marcarlo en el teclado."
-            if mem["miss"]>=2: txt="Marca ahora tu número [[b150]] o díctalo despacio."
-            return _twiml("<Response>"+ _gather_es("/voice/next", allow_dtmf=True)+ _say_es_ssml(txt)+"</Gather></Response>")
-        mem["step"]="ask_note"; mem["miss"]=0
-
-    if mem["step"]=="ask_note":
-        if not mem["note"]:
-            mem["miss"]+=1
-            return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml("Cuéntame brevemente el motivo de la llamada.")+"</Gather></Response>")
-        mem["step"]='confirm'; mem["miss"]=0
-
-    if mem["step"]=="confirm":
-        zona_lbl = mem["zone"].title().replace("-", " ")
-        phone_digits = re.sub(r"\D","", mem["phone"] or "")
-        phone_ssml = f"[[digits:{phone_digits}]]" if phone_digits else (mem["phone"] or "no consta")
-        resumen = f"{mem['name'] or 'sin nombre'}, {('propietario' if mem['role']=='propietario' else 'inquilino')} en {zona_lbl}. Teléfono {phone_ssml}. ¿Está correcto?"
-        return _twiml("<Response>"+ _gather_es("/voice/confirm-summary", allow_dtmf=True)+ _say_es_ssml(resumen)+"</Gather></Response>")
-
-    # fallback
-    return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml("Seguimos [[b120]] ¿me repites, por favor?")+"</Gather></Response>")
-
-@app.post("/voice/confirm-summary")
-def voice_confirm_summary():
-    call_id=unquote_plus(request.form.get("CallSid",""))
-    speech =unquote_plus(request.form.get("SpeechResult","")); digits=request.form.get("Digits","")
-    yn="yes" if (digits=="1" or re.search(r"\b(si|sí|vale|correcto|claro|ok)\b",(speech or "").lower())) else \
-       ("no"  if (digits=="2" or re.search(r"\bno\b",(speech or "").lower())) else "")
-    mem=_IVR_MEM.get(call_id)
-    if not mem:
-        return _twiml('<Response><Redirect method="POST">/voice/answer</Redirect></Response>')
-    if yn=="no":
-        mem["step"]="ask_city"; mem["miss"]=0
-        pregunta=("Vamos a corregirlo [[b120]] ¿en qué población está el inmueble?"
-                  if mem["role"]=="propietario" else
-                  "Vamos a corregirlo [[b120]] ¿en qué población quieres alquilar?")
-        return _twiml("<Response>"+ _gather_es("/voice/next")+ _say_es_ssml(pregunta)+"</Gather></Response>")
-    if yn!="yes":
-        return _twiml("<Response>"+ _gather_es("/voice/confirm-summary", allow_dtmf=True)+
-                      _say_es_ssml("¿Me confirmas [[b120]] por favor? Di sí o no [[b120]] o pulsa 1 o 2.")
-                      +"</Gather></Response>")
-
-    # Asignación por territorio (usar geo_lat/lng si ya lo calculamos)
-    lt = mem.get("geo_lat"); lg = mem.get("geo_lng")
-    if lt is None or lg is None:
-        # último intento de geocode del slug/etiqueta que tengamos
-        gname = mem["zone"].replace("-", " ")
-        lt,lg=_geocode_city(gname)
-    phones, owner = ([], "unassigned")
-    if (lt is not None) and (lg is not None):
-        phones, owner = _find_assignees_by_latlng(lt,lg,_slug_city(mem["zone"]))
-    assignees = phones if phones else [CENTRAL_PHONE]
-
-    transcript_text = " | ".join([t for t in mem.get("transcript",[]) if t])
-    _save_task(call_sid=call_id, role=mem["role"], zone=mem["zone"], name=mem["name"],
-               phone=mem["phone"], assignees=assignees, recording_url="", transcript_text=transcript_text)
-
-    resumen = (f"SpainRoom: {mem['role']} en {mem['zone'].title().replace('-',' ')}. "
-               f"Nombre: {mem['name'] or 'N/D'}. Tel: {mem['phone'] or 'N/D'}. "
-               f"Nota: {mem['note'] or 'N/D'}. Destino: {owner}")
-    for to in assignees:
-        try:
-            from twilio.rest import Client
-            Client(os.getenv("TWILIO_ACCOUNT_SID",""), os.getenv("TWILIO_AUTH_TOKEN","")).messages.create(
-                from_=SMS_FROM, to=to, body=resumen
-            )
-        except Exception as e:
-            _jlog("sms_fail", error=str(e), to=to)
-
-    gracias=_line("Perfecto, ya tengo todo [[b150]] la persona de tu zona te llamará en breve. ¡Gracias!",
-                  "Gracias [[b150]] te llamarán desde tu zona en breve.")
-    del _IVR_MEM[call_id]
-    return _twiml("<Response>"+ _say_es_ssml(gracias) + "<Hangup/></Response>")
-
-# -------------------- Root y fallback --------------------
-@app.route("/", methods=["GET","POST"])
-def root_safe():
-    if request.method=="POST":
-        return _twiml(_say_es_ssml("Hola, te atiendo ahora mismo.") + '<Redirect method="POST">/voice/answer</Redirect>')
-    return ("",404)
-
-@app.route("/voice/fallback", methods=["GET","POST"])
-def voice_fallback():
-    return _twiml(_say_es_ssml("Un segundo, por favor.") + '<Redirect method="POST">/voice/answer</Redirect>')
-
-# -------------------- UI de tareas --------------------
 @app.get("/admin/tasks")
 def admin_tasks_page():
     html = """<!doctype html><html lang="es"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>SpainRoom · Tareas</title>
-<style>:root{--card:#121923;--bg:#0c141d;--muted:#9fb0c3;--txt:#e7eef7;--btn:#2563eb}
-body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b1118;color:var(--txt)}
-header{padding:16px 18px;background:#0b1118;position:sticky;top:0;border-bottom:1px solid #1b2a3a}
+<style>body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b1118;color:#e7eef7}
+header{padding:16px 18px;background:#0b1118;border-bottom:1px solid #1b2a3a}
 .wrap{max-width:1120px;margin:20px auto;padding:0 14px}
-.card{background:var(--card);border:1px solid #1b2a3a;border-radius:12px;padding:16px}
-row{display:flex;gap:12px;flex-wrap:wrap}
+.card{background:#121923;border:1px solid #1b2a3a;border-radius:12px;padding:16px}
 table{width:100%;border-collapse:collapse;margin-top:10px}
-th,td{padding:9px;border-bottom:1px solid #1b2a3a;font-size:14px}
-th{color:#9fb0c3;text-align:left}
-tr:hover{background:#0e1722}
+th,td{padding:9px;border-bottom:1px solid #1b2a3a;font-size:14px} th{color:#9fb0c3;text-align:left}
 button,select,input,textarea{background:#0e1620;border:1px solid #1b2a3a;color:#e7eef7;border-radius:10px;padding:10px}
 button{background:#2563eb;border:0;cursor:pointer}
-.pill{padding:4px 8px;border-radius:18px;font-size:12px}
-.pending{background:#1f2a37}.done{background:#0b3b2f}
+.pill{padding:4px 8px;border-radius:18px;font-size:12px}.pending{background:#1f2a37}.done{background:#0b3b2f}
 .toast{position:fixed;right:14px;bottom:14px;background:#0e1620;border:1px solid #1b2a3a;border-radius:10px;padding:10px 14px}
 </style></head><body>
 <header><h2 style="margin:0">SpainRoom · Tareas</h2></header>
 <div class="wrap"><div class="card">
-  <div class="row" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
+  <div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
     <div><label>Zona</label><br/><select id="fZone"><option value="">(todas)</option></select></div>
     <div><label>Estado</label><br/><select id="fStatus"><option value="">(todos)</option><option>pending</option><option>done</option></select></div>
     <div style="margin-left:auto"><button id="refresh">Actualizar</button></div>
   </div>
-  <div class="row" style="display:flex;gap:12px;flex-wrap:wrap">
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
     <div style="flex:2;min-width:520px">
       <table id="tbl"><thead><tr><th>Fecha</th><th>Rol</th><th>Zona</th><th>Nombre</th><th>Teléfono</th><th>Estado</th><th>Ver</th></tr></thead><tbody></tbody></table>
     </div>
@@ -656,8 +487,7 @@ async function save(){ if(!st.sel){toast('Selecciona una tarea');return;}
  const r=await fetch('/tasks/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
  if(r.ok){toast('Guardado'); await load(); $('#formBox').style.display='none'; $('#selInfo').style.display='block';} else {toast('Error');} }
 $('#refresh').onclick=load; $('#fZone').onchange=render; $('#fStatus').onchange=render; $('#save').onclick=save; load();
-</script></body></html>
-"""
+</script></body></html>"""
     return _FlaskResponse(html, mimetype="text/html; charset=utf-8")
 
 # -------------------- Diagnóstico --------------------
