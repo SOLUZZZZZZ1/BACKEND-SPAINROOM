@@ -10,11 +10,12 @@ SQLAlchemy==2.0.30
 # Utilidades
 python-dotenv==1.0.1
 
-# WSGI server
+# WSGI/ASGI server
 gunicorn==22.0.0
+uvicorn==0.30.0
 
 # Pagos (Stripe)
-stripe==7.11.0
+stripe==5.8.0
 
 # Seguridad / defensa
 flask-limiter==3.7.0
@@ -25,3 +26,7 @@ twilio==9.2.3
 
 # HTTP requests
 requests==2.32.3
+
+# ==== Añadidos para Realtime + WebSocket ====
+fastapi==0.111.0
+websockets==12.0
