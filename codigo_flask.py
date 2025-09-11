@@ -31,7 +31,7 @@ def resample_pcm16(pcm: bytes, src_hz: int, dst_hz: int) -> bytes:
     out, _ = audioop.ratecv(pcm, 2, 1, src_hz, dst_hz, None)
     return out
 
-# ========= HTTP =========
+# ========= Health / Diag =========
 @app.get("/voice/health")
 def health():
     return {"ok": True, "service": "voice"}
@@ -40,6 +40,19 @@ def health():
 def diag_key():
     return {"openai_key_configured": bool(OPENAI_API_KEY)}
 
+# ========= TwiML PRUEBA (GET+POST) =========
+@app.get("/voice/test_female")
+@app.post("/voice/test_female")
+def voice_test_female():
+    """Prueba del circuito telefónico con TTS Twilio (sin streaming)."""
+    twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice" language="es-ES">Prueba de voz femenina en el circuito telefónico. SpainRoom operativo.</Say>
+</Response>"""
+    return Response(twiml, media_type="application/xml; charset=utf-8")
+
+# ========= TwiML STREAMING (GET+POST) =========
+@app.get("/voice/answer")
 @app.post("/voice/answer")
 def voice_answer():
     """TwiML de stream bidireccional (sin track, evita 31941)."""
@@ -51,7 +64,7 @@ def voice_answer():
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
 
-# ========= WS: Twilio ⇄ OpenAI Realtime =========
+# ========= WebSocket: Twilio ⇄ OpenAI Realtime =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
     # Twilio envía Sec-WebSocket-Protocol: audio → acéptalo
@@ -69,7 +82,7 @@ async def twilio_stream(ws_twilio: WebSocket):
 
     try:
         async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as ws_ai:
-            # 1) Sesión del modelo: PCM16 16k limpio + voz femenina + VAD + guardarraíles SpainRoom
+            # 1) Sesión: PCM16 16k + voz femenina + VAD + guardarraíles SpainRoom
             await ws_ai.send(json.dumps({
                 "type": "session.update",
                 "session": {
@@ -81,21 +94,16 @@ async def twilio_stream(ws_twilio: WebSocket):
                     "instructions": (
                         "Te llamas Nora y trabajas en SpainRoom (alquiler de HABITACIONES). "
                         "Voz FEMENINA, cercana y ágil (ritmo natural, frases cortas). "
-                        "NUNCA hables de muebles, tiendas, IKEA ni productos: si el usuario pregunta por algo "
-                        "ajeno a habitaciones, responde cortésmente que tu función es ayudar con alquiler de habitaciones "
-                        "y redirige con: «Puedo ayudarte a encontrar/alquilar una HABITACIÓN. ¿Eres propietario o inquilino?». "
-                        "Flujo SpainRoom (no los leas literalmente, úsalos como guía): "
-                        "1) Pregunta si es PROPIETARIO o INQUILINO. "
-                        "2) Pide la POBLACIÓN de interés. "
-                        "3) Pide NOMBRE COMPLETO. "
-                        "4) Pide TELÉFONO. "
-                        "Contesta siempre en el idioma del usuario (ES/EN) y cambia si el usuario cambia. "
-                        "Permite interrupciones (barge-in) y mantén un tono profesional y resolutivo."
+                        "Si el usuario pregunta por temas ajenos (muebles, tiendas, etc.), "
+                        "indica cortésmente que ayudas con HABITACIONES y redirige: "
+                        "«Puedo ayudarte con habitaciones. ¿Eres propietario o inquilino?» "
+                        "Responde en el idioma del usuario (ES/EN) y cambia si el usuario cambia. "
+                        "Permite interrupciones (barge-in) y mantén tono profesional."
                     )
                 }
             }))
 
-            # 2) Hilo: Modelo → Twilio (PCM16 16k → μ-law 8k en chunks de 20 ms y pacing real)
+            # 2) Modelo → Twilio (PCM16 16k → μ-law 8k en chunks de 20 ms, sin freno)
             async def ai_to_twilio():
                 try:
                     async for raw in ws_ai:
@@ -119,7 +127,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                                         "streamSid": stream_sid,
                                         "media": {"payload": payload}
                                     }))
-                                    await asyncio.sleep(0.02)  # pace 20 ms para evitar “voz lenta”
+                                    await asyncio.sleep(0)  # sin retraso artificial
 
                         elif t == "error":
                             print("OPENAI REALTIME ERROR:", evt)
@@ -141,13 +149,10 @@ async def twilio_stream(ws_twilio: WebSocket):
                     if ev == "start":
                         stream_sid = msg["start"]["streamSid"]
                         started = True
-                        # Saludo inicial (ya con streamSid)
+                        # Saludo inicial
                         await ws_ai.send(json.dumps({
                             "type": "response.create",
-                            "response": {
-                                "instructions":
-                                    "Hola, soy Nora de SpainRoom. ¿Eres propietario o inquilino?"
-                            }
+                            "response": { "instructions": "Hola, soy Nora de SpainRoom. ¿En qué puedo ayudarte?" }
                         }))
 
                     elif ev == "media":
