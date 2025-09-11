@@ -1,10 +1,10 @@
 # SpainRoom · Backend (Render: gunicorn codigo_flask:app)
-# - Voz por turnos (SSML sin <speak> / amazon:*), _twiml seguro (adiós 'goodbye')
-# - Slots en orden: Rol → Población (obligatoria) → Nombre → Teléfono → Nota → Confirmación
-# - Población robusta (heurística + geocód. del texto)
+# - Voz por turnos (SSML válido), _twiml seguro
+# - Slots: Rol → Población (obligatoria) → Nombre → Teléfono → Nota → Confirmación
+# - Paso ask_note: tras 2 intentos vacíos, pone "(no especificado)" y continúa (anti-bucle)
+# - WAF ligero (no inspecciona /voice, /health, /__routes)
 # - Tareas JSONL + UI /admin/tasks
 # - Territorios: /admin/territories (Leaflet) + /territories/auto_seed
-# - WAF ligero (no inspecciona /voice, /health, /__routes)
 
 from flask import Flask, request, jsonify, Response, Response as _FlaskResponse, has_request_context
 import requests, json, os, re, random, tempfile, shutil
@@ -316,10 +316,18 @@ def voice_next():
         mem["step"]="ask_note"; mem["miss"]=0; st="ask_note"
 
     if st=="ask_note":
-        if not mem["note"]:
+        if s:
+            mem["note"]=s
+            mem["step"]="confirm"; mem["miss"]=0
+            st="confirm"
+        else:
             mem["miss"]+=1
-            return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml("Cuéntame brevemente el motivo de la llamada.")+"</Gather></Response>")
-        mem["step"]="confirm"; mem["miss"]=0; st="confirm"
+            if mem["miss"]>=2:
+                mem["note"]="(no especificado)"
+                mem["step"]="confirm"; mem["miss"]=0
+                st="confirm"
+            else:
+                return _twiml("<Response>"+_gather_es("/voice/next")+_say_es_ssml("Cuéntame brevemente el motivo de la llamada.")+"</Gather></Response>")
 
     if st=="confirm":
         zona_lbl = mem["zone"].title().replace("-", " ")
@@ -547,11 +555,7 @@ def admin_territories():
   </div>
 </div>
 """
-    # Inyectamos la constante de servidor sin f-string en el bloque grande
-    html_const = f"""
-<script>const GRID_SIZE_DEG = {GRID_SIZE_DEG};</script>
-"""
-
+    html_const = f"""<script>const GRID_SIZE_DEG = {GRID_SIZE_DEG};</script>"""
     html_tail = """
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
@@ -668,7 +672,7 @@ def terr_auto_seed():
     """
     JSON:
     { "city": "Madrid", "mode": "madrid_barrios" | "barcelona_distritos" | "by_population",
-      "population": 3200000, "phones": ["+34..."] }
+      "population": 3200000, "phones": ["+34..."], "cells": 0 (opcional override) }
     """
     global TERR
     data = request.get_json(force=True) or {}
@@ -694,6 +698,9 @@ def terr_auto_seed():
         elif pop < 500000:  cells = 12
         else:               cells = 20
 
+    cells_override = int(data.get("cells") or 0)
+    if cells_override > 0: cells = cells_override
+
     import math
     rows = int(math.sqrt(cells)); cols = math.ceil(cells/rows)
     minlat,minlng,maxlat,maxlng = bbox[0], bbox[1], bbox[2], bbox[3]
@@ -706,7 +713,7 @@ def terr_auto_seed():
     for r in range(rows):
         for c in range(cols):
             if idx>cells: break
-            bb=[minlat+r*dlat, minlng+c*dlng, minlat+(r+1)*dlat, minlng+(c+1)*dlng]
+            bb=[minlat+r*dlat, minlng+c*dlng, minlat+(r+1)*dlat, max(minlng+(c+1)*dlng, minlng+1e-6)]
             TERR["microzones"].append({"city":city_slug,"name":f"zona-{idx}","bbox":bb,"phones":phones})
             idx+=1
 
