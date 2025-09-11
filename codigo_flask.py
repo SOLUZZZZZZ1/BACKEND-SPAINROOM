@@ -133,7 +133,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                                         "media": {"payload": payload}
                                     }))
                                     # ritmo real 20 ms: Twilio reproduce natural, sin “cámara lenta”
-                                    await asyncio.sleep(0.02)
+                                    await asyncio.sleep(0)
 
                         elif t == "error":
                             print("OPENAI REALTIME ERROR:", evt)
