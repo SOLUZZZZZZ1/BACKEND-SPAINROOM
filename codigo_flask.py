@@ -1,10 +1,9 @@
 # SpainRoom · Backend (Render: gunicorn codigo_flask:app)
-# - Voz por turnos (SSML sin <speak> / amazon:*), _twiml seguro
-# - Slots: Rol → Población (obligatoria) → Nombre → Teléfono → Nota → Confirmación
-# - Small-talk solo cuando faltan rol/población
-# - Captura robusta de población (heurística + geocodificación del texto)
+# - Voz por turnos (SSML sin <speak> / amazon:*), _twiml seguro (adiós 'goodbye')
+# - Slots en orden: Rol → Población (obligatoria) → Nombre → Teléfono → Nota → Confirmación
+# - Población robusta (heurística + geocód. del texto)
 # - Tareas JSONL + UI /admin/tasks
-# - Territorios: /admin/territories (Leaflet) + /territories/auto_seed (siembra automática por ciudad)
+# - Territorios: /admin/territories (Leaflet) + /territories/auto_seed
 # - WAF ligero (no inspecciona /voice, /health, /__routes)
 
 from flask import Flask, request, jsonify, Response, Response as _FlaskResponse, has_request_context
@@ -125,7 +124,7 @@ def _geocode_city(city:str, want_bbox=False):
         if r.status_code==200 and r.json():
             d=r.json()[0]; lat=float(d["lat"]); lng=float(d["lon"])
             if want_bbox and "boundingbox" in d:
-                bb=d["boundingbox"]; bbox=[float(bb[0]), float(bb[2]), float(bb[1]), float(bb[3])]  # [minlat,minlng,maxlat,maxlng]
+                bb=d["boundingbox"]; bbox=[float(bb[0]), float(bb[2]), float(bb[1]), float(bb[3])]
                 return lat,lng,bbox
             return lat,lng,None
     except: pass
@@ -353,7 +352,7 @@ def voice_confirm_summary():
     if mem.get("geo_lat") is not None and mem.get("geo_lng") is not None:
         lt,lg=mem["geo_lat"], mem["geo_lng"]
     else:
-        lt,lg=_geocode_city(mem["zone"].replace("-"," "))[0:2]
+        lt,lg,_ = _geocode_city(mem["zone"].replace("-"," "), want_bbox=False)
     phones, owner = ([], "unassigned")
     if (lt is not None) and (lg is not None):
         phones, owner = _find_phones(lt,lg,_slug(mem["zone"]))
@@ -383,13 +382,53 @@ def voice_confirm_summary():
     del _IVR[cid]
     return _twiml("<Response>"+_say_es_ssml(thanks)+"<Hangup/></Response>")
 
-# -------------------- UI tareas --------------------
+# -------------------- Tareas JSONL (API + UI) --------------------
+@app.get("/tasks/list")
+def tasks_list():
+    out=[]
+    try:
+        if os.path.exists(TASKS_FILE):
+            with open(TASKS_FILE,"r",encoding="utf-8") as f:
+                for line in f: out.append(json.loads(line))
+    except: pass
+    return jsonify(out),200
+
+@app.post("/tasks/update")
+def tasks_update():
+    try:
+        payload=request.get_json(force=True) or {}
+        call_sid=payload.get("call_sid")
+        status=(payload.get("status") or "pending").strip()
+        notes=(payload.get("notes") or "").strip()
+        if not call_sid: return jsonify(ok=False,error="call_sid_required"),400
+        if not os.path.exists(TASKS_FILE): return jsonify(ok=False,error="tasks_file_not_found"),404
+        tasks=[]; last_idx=-1
+        with open(TASKS_FILE,"r",encoding="utf-8") as f:
+            for i,line in enumerate(f):
+                try:
+                    obj=json.loads(line); tasks.append(obj)
+                    if obj.get("call_sid")==call_sid: last_idx=i
+                except: pass
+        if last_idx==-1: return jsonify(ok=False,error="task_not_found"),404
+        tasks[last_idx]["status"]=status
+        if notes:
+            old=tasks[last_idx].get("transcript","")
+            tasks[last_idx]["transcript"]=(old+(" | " if old else "")+f"NOTA: {notes}")[:4000]
+        with tempfile.NamedTemporaryFile("w",delete=False,encoding="utf-8") as tmp:
+            for obj in tasks: tmp.write(json.dumps(obj,ensure_ascii=False)+"\n")
+            tmp_path=tmp.name
+        shutil.move(tmp_path, TASKS_FILE); return jsonify(ok=True),200
+    except Exception as e:
+        return jsonify(ok=False,error=str(e)),500
+
 @app.get("/admin/tasks")
 def admin_tasks_page():
-    html = """<!doctype html><html lang="es"><head><meta charset="utf-8"/>
+    html = """
+<!doctype html><html lang="es"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>SpainRoom · Tareas</title>
-<style>body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b1118;color:#e7eef7}
+<style>
+body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b1118;color:#e7eef7}
 header{padding:16px 18px;background:#0b1118;border-bottom:1px solid #1b2a3a}
 .wrap{max-width:1120px;margin:20px auto;padding:0 14px}
 .card{background:#121923;border:1px solid #1b2a3a;border-radius:12px;padding:16px}
@@ -430,7 +469,8 @@ button{background:#2563eb;border:0;cursor:pointer}
 const $=s=>document.querySelector(s); const st={data:[],sel:null};
 function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',2000);}
 async function load(){const r=await fetch('/tasks/list'); const d=await r.json(); st.data=d;
- const zones=[...new Set(d.map(x=>x.zone).filter(Boolean))].sort(); $('#fZone').innerHTML='<option value=\"\">(todas)</option>'+zones.map(z=>`<option>${z}</option>`).join(''); render();}
+ const zones=[...new Set(d.map(x=>x.zone).filter(Boolean))].sort(); $('#fZone').innerHTML='<option value="">
+(todas)</option>'+zones.map(z=>`<option>${z}</option>`).join(''); render();}
 function pill(s){return `<span class="pill ${s==='done'?'done':'pending'}">${s||'pending'}</span>`;}
 function render(){const z=$('#fZone').value||'', s=$('#fStatus').value||'', tb=$('#tbl tbody');
  const rows=st.data.filter(x=>(!z||x.zone===z)&&(!s||(x.status||'pending')===s));
@@ -446,28 +486,30 @@ async function save(){ if(!st.sel){toast('Selecciona una tarea');return;}
  const r=await fetch('/tasks/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
  if(r.ok){toast('Guardado'); await load(); $('#formBox').style.display='none'; $('#selInfo').style.display='block';} else {toast('Error');} }
 $('#refresh').onclick=load; $('#fZone').onchange=render; $('#fStatus').onchange=render; $('#save').onclick=save; load();
-</script></body></html>"""
+</script></body></html>
+"""
     return _FlaskResponse(html, mimetype="text/html; charset=utf-8")
 
-# -------------------- UI / Admin TERRITORIOS (Leaflet) --------------------
+# -------------------- UI / Admin TERRITORIOS (Leaflet, sin f-strings) --------------------
 @app.get("/admin/territories")
 def admin_territories():
-    html = f"""<!doctype html><html lang="es"><head><meta charset="utf-8"/>
+    html_head = """
+<!doctype html><html lang="es"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>SpainRoom · Territorios</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
 <style>
-  body{{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b1118;color:#e7eef7}}
-  header{{padding:12px 16px;background:#0b1118;border-bottom:1px solid #1b2a3a}}
-  .wrap{{display:flex;gap:12px;flex-wrap:wrap;padding:12px}}
-  #map{{height:70vh;min-height:520px;border:1px solid #1b2a3a;border-radius:10px}}
-  .card{{background:#121923;border:1px solid #1b2a3a;border-radius:12px;padding:12px}}
-  input,select,textarea,button{{background:#0e1620;border:1px solid #1b2a3a;color:#e7eef7;border-radius:10px;padding:8px}}
-  button{{background:#2563eb;border:0;cursor:pointer}}
-  table{{width:100%;border-collapse:collapse;margin-top:8px}}
-  th,td{{padding:6px;border-bottom:1px solid #1b2a3a;font-size:13px}}
-  th{{color:#9fb0c3;text-align:left}}
+  body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b1118;color:#e7eef7}
+  header{padding:12px 16px;background:#0b1118;border-bottom:1px solid #1b2a3a}
+  .wrap{display:flex;gap:12px;flex-wrap:wrap;padding:12px}
+  #map{height:70vh;min-height:520px;border:1px solid #1b2a3a;border-radius:10px}
+  .card{background:#121923;border:1px solid #1b2a3a;border-radius:12px;padding:12px}
+  input,select,textarea,button{background:#0e1620;border:1px solid #1b2a3a;color:#e7eef7;border-radius:10px;padding:8px}
+  button{background:#2563eb;border:0;cursor:pointer}
+  table{width:100%;border-collapse:collapse;margin-top:8px}
+  th,td{padding:6px;border-bottom:1px solid #1b2a3a;font-size:13px}
+  th{color:#9fb0c3;text-align:left}
 </style></head><body>
 <header><h2 style="margin:0">SpainRoom · Territorios</h2></header>
 <div class="wrap">
@@ -488,7 +530,7 @@ def admin_territories():
     <hr style="border:0;border-top:1px solid #1b2a3a;margin:12px 0">
     <h3 style="margin:0 0 8px 0">Rejilla (tile)</h3>
     <label>Tamaño (deg)</label>
-    <input id="tileSize" type="number" step="0.01" value="{GRID_SIZE_DEG}" style="width:90px"/>
+    <input id="tileSize" type="number" step="0.01" value="" style="width:90px"/>
     <button id="claimTile">Reclamar tile aquí</button>
     <div style="font-size:12px;color:#9fb0c3;margin-top:6px">Usa el centro del mapa.</div>
   </div>
@@ -504,7 +546,13 @@ def admin_territories():
     <table id="tblTiles"><thead><tr><th>Clave</th><th>Label</th><th>Phones</th><th></th></tr></thead><tbody></tbody></table>
   </div>
 </div>
+"""
+    # Inyectamos la constante de servidor sin f-string en el bloque grande
+    html_const = f"""
+<script>const GRID_SIZE_DEG = {GRID_SIZE_DEG};</script>
+"""
 
+    html_tail = """
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <script>
@@ -533,8 +581,9 @@ document.getElementById('saveBbox').onclick=async()=>{
   if(r.ok){alert('Microzona guardada'); loadAll();} else {alert('Error al guardar');}
 };
 
+document.getElementById('tileSize').value = GRID_SIZE_DEG.toString();
 document.getElementById('claimTile').onclick=async()=>{
-  const size=parseFloat(document.getElementById('tileSize').value)||{GRID_SIZE_DEG};
+  const size=parseFloat(document.getElementById('tileSize').value)||GRID_SIZE_DEG;
   const c=map.getCenter();
   const body={mode:'tile', lat:c.lat, lng:c.lng, size:size, label:'tile '+size, phones:[]};
   const r=await fetch('/territories/claim',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
@@ -544,7 +593,7 @@ document.getElementById('claimTile').onclick=async()=>{
 async function loadAll(){
   drawnItems.clearLayers();
   const r=await fetch('/territories/list'); const data=await r.json();
-  // pintar microzonas
+  // microzonas
   const tbMz=document.querySelector('#tblMz tbody'); tbMz.innerHTML='';
   (data.microzones||[]).forEach((mz)=>{
     const b=mz.bbox; L.rectangle([[b[0],b[1]],[b[2],b[3]]],{color:'#22c55e',weight:1}).addTo(drawnItems);
@@ -573,8 +622,9 @@ async function loadAll(){
 }
 loadAll();
 </script>
-</body></html>"""
-    return _FlaskResponse(html, mimetype="text/html; charset=utf-8")
+</body></html>
+"""
+    return _FlaskResponse(html_head + html_const + html_tail, mimetype="text/html; charset=utf-8")
 
 # -------------------- API Territorios (+ auto_seed) --------------------
 @app.get("/territories/list")
@@ -617,12 +667,8 @@ def terr_unclaim():
 def terr_auto_seed():
     """
     JSON:
-    {
-      "city": "Madrid",
-      "mode": "madrid_barrios" | "barcelona_distritos" | "by_population",
-      "population": 3200000,          # opcional (by_population)
-      "phones": ["+34..."]            # opcional (se copia a todas las celdas)
-    }
+    { "city": "Madrid", "mode": "madrid_barrios" | "barcelona_distritos" | "by_population",
+      "population": 3200000, "phones": ["+34..."] }
     """
     global TERR
     data = request.get_json(force=True) or {}
@@ -635,13 +681,11 @@ def terr_auto_seed():
     lat,lng,bbox = _geocode_city(city, want_bbox=True)
     if bbox is None: return jsonify(ok=False,error="bbox_not_found"),400
 
-    # decidir nº celdas
     if mode=="madrid_barrios":
-        cells = 21  # distritos
+        cells = 21
     elif mode=="barcelona_distritos":
         cells = 10
     else:
-        # by_population
         if   pop < 10000:   cells = 1
         elif pop < 20000:   cells = 2
         elif pop < 50000:   cells = 3
@@ -650,15 +694,12 @@ def terr_auto_seed():
         elif pop < 500000:  cells = 12
         else:               cells = 20
 
-    # partir bbox en grid aproximada (rows*cols >= cells)
     import math
-    rows = int(math.sqrt(cells))
-    cols = math.ceil(cells/rows)
+    rows = int(math.sqrt(cells)); cols = math.ceil(cells/rows)
     minlat,minlng,maxlat,maxlng = bbox[0], bbox[1], bbox[2], bbox[3]
     dlat=(maxlat-minlat)/rows; dlng=(maxlng-minlng)/cols
 
     city_slug=_slug(city)
-    # limpiar microzonas existentes de esa city si las hubiera
     TERR["microzones"]=[mz for mz in TERR.get("microzones",[]) if mz.get("city")!=city_slug]
 
     idx=1
