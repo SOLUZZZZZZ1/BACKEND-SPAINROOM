@@ -16,19 +16,18 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 # Voces soportadas: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
-OPENAI_VOICE = os.getenv("OPENAI_VOICE", "shimmer")
+OPENAI_VOICE = os.getenv("OPENAI_VOICE", "marin")  # ← femenina por defecto
 
 TWILIO_WS_PATH = "/stream/twilio"
 
-app = FastAPI(title="SpainRoom Voice Gateway (anti-ruido estado+ritmo)")
+app = FastAPI(title="SpainRoom Voice Gateway (femenina, sin lentitud, antiruido)")
 
-# ========= Resamplers con estado =========
+# ========= Resampler PCM16 con estado (evita “ruido módem”) =========
 class PcmResampler:
-    """Resampler PCM16 mono con estado continuo para evitar artefactos entre fragmentos."""
     def __init__(self, src_hz: int, dst_hz: int):
         self.src_hz = src_hz
         self.dst_hz = dst_hz
-        self.state: Optional[Tuple] = None  # estado interno de audioop.ratecv
+        self.state: Optional[Tuple] = None
 
     def process(self, pcm_bytes: bytes) -> bytes:
         if not pcm_bytes or self.src_hz == self.dst_hz:
@@ -45,20 +44,11 @@ def health():
 def diag_key():
     return {"openai_key_configured": bool(OPENAI_API_KEY)}
 
-# ========= TwiML PRUEBA (GET+POST) =========
-@app.get("/voice/test_female")
-@app.post("/voice/test_female")
-def voice_test_female():
-    twiml = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice" language="es-ES">Prueba de voz femenina en el circuito telefónico. SpainRoom operativo.</Say>
-</Response>"""
-    return Response(twiml, media_type="application/xml; charset=utf-8")
-
-# ========= TwiML STREAMING (GET+POST) =========
+# ========= TwiML (acepta GET+POST) =========
 @app.get("/voice/answer")
 @app.post("/voice/answer")
 def voice_answer():
+    """Inicia Media Streams bidireccional (sin track para evitar 31941)."""
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -70,7 +60,7 @@ def voice_answer():
 # ========= WebSocket: Twilio ⇄ OpenAI Realtime =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
-    # Twilio usa el subprotocolo "audio"
+    # Twilio usa subprotocolo "audio"
     await ws_twilio.accept(subprotocol="audio")
 
     if not OPENAI_API_KEY:
@@ -78,23 +68,25 @@ async def twilio_stream(ws_twilio: WebSocket):
         await ws_twilio.close()
         return
 
+    # Estados
     stream_sid: Optional[str] = None
     started = False
 
-    # Resamplers con estado (16k <-> 8k)
-    down = PcmResampler(16000, 8000)  # modelo -> Twilio
-    up   = PcmResampler(8000, 16000)  # Twilio -> modelo
+    # Resamplers con estado (modelo 16k ↔ Twilio 8k)
+    down = PcmResampler(16000, 8000)   # modelo -> Twilio
+    up   = PcmResampler(8000, 16000)   # Twilio -> modelo
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
+               "OpenAI-Beta": "realtime=v1"}
 
     try:
         async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as ws_ai:
-            # Sesión: PCM16 16k limpio (modelo) + voz y guardarraíles SpainRoom
+            # Sesión del modelo: PCM16 16k + voz femenina + VAD + guardarraíles SpainRoom
             await ws_ai.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "voice": OPENAI_VOICE,
-                    "modalities": ["audio", "text"],
+                    "modalities": ["audio", "text"],  # requerido por Realtime
                     "turn_detection": {"type": "server_vad", "create_response": True},
                     "input_audio_format":  {"type": "pcm16", "sample_rate_hz": 16000},
                     "output_audio_format": {"type": "pcm16", "sample_rate_hz": 16000},
@@ -108,7 +100,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                 }
             }))
 
-            # Modelo -> Twilio (PCM16 16k -> PCM16 8k -> μ-law 8k) con estado y pacing real
+            # -------- Modelo -> Twilio (PCM16 16k → PCM16 8k → μ-law 8k) --------
             async def ai_to_twilio():
                 try:
                     async for raw in ws_ai:
@@ -120,11 +112,11 @@ async def twilio_stream(ws_twilio: WebSocket):
                             if not b64_pcm:
                                 continue
                             pcm16_16k = base64.b64decode(b64_pcm)
-                            pcm16_8k  = down.process(pcm16_16k)           # downsample con estado
-                            ulaw_8k   = audioop.lin2ulaw(pcm16_8k, 2)     # PCM16 -> μ-law
+                            pcm16_8k  = down.process(pcm16_16k)         # downsample con estado
+                            ulaw_8k   = audioop.lin2ulaw(pcm16_8k, 2)   # PCM16 -> μ-law (1 byte/muestra)
 
                             if stream_sid and started and ulaw_8k:
-                                CHUNK = 160  # 20 ms @ 8kHz μ-law (1 byte/muestra)
+                                CHUNK = 160  # 20 ms @ 8 kHz (160 bytes μ-law)
                                 for i in range(0, len(ulaw_8k), CHUNK):
                                     payload = base64.b64encode(ulaw_8k[i:i+CHUNK]).decode()
                                     await ws_twilio.send_text(json.dumps({
@@ -132,12 +124,12 @@ async def twilio_stream(ws_twilio: WebSocket):
                                         "streamSid": stream_sid,
                                         "media": {"payload": payload}
                                     }))
-                                    # ritmo real 20 ms: Twilio reproduce natural, sin “cámara lenta”
+                                    # SIN pausa artificial → no “voz lenta”
                                     await asyncio.sleep(0)
 
                         elif t == "error":
                             print("OPENAI REALTIME ERROR:", evt)
-                        # else:
+                        # else:  # traza opcional
                         #     print("RT EVT:", t)
 
                 except Exception as e:
@@ -145,7 +137,7 @@ async def twilio_stream(ws_twilio: WebSocket):
 
             task = asyncio.create_task(ai_to_twilio())
 
-            # Twilio -> Modelo (μ-law 8k -> PCM16 8k -> PCM16 16k) con estado
+            # -------- Twilio -> Modelo (μ-law 8k → PCM16 8k → PCM16 16k) --------
             try:
                 while True:
                     msg_text = await ws_twilio.receive_text()
@@ -158,14 +150,16 @@ async def twilio_stream(ws_twilio: WebSocket):
                         # Saludo inicial (ya con streamSid)
                         await ws_ai.send(json.dumps({
                             "type": "response.create",
-                            "response": { "instructions": "Hola, soy Nora de SpainRoom. ¿En qué puedo ayudarte?" }
+                            "response": {
+                                "instructions": "Hola, soy Nora de SpainRoom. ¿En qué puedo ayudarte?"
+                            }
                         }))
 
                     elif ev == "media":
                         ulaw_b64 = msg["media"]["payload"]
                         ulaw_8k  = base64.b64decode(ulaw_b64)
-                        pcm16_8k = audioop.ulaw2lin(ulaw_8k, 2)
-                        pcm16_16k= up.process(pcm16_8k)  # upsample con estado
+                        pcm16_8k = audioop.ulaw2lin(ulaw_8k, 2)       # μ-law -> PCM16 8k
+                        pcm16_16k= up.process(pcm16_8k)               # upsample con estado
                         await ws_ai.send(json.dumps({
                             "type": "input_audio_buffer.append",
                             "audio": base64.b64encode(pcm16_16k).decode()
