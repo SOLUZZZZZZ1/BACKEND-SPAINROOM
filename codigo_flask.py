@@ -103,4 +103,68 @@ async def twilio_stream(ws_twilio: WebSocket):
                             if stream_sid and started and ulaw_8k:
                                 CHUNK = 160  # 20 ms @ 8kHz μ-law (1 byte/muestra)
                                 for i in range(0, len(ulaw_8k), CHUNK):
-                                    payload = base64.b
+                                    payload = base64.b64encode(ulaw_8k[i:i+CHUNK]).decode()
+                                    await ws_twilio.send_text(json.dumps({
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {"payload": payload}
+                                    }))
+                                    await asyncio.sleep(0.02)  # pace real 20 ms
+
+                        elif t == "error":
+                            print("OPENAI REALTIME ERROR:", evt)
+                        # else:
+                        #     print("RT EVT:", t)
+
+                except Exception as e:
+                    print("ai_to_twilio error:", e)
+
+            task = asyncio.create_task(ai_to_twilio())
+
+            # 3) Twilio → Modelo (μ-law 8k → PCM16 16k)
+            try:
+                while True:
+                    msg_text = await ws_twilio.receive_text()
+                    msg = json.loads(msg_text)
+                    ev = msg.get("event")
+
+                    if ev == "start":
+                        stream_sid = msg["start"]["streamSid"]
+                        started = True
+                        # Saludo inicial (ya con streamSid)
+                        await ws_ai.send(json.dumps({
+                            "type": "response.create",
+                            "response": { "instructions": "Hola, soy Nora de SpainRoom. ¿En qué puedo ayudarte?" }
+                        }))
+
+                    elif ev == "media":
+                        ulaw_b64 = msg["media"]["payload"]
+                        ulaw_8k  = base64.b64decode(ulaw_b64)
+                        pcm16_8k = audioop.ulaw2lin(ulaw_8k, 2)
+                        pcm16_16k= resample_pcm16(pcm16_8k, 8000, 16000)
+                        await ws_ai.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(pcm16_16k).decode()
+                        }))
+
+                    elif ev == "stop":
+                        break
+
+            except WebSocketDisconnect:
+                pass
+            finally:
+                task.cancel()
+                with contextlib.suppress(Exception):
+                    await task
+
+    except Exception as e:
+        print("Bridge error:", e)
+        with contextlib.suppress(Exception):
+            await ws_twilio.send_text(json.dumps({"event": "error", "message": str(e)}))
+        with contextlib.suppress(Exception):
+            await ws_twilio.close()
+
+# Dev local opcional
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("codigo_flask:app", host="0.0.0.0", port=8000)
