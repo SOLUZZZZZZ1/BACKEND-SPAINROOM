@@ -1,9 +1,8 @@
 # SpainRoom · Backend principal (Render: gunicorn codigo_flask:app)
-# - Voz por turnos (SSML, _twiml seguro)
-# - WAF embebido
-# - Tareas (JSONL), UI /admin/tasks, SMS
-# - Territorios (microzonas + rejilla)
-# - Twilio Conversations (webhook + creación de hilos)
+# - Voz por turnos (SSML natural sin <speak> ni amazon:*), _twiml seguro
+# - WAF embebido (no inspecciona /voice, /health, /__routes)
+# - Tareas JSONL + UI /admin/tasks + SMS a franquiciados
+# - Territorios (microzonas + rejilla) para enrutar leads
 
 from flask import Flask, request, jsonify, Response, Response as _FlaskResponse, has_request_context
 import requests, json, os, re, random, tempfile, shutil
@@ -11,20 +10,19 @@ from math import radians, sin, cos, sqrt, atan2, floor
 from urllib.parse import unquote_plus
 from datetime import datetime, timezone
 
-# --------------------------------
 app = Flask(__name__)
 
-# ====== Config =========
+# -------------------- Config --------------------
 CENTRAL_PHONE = os.getenv("CENTRAL_PHONE", "+12252553716")
 SMS_FROM      = os.getenv("TWILIO_MESSAGING_FROM", "+12252553716")
 VOICE_FROM    = os.getenv("TWILIO_VOICE_FROM", "+12252553716")
-TTS_VOICE     = os.getenv("TTS_VOICE", "Polly.Conchita")
+TTS_VOICE     = os.getenv("TTS_VOICE", "Polly.Conchita")   # compatible Twilio-Polly
 TERR_FILE     = os.getenv("TERR_FILE", "/tmp/spainroom_territories.json")
 TERR_TOKEN    = os.getenv("TERR_TOKEN", "")
-GRID_SIZE_DEG = float(os.getenv("GRID_SIZE_DEG", "0.05"))  # ~5-6 km
-TASKS_FILE    = "/tmp/spainroom_tasks.jsonl"                # persistencia simple
+GRID_SIZE_DEG = float(os.getenv("GRID_SIZE_DEG", "0.05"))  # ≈5–6 km
+TASKS_FILE    = "/tmp/spainroom_tasks.jsonl"
 
-# ===== _twiml y helpers =====
+# -------------------- TwiML helper --------------------
 def _twiml(body: str) -> Response:
     b = (body or "").strip()
     if not b.startswith("<Response"): b = f"<Response>{b}</Response>"
@@ -32,7 +30,7 @@ def _twiml(body: str) -> Response:
 
 def _now_iso(): return datetime.now(tz=timezone.utc).isoformat()
 
-# ====== WAF (defensa) ======
+# -------------------- WAF (ligero) --------------------
 DEF_CFG = {
     "MAX_BODY": int(os.getenv("DEFENSE_MAX_BODY", "524288")),
     "ALLOW_METHODS": set((os.getenv("DEFENSE_ALLOW_METHODS", "GET,POST,OPTIONS")).split(",")),
@@ -161,11 +159,11 @@ def _secure_headers(resp):
     resp.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
     return resp
 
-# ====== Salud ======
+# -------------------- Salud --------------------
 @app.get("/health")
 def health(): return jsonify(ok=True, service="BACKEND-SPAINROOM"), 200
 
-# ====== Geocode demo ======
+# -------------------- Geocode demo --------------------
 def calcular_distancia(lat1, lon1, lat2, lon2):
     R=6371; dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
     a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
@@ -180,12 +178,16 @@ def geocode():
     if r.status_code!=200 or not r.json(): return jsonify({"error":"No se pudo geocodificar"}), 500
     d=r.json()[0]; return jsonify({"lat":float(d["lat"]), "lng":float(d["lon"]) })
 
-# ====== Voz (SSML natural) ======
+# -------------------- VOZ (SSML natural, sin <speak> ni amazon:*) --------------------
 def _ssml(text: str) -> str:
+    """
+    [[b300]] -> <break time="300ms"/>, [[digits:600123123]] -> <say-as interpret-as="digits">...</say-as>
+    (No usamos <speak>; Twilio soporta <prosody>/<break>/<say-as> directamente dentro de <Say>)
+    """
     s=text
     s=re.sub(r"\[\[b(\d{2,4})\]\]", lambda m:f'<break time="{m.group(1)}ms"/>', s)
     s=re.sub(r"\[\[digits:([\d\s\+]+)\]\]", lambda m:f'<say-as interpret-as="digits">{m.group(1)}</say-as>', s)
-    return f'<speak><prosody rate="medium" pitch="+2%">{s}</prosody></speak>'
+    return f'<prosody rate="medium" pitch="+2%">{s}</prosody>'
 
 def _say_es_ssml(text: str) -> str:
     return f'<Say language="es-ES" voice="{TTS_VOICE}">{_ssml(text)}</Say>'
@@ -202,11 +204,11 @@ def _gather_es(action: str, timeout="10", end_silence="auto",
             f'speechTimeout="{end_silence}" speechModel="phone_call" bargeIn="true" '
             f'action="{action}" method="POST" actionOnEmptyResult="true" hints="{hints}">')
 
-# ====== Tareas (JSONL simple) ======
-def _save_task(call_sid, role, zone, name, phone, assignees, recording_url, transcript_text, conversation_sid=None):
+# -------------------- Tareas (JSONL) --------------------
+def _save_task(call_sid, role, zone, name, phone, assignees, recording_url, transcript_text):
     task={"created_at":_now_iso(),"call_sid":call_sid,"role":role,"zone":zone,
           "name":name,"phone":phone,"assignees":assignees,"recording":recording_url,
-          "transcript":transcript_text,"conversation_sid":conversation_sid,"status":"pending"}
+          "transcript":transcript_text,"status":"pending"}
     try:
         with open(TASKS_FILE,"a",encoding="utf-8") as f: f.write(json.dumps(task,ensure_ascii=False)+"\n")
     except Exception as e: _jlog("task_file_fail", error=str(e))
@@ -245,12 +247,11 @@ def tasks_update():
         with tempfile.NamedTemporaryFile("w",delete=False,encoding="utf-8") as tmp:
             for obj in tasks: tmp.write(json.dumps(obj,ensure_ascii=False)+"\n")
             tmp_path=tmp.name
-        shutil.move(tmp_path, TASKS_FILE)
-        return jsonify(ok=True),200
+        shutil.move(tmp_path, TASKS_FILE); return jsonify(ok=True),200
     except Exception as e:
         return jsonify(ok=False,error=str(e)),500
 
-# ====== Territorios (microzonas + rejilla) ======
+# -------------------- Territorios (microzonas + rejilla) --------------------
 PROVS = {"jaen":"Jaén","madrid":"Madrid","valencia":"Valencia","sevilla":"Sevilla",
          "barcelona":"Barcelona","malaga":"Málaga","granada":"Granada"}
 
@@ -269,11 +270,13 @@ def _load_territories():
         try:
             with open(TERR_FILE,"r",encoding="utf-8") as f: return json.load(f)
         except: pass
-    return {"tiles":{}, "microzones":[]}  # tiles: key->{label,phones[]}; microzones:[{city,name,bbox,phones[]}]
+    return {"tiles":{}, "microzones":[]}
+
 def _save_territories(obj):
     try:
         with open(TERR_FILE,"w",encoding="utf-8") as f: json.dump(obj,f,ensure_ascii=False,indent=2)
     except Exception as e: _jlog("territories_save_err", error=str(e))
+
 TERR=_load_territories()
 
 def _point_in_bbox(lat,lng,b): return (b[0] <= lat <= b[2]) and (b[1] <= lng <= b[3])
@@ -286,15 +289,12 @@ def _geocode_city(city:str):
     return None,None
 
 def _find_assignees_by_latlng(lat,lng,city_slug):
-    # 1) microzonas por ciudad
     for mz in TERR.get("microzones",[]):
         if mz.get("city")==city_slug and _point_in_bbox(lat,lng,mz.get("bbox",[0,0,0,0])):
             return (mz.get("phones") or []), f"{mz.get('city')}::{mz.get('name')}"
-    # 2) tile por rejilla
     key=_tile_key(lat,lng)
     if key in TERR.get("tiles",{}):
         t=TERR["tiles"][key]; return (t.get("phones") or []), key
-    # 3) sin dueño -> central
     return [], "unassigned"
 
 @app.get("/territories/list")
@@ -353,7 +353,7 @@ def terr_unclaim():
         return jsonify(ok=False,error="not_found"),404
     return jsonify(ok=False,error="mode_required"),400
 
-# ====== Voz: formulario por turnos ======
+# -------------------- VOZ: formulario por turnos --------------------
 def smalltalk_kind(s: str):
     s=(s or '').lower()
     if any(p in s for p in ['hola','buenas','qué tal','que tal']): return 'greeting'
@@ -393,7 +393,6 @@ def _parse_phone(s:str, digits:str)->str:
     if len(d)>=9: return "+34"+d if not d.startswith(("34","+")) else ("+"+d if not d.startswith("+") else d)
     return ""
 
-# Estado por llamada
 _IVR_MEM = {}  # CallSid -> { step, role, zone, name, phone, note, transcript:[], miss }
 
 @app.get("/voice/health")
@@ -521,135 +520,37 @@ def voice_confirm_summary():
     assignees = phones if phones else [CENTRAL_PHONE]
 
     transcript_text = " | ".join([t for t in mem.get("transcript",[]) if t])
-    _save_task(call_id=call_id, role=mem["role"], zone=mem["zone"], name=mem["name"],
+    _save_task(call_sid=call_id, role=mem["role"], zone=mem["zone"], name=mem["name"],
                phone=mem["phone"], assignees=assignees, recording_url="", transcript_text=transcript_text)
 
     resumen = (f"SpainRoom: {mem['role']} en {zona_lbl}. Nombre: {mem['name'] or 'N/D'}. "
                f"Tel: {mem['phone'] or 'N/D'}. Nota: {mem['note'] or 'N/D'}. Destino: {owner}")
-    for to in assignees: _send_sms(to, resumen)
+    for to in assignees:
+        try:
+            from twilio.rest import Client
+            Client(os.getenv("TWILIO_ACCOUNT_SID",""), os.getenv("TWILIO_AUTH_TOKEN","")).messages.create(
+                from_=SMS_FROM, to=to, body=resumen
+            )
+        except Exception as e:
+            _jlog("sms_fail", error=str(e), to=to)
 
     gracias=_line("Perfecto, ya tengo todo [[b150]] la persona de tu zona te llamará en breve. ¡Gracias!",
                   "Gracias [[b150]] te llamarán desde tu zona en breve.")
     del _IVR_MEM[call_id]
     return _twiml("<Response>"+ _say_es_ssml(gracias) + "<Hangup/></Response>")
 
-# ====== SMS helper ======
-def _send_sms(to_e164: str, body: str):
-    sid=os.getenv("TWILIO_ACCOUNT_SID",""); tok=os.getenv("TWILIO_AUTH_TOKEN","")
-    if not (sid and tok and SMS_FROM and to_e164): _jlog("sms_skip",reason="missing_sid_or_token_or_from_or_to"); return
-    try:
-        from twilio.rest import Client
-        Client(sid,tok).messages.create(from_=SMS_FROM, to=to_e164, body=body); _jlog("sms_ok",to=to_e164)
-    except Exception as e: _jlog("sms_fail", error=str(e), to=to_e164)
+# -------------------- Root y fallback --------------------
+@app.route("/", methods=["GET","POST"])
+def root_safe():
+    if request.method=="POST":
+        return _twiml(_say_es_ssml("Hola, te atiendo ahora mismo.") + '<Redirect method="POST">/voice/answer</Redirect>')
+    return ("",404)
 
-# ====== Conversations (omni-canal) ======
-from twilio.rest import Client as TwilioClient
-_TW_ACC = os.getenv("TWILIO_ACCOUNT_SID","")
-_TW_TOK = os.getenv("TWILIO_AUTH_TOKEN","")
-_tw = TwilioClient(_TW_ACC,_TW_TOK) if (_TW_ACC and _TW_TOK) else None
+@app.route("/voice/fallback", methods=["GET","POST"])
+def voice_fallback():
+    return _twiml(_say_es_ssml("Un segundo, por favor.") + '<Redirect method="POST">/voice/answer</Redirect>')
 
-def _conv_send(conversation_sid:str, body:str):
-    if not _tw or not conversation_sid: return
-    try:
-        _tw.conversations.v1.conversations(conversation_sid).messages.create(body=body)
-    except Exception as e:
-        _jlog("conv_send_fail", error=str(e))
-
-@app.post("/conversations/webhook")
-def conversations_webhook():
-    """
-    Webhook de Conversations Service (Post-Event).
-    Twilio envía JSON con campos como: EventType, ConversationSid, MessageSid, Body, Author, ParticipantSid, Attributes.
-    """
-    try:
-        payload = request.get_json(force=True) or {}
-    except Exception:
-        payload = request.form.to_dict()  # si viniera como x-www-form-urlencoded
-    et = (payload.get("EventType") or payload.get("event_type") or "").lower()
-    conv = payload.get("ConversationSid") or payload.get("conversation_sid") or ""
-    body = (payload.get("Body") or payload.get("body") or "").strip()
-    author = payload.get("Author") or payload.get("author") or ""
-    attrs = payload.get("Attributes") or payload.get("attributes") or "{}"
-
-    if et in ("onmessageadded","on_message_added"):
-        # Detectar rol/población con las heurísticas de voz:
-        role = _parse_role(body)
-        zone = _parse_city(body)
-        name = ""  # en chat solemos no tener nombre; se puede pedir en la conversación
-        phone = "" # en chat puede llegar en atributos; si no, vacío
-        note = body
-
-        # Intentar zona precisa si hay ciudad/CP
-        lat=lng=None
-        if zone and zone not in PROVS:
-            lt,lg=_geocode_city(zone); lat,lng=lt,lg
-        phones, owner = ([], "unassigned")
-        if (lat is not None) and (lng is not None):
-            phones, owner = _find_assignees_by_latlng(lat,lng,_slug_city(zone))
-        assignees = phones if phones else [CENTRAL_PHONE]
-
-        # Crear/actualizar Tarea (call_sid usamos ConversationSid para identificar hilo)
-        _save_task(call_sid=conv, role=role or "cliente", zone=zone or "", name=name, phone=phone,
-                   assignees=assignees, recording_url="", transcript_text=note, conversation_sid=conv)
-
-        # Respuesta de cortesía dentro de la conversación
-        ack = "¡Gracias! Tomo nota. ¿Puedes decirme tu nombre completo y un teléfono de contacto?"
-        _conv_send(conv, ack)
-
-    return jsonify(ok=True), 200
-
-@app.post("/conversations/start")
-def conversations_start():
-    """
-    Crea una conversación y añade al cliente (SMS/WhatsApp) y al franquiciado (SMS).
-    JSON esperado:
-    { "to": "+34...", "via": "sms|whatsapp", "zone": "jaen" }
-    """
-    if not _tw: return jsonify(ok=False,error="twilio_not_configured"),400
-    data = request.get_json(force=True) or {}
-    to = data.get("to","").strip()
-    via = (data.get("via","sms") or "sms").lower()
-    zone = _slug_city(data.get("zone",""))
-    if not to: return jsonify(ok=False,error="to_required"),400
-
-    # Crear conversación
-    conv = _tw.conversations.v1.conversations.create(friendly_name=f"SpainRoom-{_now_iso()}")
-    conv_sid = conv.sid
-
-    # Añadir participante cliente
-    if via=="whatsapp":
-        _tw.conversations.v1.conversations(conv_sid).participants.create(
-            messaging_binding_address=f"whatsapp:{to}",
-            messaging_binding_proxy_address=f"whatsapp:{SMS_FROM.replace('+','+')}"
-        )
-    else:
-        _tw.conversations.v1.conversations(conv_sid).participants.create(
-            messaging_binding_address=to,
-            messaging_binding_proxy_address=SMS_FROM
-        )
-
-    # Asignar franquiciado por territorio (si no, central)
-    lt,lg=_geocode_city(zone) if zone else (None,None)
-    phones, owner = ([], "unassigned")
-    if (lt is not None) and (lg is not None):
-        phones, owner = _find_assignees_by_latlng(lt,lg,zone)
-    targets = phones if phones else [CENTRAL_PHONE]
-    for fran in targets:
-        _tw.conversations.v1.conversations(conv_sid).participants.create(
-            messaging_binding_address=fran,
-            messaging_binding_proxy_address=SMS_FROM
-        )
-
-    # Mensaje de bienvenida
-    _conv_send(conv_sid, "Hola, soy de SpainRoom. ¿Eres propietario o inquilino y de qué población hablamos?")
-
-    # Crear tarea ligada a la conversación
-    _save_task(call_sid=conv_sid, role="", zone=zone, name="", phone=to, assignees=targets,
-               recording_url="", transcript_text="Inicio de conversación", conversation_sid=conv_sid)
-
-    return jsonify(ok=True, conversation_sid=conv_sid, assignees=targets), 200
-
-# ====== UI de tareas ======
+# -------------------- UI de tareas --------------------
 @app.get("/admin/tasks")
 def admin_tasks_page():
     html = """<!doctype html><html lang="es"><head><meta charset="utf-8"/>
@@ -721,19 +622,10 @@ $('#refresh').onclick=load; $('#fZone').onchange=render; $('#fStatus').onchange=
 """
     return _FlaskResponse(html, mimetype="text/html; charset=utf-8")
 
-# ====== Diagnóstico de rutas ======
+# -------------------- Diagnóstico --------------------
 @app.get("/__routes")
 def __routes(): return {"routes":[f"{r.endpoint} -> {r.rule}" for r in app.url_map.iter_rules()]}, 200
 
-# ====== SMS helper (al final para evitar importearly) ======
-def _send_sms(to_e164: str, body: str):
-    sid=os.getenv("TWILIO_ACCOUNT_SID",""); tok=os.getenv("TWILIO_AUTH_TOKEN","")
-    if not (sid and tok and SMS_FROM and to_e164): return
-    try:
-        from twilio.rest import Client
-        Client(sid,tok).messages.create(from_=SMS_FROM, to=to_e164, body=body)
-    except Exception as e: pass
-
-# ====== MAIN ======
+# -------------------- MAIN --------------------
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
