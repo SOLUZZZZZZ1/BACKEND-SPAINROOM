@@ -7,7 +7,7 @@ import audioop
 import contextlib
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, PlainTextResponse
 import websockets
 
@@ -15,21 +15,23 @@ import websockets
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
-OPENAI_VOICE = os.getenv("OPENAI_VOICE", "shimmer")  # voces soportadas: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
+# Voces soportadas: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
+OPENAI_VOICE = os.getenv("OPENAI_VOICE", "shimmer")
 
 TWILIO_WS_PATH = "/stream/twilio"
 
 # ========= App =========
 app = FastAPI(title="SpainRoom Voice Gateway (VOZ LITE CHUNKED)")
 
-# ========= Util: PCM16 resample =========
+# ========= Utils =========
 def resample_pcm16(pcm: bytes, src_hz: int, dst_hz: int) -> bytes:
+    """Re-muestreo PCM16 mono con stdlib (audioop)."""
     if not pcm or src_hz == dst_hz:
         return pcm
     out, _ = audioop.ratecv(pcm, 2, 1, src_hz, dst_hz, None)
     return out
 
-# ========= Rutas HTTP =========
+# ========= HTTP =========
 @app.get("/voice/health")
 def health():
     return {"ok": True, "service": "voice"}
@@ -40,7 +42,7 @@ def diag_key():
 
 @app.post("/voice/answer")
 def voice_answer():
-    # Sin track="both_tracks" (con <Connect> da 31941). Simplísimo.
+    """TwiML de stream bidireccional (sin track, evita 31941)."""
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -49,10 +51,10 @@ def voice_answer():
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
 
-# ========= WebSocket: Twilio ⇄ OpenAI Realtime =========
+# ========= WS: Twilio ⇄ OpenAI Realtime =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
-    # Twilio usa Sec-WebSocket-Protocol: audio -> acéptalo
+    # Twilio envía Sec-WebSocket-Protocol: audio → acéptalo
     await ws_twilio.accept(subprotocol="audio")
 
     if not OPENAI_API_KEY:
@@ -63,9 +65,80 @@ async def twilio_stream(ws_twilio: WebSocket):
     stream_sid: Optional[str] = None
     started = False
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
-               "OpenAI-Beta": "realtime=v1"}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
 
     try:
         async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as ws_ai:
-            # 1)
+            # 1) Sesión del modelo: PCM16 16k limpio + voz femenina + VAD servidor
+            await ws_ai.send(json.dumps({
+                "type": "session.update",
+                "session": {
+                    "voice": OPENAI_VOICE,
+                    "modalities": ["audio", "text"],  # requerido por Realtime
+                    "turn_detection": {"type": "server_vad", "create_response": True},
+                    "input_audio_format":  {"type": "pcm16", "sample_rate_hz": 16000},
+                    "output_audio_format": {"type": "pcm16", "sample_rate_hz": 16000},
+                    "instructions": (
+                        "Te llamas Nora de SpainRoom (alquiler de habitaciones). Voz femenina, cercana y ágil. "
+                        "Nada de viajes. Mantén ritmo natural, frases cortas."
+                    )
+                }
+            }))
+
+            # 2) Hilo: Modelo → Twilio (PCM16 16k → μ-law 8k en chunks de 20ms)
+            async def ai_to_twilio():
+                try:
+                    async for raw in ws_ai:
+                        evt = json.loads(raw)
+                        t = evt.get("type")
+
+                        if t in ("response.output_audio.delta", "response.audio.delta"):
+                            b64_pcm = evt.get("delta") or evt.get("audio")
+                            if not b64_pcm:
+                                continue
+                            pcm16_16k = base64.b64decode(b64_pcm)
+                            pcm16_8k  = resample_pcm16(pcm16_16k, 16000, 8000)
+                            ulaw_8k   = audioop.lin2ulaw(pcm16_8k, 2)  # μ-law 8k
+
+                            if stream_sid and started and ulaw_8k:
+                                CHUNK = 160  # 20 ms @ 8kHz μ-law
+                                for i in range(0, len(ulaw_8k), CHUNK):
+                                    payload = base64.b64encode(ulaw_8k[i:i+CHUNK]).decode()
+                                    await ws_twilio.send_text(json.dumps({
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {"payload": payload}
+                                    }))
+                                    await asyncio.sleep(0)
+
+                        elif t == "error":
+                            print("OPENAI REALTIME ERROR:", evt)
+                        # else:  # descomenta para ver más eventos
+                        #     print("RT EVT:", t)
+
+                except Exception as e:
+                    print("ai_to_twilio error:", e)
+
+            task = asyncio.create_task(ai_to_twilio())
+
+            # 3) Twilio → Modelo (μ-law 8k → PCM16 16k)
+            try:
+                while True:
+                    msg_text = await ws_twilio.receive_text()
+                    msg = json.loads(msg_text)
+                    ev = msg.get("event")
+
+                    if ev == "start":
+                        stream_sid = msg["start"]["streamSid"]
+                        started = True
+                        # Saludo inicial (ya con streamSid)
+                        await ws_ai.send(json.dumps({
+                            "type": "response.create",
+                            "response": { "instructions": "Hola, soy Nora de SpainRoom. ¿En qué puedo ayudarte?" }
+                        }))
+
+                    elif ev == "media":
+                        ulaw_b64 = msg["media"]["payload"]
+                        ulaw_8k  = base64.b64decode(ulaw_b64)
+                        pcm16_8k = audioop.ulaw2lin(ulaw_8k, 2)
+                        pcm16_16k= resampl_
