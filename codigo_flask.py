@@ -31,7 +31,7 @@ def diag_key():
 
 @app.post("/diag/stream-log")
 async def stream_log(req: Request):
-    # Log robusto: imprimimos el cuerpo tal cual (JSON o form)
+    # Log simple y robusto (no parseamos sofisticado para evitar fallos)
     body = (await req.body()).decode(errors="ignore")
     print("TWILIO STREAM EVENT:", body)
     return PlainTextResponse("OK")
@@ -46,14 +46,14 @@ def voice_say():
 def voice_answer():
     """
     Twilio (A Call Comes In -> POST) recibe este TwiML.
-    OJO: sin 'track' (evita error 31941). Con callback para ver start/stop.
+    Sin 'track' (evita 31941). Con callback para ver start/media/stop en logs.
     """
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="wss://backend-spainroom.onrender.com{TWILIO_WS_PATH}"
             statusCallback="https://backend-spainroom.onrender.com/diag/stream-log"
-            statusCallbackEvent="start stop" />
+            statusCallbackEvent="start media stop" />
   </Connect>
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
@@ -77,6 +77,22 @@ async def twilio_stream(ws_twilio: WebSocket):
         "OpenAI-Beta": "realtime=v1",
     }
 
+    # Helper para extraer base64 de eventos de audio del modelo (según versión)
+    def _extract_ulaw_b64(evt: dict) -> Optional[str]:
+        # Intentos habituales
+        for k in ("audio", "delta", "chunk", "data"):
+            v = evt.get(k)
+            if isinstance(v, str) and v:
+                return v
+        # Algunos eventos vienen anidados (por si acaso)
+        out = evt.get("output_audio") or {}
+        if isinstance(out, dict):
+            for k in ("audio", "delta"):
+                v = out.get(k)
+                if isinstance(v, str) and v:
+                    return v
+        return None
+
     try:
         async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as ws_ai:
             # 1) Configurar sesión: μ-law 8k, VAD y MODALIDADES REQUERIDAS ['audio','text']
@@ -84,7 +100,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                 "type": "session.update",
                 "session": {
                     "voice": "verse",
-                    "modalities": ["audio", "text"],  # <- importante
+                    "modalities": ["audio", "text"],  # <- importante (evita 'Invalid modalities: ["audio"]')
                     "turn_detection": {"type": "server_vad", "create_response": True},
                     "input_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
                     "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
@@ -101,63 +117,11 @@ async def twilio_stream(ws_twilio: WebSocket):
                     async for raw in ws_ai:
                         evt = json.loads(raw)
                         t = evt.get("type")
-                        if t == "response.audio.delta":
-                            if stream_sid and started:
+                        if t in (
+                            "response.audio.delta",
+                            "response.output_audio.delta",
+                            "response.output_audio.buffer.delta",
+                        ):
+                            b64 = _extract_ulaw_b64(evt)
+                            if b64 and stream_sid and started:
                                 await ws_twilio.send_text(json.dumps({
-                                    "event": "media",
-                                    "streamSid": stream_sid,
-                                    "media": {"payload": evt["audio"]}
-                                }))
-                        elif t == "error":
-                            print("OPENAI REALTIME ERROR:", evt)
-                except Exception as e:
-                    print("ai_to_twilio error:", e)
-
-            task = asyncio.create_task(ai_to_twilio())
-
-            # 3) Bucle: Twilio -> modelo
-            try:
-                while True:
-                    text = await ws_twilio.receive_text()
-                    msg = json.loads(text)
-                    ev = msg.get("event")
-
-                    if ev == "start":
-                        stream_sid = msg["start"]["streamSid"]
-                        started = True
-                        # Saludo inicial (dejamos modalities de sesión: ['audio','text'])
-                        await ws_ai.send(json.dumps({
-                            "type": "response.create",
-                            "response": {
-                                "instructions": "Hola. Puedo atender en español o en inglés. ¿En qué puedo ayudarte?"
-                            }
-                        }))
-
-                    elif ev == "media":
-                        # μ-law 8k en base64 -> lo pasamos tal cual al buffer de entrada
-                        await ws_ai.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": msg["media"]["payload"]
-                        }))
-
-                    elif ev == "stop":
-                        break
-
-            except WebSocketDisconnect:
-                pass
-            finally:
-                task.cancel()
-                with contextlib.suppress(Exception):
-                    await task
-
-    except Exception as e:
-        print("Bridge error:", e)
-        with contextlib.suppress(Exception):
-            await ws_twilio.send_text(json.dumps({"event": "error", "message": str(e)}))
-        with contextlib.suppress(Exception):
-            await ws_twilio.close()
-
-# ========= Local dev (opcional) =========
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("codigo_flask:app", host="0.0.0.0", port=8000, reload=False)
