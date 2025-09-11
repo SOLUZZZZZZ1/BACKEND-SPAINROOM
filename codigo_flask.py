@@ -22,7 +22,7 @@ TWILIO_WS_PATH = "/stream/twilio"
 # ========= App =========
 app = FastAPI(title="SpainRoom Voice Gateway")
 
-# ========= Util: resample PCM16 usando stdlib (audioop) =========
+# ========= Util: resample PCM16 con stdlib (audioop) =========
 def pcm16_resample(pcm_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
     if src_rate == dst_rate:
         return pcm_bytes
@@ -33,6 +33,24 @@ def pcm16_resample(pcm_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
 @app.get("/voice/health")
 def health():
     return PlainTextResponse("OK")
+
+@app.get("/diag/key")
+def diag_key():
+    """
+    Devuelve si la variable OPENAI_API_KEY está cargada (sin mostrar su valor).
+    """
+    return {"openai_key_configured": bool(OPENAI_API_KEY)}
+
+@app.post("/voice/say")
+def voice_say():
+    """
+    TwiML de prueba rápida (sin streaming) para verificar que Twilio entra a tu backend.
+    """
+    twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="es-ES">Hola, SpainRoom. Prueba de backend correcta.</Say>
+</Response>"""
+    return Response(content=twiml, media_type="application/xml; charset=utf-8")
 
 @app.post("/voice/answer")
 def voice_answer():
