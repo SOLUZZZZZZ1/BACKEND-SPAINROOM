@@ -5,7 +5,7 @@ import base64
 import asyncio
 import audioop
 import contextlib
-from typing import Optional
+from typing import Optional, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, PlainTextResponse
@@ -20,16 +20,21 @@ OPENAI_VOICE = os.getenv("OPENAI_VOICE", "shimmer")
 
 TWILIO_WS_PATH = "/stream/twilio"
 
-# ========= App =========
-app = FastAPI(title="SpainRoom Voice Gateway (FINAL ANTI-RUIDO)")
+app = FastAPI(title="SpainRoom Voice Gateway (anti-ruido estado+ritmo)")
 
-# ========= Utils =========
-def resample_pcm16(pcm: bytes, src_hz: int, dst_hz: int) -> bytes:
-    """Re-muestreo PCM16 mono con stdlib (audioop)."""
-    if not pcm or src_hz == dst_hz:
-        return pcm
-    out, _ = audioop.ratecv(pcm, 2, 1, src_hz, dst_hz, None)
-    return out
+# ========= Resamplers con estado =========
+class PcmResampler:
+    """Resampler PCM16 mono con estado continuo para evitar artefactos entre fragmentos."""
+    def __init__(self, src_hz: int, dst_hz: int):
+        self.src_hz = src_hz
+        self.dst_hz = dst_hz
+        self.state: Optional[Tuple] = None  # estado interno de audioop.ratecv
+
+    def process(self, pcm_bytes: bytes) -> bytes:
+        if not pcm_bytes or self.src_hz == self.dst_hz:
+            return pcm_bytes
+        out, self.state = audioop.ratecv(pcm_bytes, 2, 1, self.src_hz, self.dst_hz, self.state)
+        return out
 
 # ========= Health / Diag =========
 @app.get("/voice/health")
@@ -44,7 +49,6 @@ def diag_key():
 @app.get("/voice/test_female")
 @app.post("/voice/test_female")
 def voice_test_female():
-    """Prueba del circuito telefónico con TTS Twilio (sin streaming)"""
     twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice" language="es-ES">Prueba de voz femenina en el circuito telefónico. SpainRoom operativo.</Say>
@@ -55,7 +59,6 @@ def voice_test_female():
 @app.get("/voice/answer")
 @app.post("/voice/answer")
 def voice_answer():
-    """Inicia Media Streams bidireccional (sin track, evita 31941)"""
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -64,10 +67,10 @@ def voice_answer():
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
 
-# ========= WebSocket: Twilio ⇄ OpenAI Realtime (PCM16 16k <-> μ-law 8k) =========
+# ========= WebSocket: Twilio ⇄ OpenAI Realtime =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
-    # Twilio envía Sec-WebSocket-Protocol: audio → acéptalo
+    # Twilio usa el subprotocolo "audio"
     await ws_twilio.accept(subprotocol="audio")
 
     if not OPENAI_API_KEY:
@@ -78,30 +81,34 @@ async def twilio_stream(ws_twilio: WebSocket):
     stream_sid: Optional[str] = None
     started = False
 
+    # Resamplers con estado (16k <-> 8k)
+    down = PcmResampler(16000, 8000)  # modelo -> Twilio
+    up   = PcmResampler(8000, 16000)  # Twilio -> modelo
+
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
 
     try:
         async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as ws_ai:
-            # 1) Sesión del modelo: PCM16 16k limpio + voz femenina + VAD + guardarraíles SpainRoom
+            # Sesión: PCM16 16k limpio (modelo) + voz y guardarraíles SpainRoom
             await ws_ai.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "voice": OPENAI_VOICE,
-                    "modalities": ["audio", "text"],  # requerido por Realtime
+                    "modalities": ["audio", "text"],
                     "turn_detection": {"type": "server_vad", "create_response": True},
                     "input_audio_format":  {"type": "pcm16", "sample_rate_hz": 16000},
                     "output_audio_format": {"type": "pcm16", "sample_rate_hz": 16000},
                     "instructions": (
                         "Te llamas Nora y trabajas en SpainRoom (alquiler de HABITACIONES). "
-                        "Voz FEMENINA, cercana y ágil (ritmo natural, frases cortas). "
-                        "Si preguntan por temas ajenos (muebles/tiendas/IKEA), indica que ayudas con HABITACIONES "
+                        "Voz FEMENINA, cercana y ágil (frases cortas). "
+                        "Si preguntan por temas ajenos (muebles/IKEA, etc.), explica que ayudas con HABITACIONES "
                         "y redirige: «¿Eres propietario o inquilino?» "
                         "Responde en el idioma del usuario (ES/EN) y permite interrupciones (barge-in)."
                     )
                 }
             }))
 
-            # 2) Modelo → Twilio: PCM16 16k -> PCM16 8k -> μ-law 8k -> base64 (frames de 20 ms) SIN retraso
+            # Modelo -> Twilio (PCM16 16k -> PCM16 8k -> μ-law 8k) con estado y pacing real
             async def ai_to_twilio():
                 try:
                     async for raw in ws_ai:
@@ -113,10 +120,8 @@ async def twilio_stream(ws_twilio: WebSocket):
                             if not b64_pcm:
                                 continue
                             pcm16_16k = base64.b64decode(b64_pcm)
-                            # downsample 16k -> 8k
-                            pcm16_8k  = resample_pcm16(pcm16_16k, 16000, 8000)
-                            # PCM16 -> μ-law
-                            ulaw_8k   = audioop.lin2ulaw(pcm16_8k, 2)
+                            pcm16_8k  = down.process(pcm16_16k)           # downsample con estado
+                            ulaw_8k   = audioop.lin2ulaw(pcm16_8k, 2)     # PCM16 -> μ-law
 
                             if stream_sid and started and ulaw_8k:
                                 CHUNK = 160  # 20 ms @ 8kHz μ-law (1 byte/muestra)
@@ -127,8 +132,8 @@ async def twilio_stream(ws_twilio: WebSocket):
                                         "streamSid": stream_sid,
                                         "media": {"payload": payload}
                                     }))
-                                    # sin retraso artificial → no “voz lenta”
-                                    await asyncio.sleep(0)
+                                    # ritmo real 20 ms: Twilio reproduce natural, sin “cámara lenta”
+                                    await asyncio.sleep(0.02)
 
                         elif t == "error":
                             print("OPENAI REALTIME ERROR:", evt)
@@ -140,7 +145,7 @@ async def twilio_stream(ws_twilio: WebSocket):
 
             task = asyncio.create_task(ai_to_twilio())
 
-            # 3) Twilio → Modelo: μ-law 8k -> PCM16 8k -> PCM16 16k -> base64
+            # Twilio -> Modelo (μ-law 8k -> PCM16 8k -> PCM16 16k) con estado
             try:
                 while True:
                     msg_text = await ws_twilio.receive_text()
@@ -159,10 +164,8 @@ async def twilio_stream(ws_twilio: WebSocket):
                     elif ev == "media":
                         ulaw_b64 = msg["media"]["payload"]
                         ulaw_8k  = base64.b64decode(ulaw_b64)
-                        # μ-law -> PCM16 8k
                         pcm16_8k = audioop.ulaw2lin(ulaw_8k, 2)
-                        # upsample 8k -> 16k
-                        pcm16_16k= resample_pcm16(pcm16_8k, 8000, 16000)
+                        pcm16_16k= up.process(pcm16_8k)  # upsample con estado
                         await ws_ai.send(json.dumps({
                             "type": "input_audio_buffer.append",
                             "audio": base64.b64encode(pcm16_16k).decode()
