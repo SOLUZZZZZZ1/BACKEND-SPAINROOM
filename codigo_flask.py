@@ -7,7 +7,7 @@ import contextlib
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, PlainTextResponse
+from fastapi.responses import Response
 import websockets
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 
@@ -100,13 +100,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                         if t in ("response.audio.delta", "response.output_audio.delta"):
                             ulaw_b64 = evt.get("audio") or evt.get("delta")
                             if ulaw_b64 and stream_sid and started:
-                                # Opción A: enviar tal cual (normalmente suficiente)
-                                # await ws_twilio.send_text(json.dumps({
-                                #     "event": "media", "streamSid": stream_sid,
-                                #     "media": {"payload": ulaw_b64}
-                                # }))
-
-                                # Opción B: trocear en frames de 20 ms (160 bytes) para ritmo perfecto
+                                # troceo en frames de 20 ms (160 bytes) para ritmo perfecto
                                 ulaw_bytes = base64.b64decode(ulaw_b64)
                                 CHUNK = 160  # 20 ms @ 8 kHz μ-law
                                 for i in range(0, len(ulaw_bytes), CHUNK):
@@ -143,5 +137,39 @@ async def twilio_stream(ws_twilio: WebSocket):
                         # Saludo inicial
                         await ws_ai.send(json.dumps({
                             "type": "response.create",
-                            "response": { "in
-::contentReference[oaicite:0]{index=0}
+                            "response": {
+                                "instructions": "Hola, soy Nora de SpainRoom. ¿En qué puedo ayudarte?"
+                            }
+                        }))
+
+                    elif ev == "media":
+                        # μ-law 8k en base64 → buffer del modelo (SIN tocar)
+                        await ws_ai.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": msg["media"]["payload"]
+                        }))
+
+                    elif ev == "stop":
+                        break
+
+            except WebSocketDisconnect:
+                pass
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, ConnectionClosedOK, ConnectionClosedError):
+                    await task
+
+    except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
+        pass
+    except Exception as e:
+        print("Bridge error:", e)
+        with contextlib.suppress(Exception):
+            await ws_twilio.send_text(json.dumps({"event": "error", "message": str(e)}))
+    finally:
+        with contextlib.suppress(Exception):
+            await ws_twilio.close()
+
+# Dev local opcional
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("codigo_flask:app", host="0.0.0.0", port=8000)
