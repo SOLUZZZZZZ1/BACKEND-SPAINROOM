@@ -1,69 +1,54 @@
 
-# codigo_flask.py — SpainRoom Voice (Twilio 8 kHz ↔ OpenAI 24 kHz)
-# - 24 kHz end-to-end (tono correcto)
-# - TwiML GET/POST + <Parameter> callSid/from
-# - Anti-click: frames μ-law de 160 bytes exactos
-# - Barge-in fino (sensibilidad, retardo, mínimos)
-# - Voz forzada en saludo (evita cambio de acento)
-# - Captura LEAD (rol/nombre/zona) por texto y envío a Slack/Webhook
-#
-# Requisitos: fastapi, uvicorn[standard], websockets, audioop-lts (para Python 3.13+)
-#
+# codigo_flask.py — SpainRoom Voice (Twilio 8 kHz ↔ OpenAI 24 kHz) con de-click
+# (ver descripción dentro)
 import os, json, base64, asyncio, contextlib, time, math, urllib.request
 from typing import Optional, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response, JSONResponse, HTMLResponse
 import websockets
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
-
-# Compatibilidad audioop (Python 3.13 ha quitado audioop del core)
 try:
-    import audioop          # Python ≤ 3.12
+    import audioop
 except ModuleNotFoundError:
-    import audioop_lts as audioop  # Python 3.13+
+    import audioop_lts as audioop
 
-# ========= Config =========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 OPENAI_VOICE = os.getenv("OPENAI_VOICE", "sage")
 TWILIO_WS_PATH = os.getenv("TWILIO_WS_PATH", "/ws/twilio")
 PUBLIC_WS_URL = os.getenv("PUBLIC_WS_URL")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT",
-    "Eres Nora de SpainRoom. Habla SIEMPRE en español de España (es-ES), tono estable. "
-    "Primero identifica si es PROPIETARIO o INQUILINO y captura: 1) NOMBRE 2) ZONA. "
-    "Cuando tengas los tres, emite en TEXTO una sola línea: "
-    "<<LEAD>>{\"role\":\"propietario|inquilino\",\"nombre\":\"NOMBRE\",\"zona\":\"ZONA\"}<<END>> "
-    "y confirma al cliente en 1 frase.")
+    "Eres Nora de SpainRoom (es-ES, usted). Captura rol, población, zona, nombre y teléfono. "
+    "Emite <<LEAD>>{\"role\":\"propietario|inquilino\",\"poblacion\":\"POBLACION\",\"zona\":\"ZONA\","
+    "\"nombre\":\"NOMBRE COMPLETO\",\"telefono\":\"TELEFONO\"}<<END>> al completar y confirma en una frase.")
 
-# Audio / pacing
-CHUNK_MS = int(os.getenv("CHUNK_MS", "20"))                   # 20 ms por frame
-ULAW_CHUNK_BYTES = int(os.getenv("ULAW_CHUNK_BYTES", "160"))  # 20 ms @ 8 kHz μ-law
-PACE_MS = int(os.getenv("PACE_MS", str(CHUNK_MS)))            # por defecto, tiempo real
-HWM_FRAMES = int(os.getenv("HWM_FRAMES", "50"))               # backlog alto (≈1s si 20 ms/frame)
-BURST_MAX = int(os.getenv("BURST_MAX", "8"))                  # ráfagas extra por tick para recuperar
-PREROLL_MS = int(os.getenv("PREROLL_MS", "700"))
-
-SAYFIRST_TEXT = os.getenv("SAYFIRST_TEXT", "Hola, soy Nora de SpainRoom.")
+CHUNK_MS = int(os.getenv("CHUNK_MS", "20"))
+ULAW_CHUNK_BYTES = int(os.getenv("ULAW_CHUNK_BYTES", "160"))
+PACE_MS = int(os.getenv("PACE_MS", str(CHUNK_MS)))
+HWM_FRAMES = int(os.getenv("HWM_FRAMES", "50"))
+BURST_MAX = int(os.getenv("BURST_MAX", "6"))
+PREROLL_MS = int(os.getenv("PREROLL_MS", "1000"))
+SAYFIRST_TEXT = os.getenv("SAYFIRST_TEXT", "Bienvenido a SpainRoom.")
 FOLLOWUP_GREETING_MS = int(os.getenv("FOLLOWUP_GREETING_MS", "300"))
-FOLLOWUP_GREETING_TEXT = os.getenv("FOLLOWUP_GREETING_TEXT", "¿Eres propietario con habitaciones libres o inquilino buscando habitación?")
+FOLLOWUP_GREETING_TEXT = os.getenv("FOLLOWUP_GREETING_TEXT", "Para atenderle: ¿Es usted propietario o inquilino?")
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-# Pausas y barge-in
-PAUSE_EVERY_MS = int(os.getenv("PAUSE_EVERY_MS", "0"))        # 0 = sin micro-pausas
-BARGE_VAD_DB = float(os.getenv("BARGE_VAD_DB", "-30"))        # umbral dBFS para detectar voz del cliente
-BARGE_RELEASE_MS = int(os.getenv("BARGE_RELEASE_MS", "650"))  # silencio necesario para volver a hablar
+PAUSE_EVERY_MS = int(os.getenv("PAUSE_EVERY_MS", "0"))
+MAX_UTTER_MS = int(os.getenv("MAX_UTTER_MS", "3400"))
+BARGE_VAD_DB = float(os.getenv("BARGE_VAD_DB", "-28"))
+BARGE_RELEASE_MS = int(os.getenv("BARGE_RELEASE_MS", "950"))
 BARGE_SEND_SILENCE = os.getenv("BARGE_SEND_SILENCE", "1") == "1"
-START_SPEAK_DELAY_MS = int(os.getenv("START_SPEAK_DELAY_MS", "150"))  # retardo antes de arrancar a hablar
-MIN_BARGE_SPEECH_MS = int(os.getenv("MIN_BARGE_SPEECH_MS", "120"))    # ms mínimos de voz para cortar
+START_SPEAK_DELAY_MS = int(os.getenv("START_SPEAK_DELAY_MS", "350"))
+MIN_BARGE_SPEECH_MS = int(os.getenv("MIN_BARGE_SPEECH_MS", "220"))
 
-MAX_UTTER_MS = int(os.getenv("MAX_UTTER_MS", "4200"))
+DECLICK_ON = os.getenv("DECLICK_ON", "1") == "1"
+DECLICK_FRAMES = int(os.getenv("DECLICK_FRAMES", "2"))
+DECLICK_FACTORS = [0.6, 0.3]
+
 CAPTURE_TAG = os.getenv("CAPTURE_TAG", "LEAD")
+LEAD_WEBHOOK_URL = os.getenv("LEAD_WEBHOOK_URL", "")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
-# Lead delivery
-LEAD_WEBHOOK_URL = os.getenv("LEAD_WEBHOOK_URL", "")           # ej: https://tu-backend/lead
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")         # opcional
-
-# ========= App =========
 app = FastAPI(title="SpainRoom Voice Realtime", docs_url="/docs", redoc_url=None)
 
 def _log(*a):
@@ -82,15 +67,13 @@ def _infer_ws_url(request: Request) -> str:
     return f"{scheme}://{host}{TWILIO_WS_PATH}"
 
 class RateCV:
-    """Wrapper para audioop.ratecv con estado persistente."""
     def __init__(self, src_rate: int, dst_rate: int, sampwidth: int = 2, channels: int = 1):
         self.src_rate = src_rate; self.dst_rate = dst_rate
         self.sampwidth = sampwidth; self.channels = channels
         self.state = None
     def convert(self, pcm: bytes) -> bytes:
         if not pcm: return b""
-        out, self.state = audioop.ratecv(pcm, self.sampwidth, self.channels,
-                                         self.src_rate, self.dst_rate, self.state)
+        out, self.state = audioop.ratecv(pcm, self.sampwidth, self.channels, self.src_rate, self.dst_rate, self.state)
         return out
 
 async def _post_json(url: str, payload: dict):
@@ -101,32 +84,17 @@ async def _post_json(url: str, payload: dict):
 async def deliver_lead(lead: dict):
     if not lead: return
     if LEAD_WEBHOOK_URL:
-        try:
-            await _post_json(LEAD_WEBHOOK_URL, lead)
-            _log("Lead enviado a webhook:", LEAD_WEBHOOK_URL)
-        except Exception as e:
-            _log("lead webhook error:", e)
+        with contextlib.suppress(Exception):
+            await _post_json(LEAD_WEBHOOK_URL, lead); _log("Lead → webhook")
     if SLACK_WEBHOOK_URL:
-        try:
-            text = f":house: *LEAD* — {lead.get('role','?')} | {lead.get('nombre','?')} | {lead.get('zona','?')} | {lead.get('from','?')}"
-            await _post_json(SLACK_WEBHOOK_URL, {"text": text})
-            _log("Lead enviado a Slack")
-        except Exception as e:
-            _log("slack webhook error:", e)
+        with contextlib.suppress(Exception):
+            text = f":house: *LEAD* — {lead.get('role','?')} | {lead.get('poblacion',lead.get('zona','?'))} | {lead.get('zona','?')} | {lead.get('nombre','?')} | {lead.get('telefono','?')}"
+            await _post_json(SLACK_WEBHOOK_URL, {"text": text}); _log("Lead → Slack")
 
-# ========= Rutas de diagnóstico =========
 @app.get("/")
 async def root(request: Request):
     ws_url = _infer_ws_url(request)
-    html = f"""
-    <h1>SpainRoom Voice</h1>
-    <ul>
-      <li><code>/health</code></li>
-      <li><code>/docs</code></li>
-      <li><code>/voice/answer_sayfirst</code> (GET/POST) — WS: <code>{ws_url}</code></li>
-    </ul>
-    """
-    return HTMLResponse(html)
+    return HTMLResponse(f"<h3>SpainRoom Voice</h3><p>/health · /docs · /voice/answer_sayfirst (GET/POST)</p><code>{ws_url}</code>")
 
 @app.get("/health")
 async def health():
@@ -140,30 +108,18 @@ async def diag_keys():
         "SLACK_WEBHOOK_URL": bool(SLACK_WEBHOOK_URL),
     })
 
-# ========= TwiML =========
 @app.api_route("/voice/answer_sayfirst", methods=["GET","POST"])
 async def voice_answer(request: Request):
-    # Extrae CallSid y From del webhook de Twilio
-    call_sid = ""
-    from_phone = ""
-    try:
+    call_sid = ""; from_phone = ""
+    with contextlib.suppress(Exception):
         if request.method == "POST":
-            form = dict(await request.form())
-            call_sid = form.get("CallSid", "") or form.get("callsid", "")
-            from_phone = form.get("From", "") or form.get("from", "")
+            form = dict(await request.form()); call_sid = form.get("CallSid","") or form.get("callsid",""); from_phone = form.get("From","") or form.get("from","")
         else:
-            qp = dict(request.query_params)
-            call_sid = qp.get("CallSid", "") or qp.get("callsid", "")
-            from_phone = qp.get("From", "") or qp.get("from", "")
-    except Exception:
-        pass
-
+            qp = dict(request.query_params); call_sid = qp.get("CallSid","") or qp.get("callsid",""); from_phone = qp.get("From","") or qp.get("from","")
     ws_url = _infer_ws_url(request)
     params_xml = ""
     if call_sid or from_phone:
-        params_xml += f'\n      <Parameter name="callSid" value="{call_sid}"/>'
-        params_xml += f'\n      <Parameter name="from" value="{from_phone}"/>'
-
+        params_xml = f'\n      <Parameter name="callSid" value="{call_sid}"/>\n      <Parameter name="from" value="{from_phone}"/>'
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice" language="es-ES">{SAYFIRST_TEXT}</Say>
@@ -176,92 +132,83 @@ async def voice_answer(request: Request):
 
 @app.api_route("/voice/fallback", methods=["GET","POST"])
 async def voice_fallback():
-    twiml = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice" language="es-ES">Lo siento, ahora mismo no estoy disponible. Inténtalo de nuevo en un momento.</Say>
-</Response>"""
-    return Response(twiml, media_type="text/xml; charset=utf-8")
+    return Response('<?xml version="1.0"?><Response><Say language="es-ES">Lo siento, intente de nuevo.</Say></Response>',
+                    media_type="text/xml; charset=utf-8")
 
-# ========= WebSocket: Twilio ⇄ OpenAI (μ-law 8k <-> PCM16 24 kHz) =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
-    await ws_twilio.accept(subprotocol="audio")
-    _log("WS accepted (audio)")
-
+    await ws_twilio.accept(subprotocol="audio"); _log("WS accepted (audio)")
     if not OPENAI_API_KEY:
-        await ws_twilio.send_text(json.dumps({"event": "error", "message": "Falta OPENAI_API_KEY"}))
-        await ws_twilio.close(); return
+        await ws_twilio.send_text(json.dumps({"event":"error","message":"Falta OPENAI_API_KEY"})); await ws_twilio.close(); return
 
-    stream_sid: Optional[str] = None
-    started = False
-    ai_ready = asyncio.Event()
-    start_evt = asyncio.Event()
-    ws_ai: Optional[websockets.WebSocketClientProtocol] = None
+    stream_sid: Optional[str] = None; started = False
+    start_evt = asyncio.Event(); ws_ai: Optional[websockets.WebSocketClientProtocol] = None
     buffered_ulaw: List[bytes] = []
+    call_sid = ""; from_phone = ""
 
-    # Datos de la llamada (Twilio)
-    call_sid: str = ""
-    from_phone: str = ""
+    barge_active = False; barge_last_voice = 0.0; ai_spoken_ms = 0; speak_gate_until = 0.0; vad_hot_ms = 0
+    up_8k_to_24k = RateCV(8000, 24000, 2, 1); down_24k_to_8k = RateCV(24000, 8000, 2, 1)
 
-    # Estado turn-taking / barge-in
-    barge_active: bool = False
-    barge_last_voice: float = 0.0
-    ai_spoken_ms: int = 0
-    speak_gate_until: float = 0.0
-    vad_hot_ms: int = 0
-
-    # Resamplers
-    up_8k_to_24k = RateCV(8000, 24000, 2, 1)
-    down_24k_to_8k = RateCV(24000, 8000, 2, 1)
-
-    # Cola salida Twilio y buffer anti-click
     ulaw_out_queue: asyncio.Queue = asyncio.Queue(maxsize=4000)
     ulaw_carry = bytearray()
+    last_ulaw_sent: Optional[bytes] = None  # de-click
+
+    def _declick_frames_from_last() -> List[str]:
+        out: List[str] = []
+        if not last_ulaw_sent or not DECLICK_ON: return out
+        try:
+            lin = audioop.ulaw2lin(last_ulaw_sent, 2)
+            nframes = 2 if DECLICK_FRAMES >= 2 else 1
+            for f in DECLICK_FACTORS[:nframes]:
+                lin_f = audioop.mul(lin, 2, float(f))
+                u = audioop.lin2ulaw(lin_f, 2)
+                out.append(base64.b64encode(u).decode('ascii'))
+        except Exception as e:
+            _log("de-click error", e)
+        return out
 
     async def twilio_sender():
-        nonlocal stream_sid, barge_active, ai_spoken_ms, speak_gate_until
-        next_t = time.monotonic()
-        sleep_s = max(0.0, PACE_MS / 1000.0)
-        played_since_pause_ms = 0
+        nonlocal stream_sid, barge_active, ai_spoken_ms, speak_gate_until, last_ulaw_sent
+        next_t = time.monotonic(); sleep_s = max(0.0, PACE_MS / 1000.0); played_since_pause_ms = 0
         while True:
             now = time.monotonic()
             if speak_gate_until and now < speak_gate_until:
                 if BARGE_SEND_SILENCE and stream_sid:
                     silent = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode('ascii')
                     await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":silent}}))
-                if sleep_s > 0.0: await asyncio.sleep(sleep_s)
-                continue
+                if sleep_s > 0.0: await asyncio.sleep(sleep_s); continue
+
             if barge_active:
-                try:
-                    while True:
-                        _ = ulaw_out_queue.get_nowait()
-                        ulaw_out_queue.task_done()
-                except asyncio.QueueEmpty:
-                    pass
+                for b64 in _declick_frames_from_last():
+                    await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":b64}}))
                 if BARGE_SEND_SILENCE and stream_sid:
                     silent = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode('ascii')
                     await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":silent}}))
+                try:
+                    while True: ulaw_out_queue.get_nowait(); ulaw_out_queue.task_done()
+                except asyncio.QueueEmpty: pass
                 if sleep_s > 0.0: await asyncio.sleep(sleep_s)
                 continue
 
             payload_b64 = await ulaw_out_queue.get()
+            try:
+                raw = base64.b64decode(payload_b64)
+                if raw != bytes([0xFF]) * ULAW_CHUNK_BYTES: last_ulaw_sent = raw
+            except Exception: pass
+
             await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":payload_b64}}))
             ulaw_out_queue.task_done()
 
-            ai_spoken_ms += CHUNK_MS
-            played_since_pause_ms += CHUNK_MS
+            ai_spoken_ms += CHUNK_MS; played_since_pause_ms += CHUNK_MS
 
             if PAUSE_EVERY_MS > 0 and played_since_pause_ms >= PAUSE_EVERY_MS:
                 if stream_sid:
                     silent = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode('ascii')
                     await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":silent}}))
-                played_since_pause_ms = 0
-                next_t = time.monotonic()
-                continue
+                played_since_pause_ms = 0; next_t = time.monotonic(); continue
 
             if MAX_UTTER_MS > 0 and ai_spoken_ms >= MAX_UTTER_MS:
-                barge_active = True
-                barge_last_voice = time.monotonic()
+                barge_active = True; barge_last_voice = time.monotonic()
 
             qsz = ulaw_out_queue.qsize()
             if qsz >= HWM_FRAMES:
@@ -270,12 +217,10 @@ async def twilio_stream(ws_twilio: WebSocket):
                     payload_b64 = await ulaw_out_queue.get()
                     await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":payload_b64}}))
                     ulaw_out_queue.task_done()
-                next_t = time.monotonic()
-                continue
+                next_t = time.monotonic(); continue
 
             if sleep_s > 0.0:
-                next_t += sleep_s
-                delay = next_t - time.monotonic()
+                next_t += sleep_s; delay = next_t - time.monotonic()
                 if delay > 0: await asyncio.sleep(delay)
                 else: next_t = time.monotonic()
 
@@ -291,10 +236,8 @@ async def twilio_stream(ws_twilio: WebSocket):
         nonlocal ai_spoken_ms
         ai_spoken_ms = 0
         frames = max(1, ms // CHUNK_MS)
-        chunk = bytes([0xFF]) * ULAW_CHUNK_BYTES
-        b64 = base64.b64encode(chunk).decode("ascii")
-        for _ in range(frames):
-            await ulaw_out_queue.put(b64)
+        b64 = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode("ascii")
+        for _ in range(frames): await ulaw_out_queue.put(b64)
 
     async def connect_ai_after_start():
         nonlocal ws_ai, ai_spoken_ms, barge_active, speak_gate_until
@@ -317,149 +260,101 @@ async def twilio_stream(ws_twilio: WebSocket):
                     "modalities": ["audio","text"],
                 },
             }))
-            ai_spoken_ms = 0
-            barge_active = False
-            _log("Session configured; flushing buffered μ-law frames:", len(buffered_ulaw))
-
-            while buffered_ulaw:
-                ulaw = buffered_ulaw.pop(0)
-                lin8 = audioop.ulaw2lin(ulaw, 2)
-                pcm24 = up_8k_to_24k.convert(lin8)
-                if pcm24:
-                    await ws_ai.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": base64.b64encode(pcm24).decode("ascii"),
-                    }))
+            ai_spoken_ms = 0; barge_active = False
 
             await asyncio.sleep(FOLLOWUP_GREETING_MS / 1000.0)
-            try:
-                await ws_ai.send(json.dumps({
-                    "type": "response.create",
-                    "response": {
-                        "instructions": FOLLOWUP_GREETING_TEXT,
-                        "voice": OPENAI_VOICE
-                    }
-                }))
-            except Exception as e:
-                _log("Optional greet failed:", e)
+            with contextlib.suppress(Exception):
+                await ws_ai.send(json.dumps({"type":"response.create","response":{"instructions":FOLLOWUP_GREETING_TEXT,"voice":OPENAI_VOICE}}))
 
-            # Bucle AI → Twilio con captura LEAD
             try:
                 txt_buf = ""
                 async for raw in ws_ai:
-                    evt = json.loads(raw)
-                    t = evt.get("type")
+                    evt = json.loads(raw); t = evt.get("type")
 
-                    if t in ("response.created", "response.started"):
-                        ai_spoken_ms = 0
-                        barge_active = False
+                    if t in ("response.created","response.started"):
+                        ai_spoken_ms = 0; barge_active = False
                         speak_gate_until = time.monotonic() + (START_SPEAK_DELAY_MS / 1000.0)
 
                     if t in ("response.output_text.delta",):
                         delta = evt.get("delta") or evt.get("text") or ""
                         if delta:
                             txt_buf += delta
-                            start_tag = f"<<{CAPTURE_TAG}>>"
-                            end_tag = "<<END>>"
-                            if start_tag in txt_buf and end_tag in txt_buf:
-                                sidx = txt_buf.rfind(start_tag)
-                                eidx = txt_buf.find(end_tag, sidx)
-                                if eidx != -1:
-                                    payload = txt_buf[sidx+len(start_tag):eidx].strip()
-                                    _log(f"[{CAPTURE_TAG}]", payload)
+                            st, en = f"<<{CAPTURE_TAG}>>", "<<END>>"
+                            if st in txt_buf and en in txt_buf:
+                                s = txt_buf.rfind(st); e = txt_buf.find(en, s)
+                                if e != -1:
+                                    payload = txt_buf[s+len(st):e].strip()
                                     lead = {}
-                                    try:
-                                        lead = json.loads(payload)
-                                    except Exception:
-                                        lead = {"raw": payload}
-                                    lead.update({
-                                        "call_sid": call_sid,
-                                        "from": from_phone,
-                                        "timestamp": int(time.time()*1000),
-                                        "source": "twilio-voice"
-                                    })
+                                    with contextlib.suppress(Exception): lead = json.loads(payload)
+                                    lead.update({"timestamp": int(time.time()*1000), "source": "twilio-voice"})
                                     await deliver_lead(lead)
 
-                    if t in ("response.audio.delta", "response.output_audio.delta"):
-                        if barge_active:
-                            continue
+                    if t in ("response.audio.delta","response.output_audio.delta"):
+                        if barge_active: continue
                         b64 = evt.get("audio") or evt.get("delta")
-                        if b64 and stream_sid and started:
+                        if b64 and started and stream_sid:
                             pcm24 = base64.b64decode(b64)
-                            lin8k = down_24k_to_8k.convert(pcm24)
-                            if not lin8k: continue
-                            ulaw8k = audioop.lin2ulaw(lin8k, 2)
-                            await enqueue_ulaw_frames(ulaw8k)
-
-                    if t in ("response.completed", "response.stopped", "response.canceled"):
-                        ai_spoken_ms = 0
+                            lin8 = down_24k_to_8k.convert(pcm24)
+                            if not lin8: continue
+                            ulaw8 = audioop.lin2ulaw(lin8, 2)
+                            await enqueue_ulaw_frames(ulaw8)
 
             except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
-                _log("AI socket closed")
+                _log("AI socket closed.")
             except Exception as e:
                 _log("ai_to_twilio error:", e)
         finally:
             with contextlib.suppress(Exception):
-                if ws_ai is not None:
-                    await ws_ai.close()
+                if ws_ai is not None: await ws_ai.close()
 
     async def twilio_to_ai():
         nonlocal stream_sid, started, barge_active, barge_last_voice, vad_hot_ms, call_sid, from_phone
         try:
             while True:
                 msg_text = await ws_twilio.receive_text()
-                msg = json.loads(msg_text)
-                ev = msg.get("event")
+                msg = json.loads(msg_text); ev = msg.get("event")
 
                 if ev == "start":
-                    stream_sid = msg["start"]["streamSid"]
-                    started = True
-                    try:
+                    stream_sid = msg["start"]["streamSid"]; started = True
+                    with contextlib.suppress(Exception):
                         params = {p.get("name"): p.get("value") for p in msg["start"].get("customParameters", [])}
-                        call_sid = params.get("callSid", call_sid)
-                        from_phone = params.get("from", from_phone)
-                    except Exception:
-                        pass
-                    _log("Twilio 'start' — streamSid:", stream_sid, "callSid:", call_sid, "from:", from_phone)
+                        call_sid = params.get("callSid",""); from_phone = params.get("from","")
+                    _log("Twilio start — streamSid:", stream_sid, "from:", from_phone)
                     start_evt.set()
                     await enqueue_silence(PREROLL_MS)
 
                 elif ev == "media":
                     if not started: continue
-                    b64 = msg["media"]["payload"]
-                    ulaw = base64.b64decode(b64)
-
-                    lin_probe = audioop.ulaw2lin(ulaw, 2)
-                    rms = max(1, audioop.rms(lin_probe, 2))
-                    db = 20.0 * math.log10(rms / 32767.0)
-                    now = time.monotonic()
+                    ulaw = base64.b64decode(msg["media"]["payload"])
+                    lin = audioop.ulaw2lin(ulaw, 2)
+                    rms = max(1, audioop.rms(lin, 2)); db = 20.0 * math.log10(rms / 32767.0); now = time.monotonic()
                     if db >= BARGE_VAD_DB:
                         vad_hot_ms = min(vad_hot_ms + CHUNK_MS, 2000)
                         if vad_hot_ms >= MIN_BARGE_SPEECH_MS:
-                            barge_active = True
-                            barge_last_voice = now
-                            vad_hot_ms = 0
+                            barge_active = True; barge_last_voice = now; vad_hot_ms = 0
                             with contextlib.suppress(Exception):
-                                if ws_ai is not None:
-                                    await ws_ai.send(json.dumps({"type": "response.cancel"}))
+                                # cancelar respuesta en curso
+                                await ws_ai.send(json.dumps({"type":"response.cancel"}))
                     else:
                         vad_hot_ms = 0
                         if barge_active and (now - barge_last_voice) * 1000.0 >= BARGE_RELEASE_MS:
                             barge_active = False
 
                     if ws_ai is not None:
-                        pcm24 = up_8k_to_24k.convert(lin_probe)
+                        pcm24 = up_8k_to_24k.convert(lin)
                         if pcm24:
                             await ws_ai.send(json.dumps({
-                                "type": "input_audio_buffer.append",
+                                "type":"input_audio_buffer.append",
                                 "audio": base64.b64encode(pcm24).decode("ascii"),
                             }))
+                    else:
+                        buffered_ulaw.append(ulaw)
 
                 elif ev == "stop":
-                    _log("Twilio 'stop' received; closing")
+                    _log("Twilio stop")
                     with contextlib.suppress(Exception):
                         if ws_ai is not None:
-                            await ws_ai.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            await ws_ai.send(json.dumps({"type":"input_audio_buffer.commit"}))
                     break
 
         except WebSocketDisconnect:
@@ -469,17 +364,14 @@ async def twilio_stream(ws_twilio: WebSocket):
 
     # Lanzar tareas
     task_connect = asyncio.create_task(connect_ai_after_start())
-    task_twilio = asyncio.create_task(twilio_to_ai())
-    task_sender = asyncio.create_task(twilio_sender())
-    done, pending = await asyncio.wait(
-        {task_connect, task_twilio, task_sender}, return_when=asyncio.FIRST_COMPLETED
-    )
+    task_twilio  = asyncio.create_task(twilio_to_ai())
+    task_sender  = asyncio.create_task(twilio_sender())
+    done, pending = await asyncio.wait({task_connect, task_twilio, task_sender}, return_when=asyncio.FIRST_COMPLETED)
     for t in pending:
         t.cancel()
         with contextlib.suppress(Exception):
             await t
 
-# Dev local
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("codigo_flask:app", host="0.0.0.0", port=8000)
