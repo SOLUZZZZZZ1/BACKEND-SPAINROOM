@@ -1,0 +1,24 @@
+# requirements.mono.txt — TODO en un mismo proceso (no recomendado, pero posible)
+# OJO: arranca SIEMPRE el entrypoint ASGI de FastAPI para el WS de voz.
+# Ej.: uvicorn codigo_flask_bargein24k_post:app --host 0.0.0.0 --port $PORT
+fastapi==0.111.*
+uvicorn[standard]==0.30.*
+websockets==12.*
+python-dotenv==1.0.*
+
+# Si además usas tu API/Panel en Flask:
+Flask==3.0.*
+Flask-Cors==4.0.*
+
+# DB (ajusta a tu proyecto)
+SQLAlchemy==2.0.*
+Flask-SQLAlchemy==3.1.*
+psycopg2-binary==2.9.*
+
+# SDKs varios que ya tienes
+twilio==9.*
+stripe==7.*
+openai==1.*
+
+# Producción (solo si lo necesitas, y siempre con worker ASGI)
+gunicorn==22.*

@@ -1,0 +1,5 @@
+# requirements.voice.txt — servicio de VOZ (Twilio WS ↔ FastAPI ↔ OpenAI Realtime 24 kHz)
+fastapi==0.111.*
+uvicorn[standard]==0.30.*
+websockets==12.*
+python-dotenv==1.0.*
