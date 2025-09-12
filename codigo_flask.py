@@ -1,5 +1,18 @@
 
-# codigo_flask.py — v4.4: pacing fijo 20 ms + preroll 500 ms + Say-first + conexión a OpenAI tras 'start'
+# codigo_flask.py — v5 ROBUSTA
+# Transcodifica entre Twilio (G.711 μ-law 8 kHz) y OpenAI (PCM16 16 kHz)
+# para evitar audio roto/ruido cuando el bot responde.
+#
+# Incluye:
+# - /voice/answer_sayfirst  (TwiML: <Say> + <Pause> + <Connect><Stream/>)
+# - /voice/answer           (directo)
+# - /voice/fallback         (mensaje claro si algo falla)
+# - /voice/test_female      (autotest Twilio TTS)
+# - WS bridge Twilio <-> OpenAI con:
+#     * Conexión a OpenAI DESPUÉS de 'start'
+#     * Preroll de silencio μ-law para estabilizar
+#     * Pacing estricto 20 ms (160 B μ-law) al enviar a Twilio
+#     * Transcoding μ-law8k <-> PCM16 16k con audioop
 import os
 import json
 import base64
@@ -12,6 +25,8 @@ from fastapi.responses import Response
 import websockets
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 
+import audioop  # estándar en Python (μ-law/PCM y resampling)
+
 # ========= Config =========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
@@ -19,7 +34,7 @@ OPENAI_VOICE = os.getenv("OPENAI_VOICE", "sage")
 TWILIO_WS_PATH = os.getenv("TWILIO_WS_PATH", "/ws/twilio")
 PUBLIC_WS_URL = os.getenv("PUBLIC_WS_URL")  # e.g., wss://backend-spainroom.onrender.com/ws/twilio
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "Eres Nora de SpainRoom. Responde de forma clara y breve.")
-PREROLL_MS = int(os.getenv("PREROLL_MS", "500"))             # μ-law silencio inicial tras start
+PREROLL_MS = int(os.getenv("PREROLL_MS", "500")) # μ-law silencio inicial tras start
 SLEEP_PER_CHUNK = 0.02  # pacing fijo: 20 ms por chunk de 160B μ-law
 SAYFIRST_TEXT = os.getenv("SAYFIRST_TEXT", "Hola, soy Nora de SpainRoom.")
 FOLLOWUP_GREETING_MS = int(os.getenv("FOLLOWUP_GREETING_MS", "700"))
@@ -27,7 +42,7 @@ FOLLOWUP_GREETING_TEXT = os.getenv("FOLLOWUP_GREETING_TEXT", "¿En qué puedo ay
 DEBUG = os.getenv("DEBUG", "1") == "1"
 
 # ========= App =========
-app = FastAPI(title="SpainRoom Voice Realtime Bridge v4.4")
+app = FastAPI(title="SpainRoom Voice Realtime Bridge v5 ROBUSTA")
 
 # ========= Util =========
 def _log(*args):
@@ -63,6 +78,22 @@ async def _send_ulaw_silence(ws_twilio: WebSocket, stream_sid: str, ms: int):
             "media": {"payload": payload},
         }))
         await asyncio.sleep(SLEEP_PER_CHUNK)
+
+class RateCV:
+    """Pequeño wrapper para audioop.ratecv con estado persistente."""
+    def __init__(self, src_rate: int, dst_rate: int, sampwidth: int = 2, channels: int = 1):
+        self.src_rate = src_rate
+        self.dst_rate = dst_rate
+        self.sampwidth = sampwidth
+        self.channels = channels
+        self.state = None
+
+    def convert(self, pcm: bytes) -> bytes:
+        if not pcm:
+            return b""
+        out, self.state = audioop.ratecv(pcm, self.sampwidth, self.channels,
+                                         self.src_rate, self.dst_rate, self.state)
+        return out
 
 # ========= Health =========
 @app.get("/health")
@@ -123,11 +154,11 @@ def voice_test_female():
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
 
-# ========= WebSocket: Twilio ⇄ OpenAI Realtime (μ-law 8k passthrough) =========
+# ========= WebSocket: Twilio ⇄ OpenAI (Transcoding μ-law 8k <-> PCM16 16k) =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
     await ws_twilio.accept(subprotocol="audio")
-    print("[RT] WS accepted (audio)", flush=True)
+    _log("WS accepted (audio)")
 
     if not OPENAI_API_KEY:
         await ws_twilio.send_text(json.dumps({"event": "error", "message": "Falta OPENAI_API_KEY"}))
@@ -139,7 +170,11 @@ async def twilio_stream(ws_twilio: WebSocket):
     ai_ready = asyncio.Event()
     start_evt = asyncio.Event()
     ws_ai: Optional[websockets.WebSocketClientProtocol] = None
-    buffered_media: List[str] = []  # base64 μ-law frames de Twilio recibidos antes de que AI esté listo
+    buffered_ulaw: List[bytes] = []  # μ-law recibido antes de que AI esté listo
+
+    # Resamplers
+    up_8k_to_16k = RateCV(8000, 16000, 2, 1)
+    down_16k_to_8k = RateCV(16000, 8000, 2, 1)
 
     async def connect_ai_after_start():
         nonlocal ws_ai
@@ -150,33 +185,36 @@ async def twilio_stream(ws_twilio: WebSocket):
                 "OpenAI-Beta": "realtime=v1",
             }
             ai_url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
-            print("[RT] Connecting to OpenAI Realtime…", flush=True)
+            _log("Connecting to OpenAI Realtime…")
             ws_ai = await websockets.connect(ai_url, extra_headers=headers)
-            print("[RT] OpenAI Realtime connected", flush=True)
+            _log("OpenAI Realtime connected")
 
-            # μ-law 8k E2E + VAD servidor
+            # Sesión: PCM16 16k E2E con el modelo (nosotros transcodificamos a μ-law 8k para Twilio)
             await ws_ai.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "voice": OPENAI_VOICE,
                     "instructions": SYSTEM_PROMPT,
-                    "input_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000, "channels": 1},
-                    "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000, "channels": 1},
+                    "input_audio_format": {"type": "pcm16", "sample_rate_hz": 16000, "channels": 1},
+                    "output_audio_format": {"type": "pcm16", "sample_rate_hz": 16000, "channels": 1},
                     "turn_detection": {"type": "server_vad"},
                 },
             }))
             ai_ready.set()
-            print("[RT] Session configured; flushing buffered media:", len(buffered_media), flush=True)
+            _log("Session configured; flushing buffered μ-law frames:", len(buffered_ulaw))
 
-            # Volcar audio que llegó antes
-            while buffered_media:
-                payload = buffered_media.pop(0)
-                await ws_ai.send(json.dumps({
-                    "type": "input_audio_buffer.append",
-                    "audio": payload,
-                }))
+            # Volcar μ-law buffered → PCM16 16k → append
+            while buffered_ulaw:
+                ulaw = buffered_ulaw.pop(0)
+                lin8 = audioop.ulaw2lin(ulaw, 2)
+                pcm16_16k = up_8k_to_16k.convert(lin8)
+                if pcm16_16k:
+                    await ws_ai.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(pcm16_16k).decode("ascii"),
+                    }))
 
-            # Pequeño saludo de seguimiento para que el usuario sepa que ya puede hablar
+            # Saludo de seguimiento (después de breve pausa)
             await asyncio.sleep(FOLLOWUP_GREETING_MS / 1000.0)
             try:
                 await ws_ai.send(json.dumps({
@@ -184,33 +222,35 @@ async def twilio_stream(ws_twilio: WebSocket):
                     "response": {"instructions": FOLLOWUP_GREETING_TEXT}
                 }))
             except Exception as e:
-                print("[RT] Optional greet failed:", e, flush=True)
+                _log("Optional greet failed:", e)
 
-            # Bucle de lectura desde AI → Twilio
+            # Bucle AI → Twilio con transcodificación a μ-law 8k + pacing 20 ms
             try:
                 async for raw in ws_ai:
                     evt = json.loads(raw)
                     t = evt.get("type")
                     if t in ("response.audio.delta", "response.output_audio.delta"):
-                        ulaw_b64 = evt.get("audio") or evt.get("delta")
-                        if ulaw_b64 and stream_sid and started:
-                            data = base64.b64decode(ulaw_b64)
-                            # Pacing estricto: 160B → dormir 20 ms por chunk
-                            for i in range(0, len(data), 160):
-                                chunk = data[i:i+160]
+                        b64 = evt.get("audio") or evt.get("delta")
+                        if b64 and stream_sid and started:
+                            pcm16 = base64.b64decode(b64)
+                            lin8k = down_16k_to_8k.convert(pcm16)
+                            if not lin8k:
+                                continue
+                            ulaw8k = audioop.lin2ulaw(lin8k, 2)
+                            for i in range(0, len(ulaw8k), 160):
+                                chunk = ulaw8k[i:i+160]
                                 if not chunk:
                                     continue
-                                payload = base64.b64encode(chunk).decode("ascii")
                                 await ws_twilio.send_text(json.dumps({
                                     "event": "media",
                                     "streamSid": stream_sid,
-                                    "media": {"payload": payload},
+                                    "media": {"payload": base64.b64encode(chunk).decode("ascii")},
                                 }))
                                 await asyncio.sleep(SLEEP_PER_CHUNK)
             except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
-                print("[RT] AI socket closed", flush=True)
+                _log("AI socket closed")
             except Exception as e:
-                print("[RT] ai_to_twilio error:", e, flush=True)
+                _log("ai_to_twilio error:", e)
         finally:
             with contextlib.suppress(Exception):
                 if ws_ai is not None:
@@ -227,7 +267,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                 if ev == "start":
                     stream_sid = msg["start"]["streamSid"]
                     started = True
-                    print("[RT] Twilio 'start' received; streamSid:", stream_sid, flush=True)
+                    _log("Twilio 'start' received; streamSid:", stream_sid)
                     start_evt.set()
 
                     # Silencio inicial para evitar chasquidos/módem
@@ -236,26 +276,30 @@ async def twilio_stream(ws_twilio: WebSocket):
                 elif ev == "media":
                     if not started:
                         continue
-                    payload = msg["media"]["payload"]
+                    b64 = msg["media"]["payload"]
+                    ulaw = base64.b64decode(b64)
                     if ai_ready.is_set() and ws_ai is not None:
-                        await ws_ai.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": payload,
-                        }))
+                        lin8 = audioop.ulaw2lin(ulaw, 2)
+                        pcm16_16k = up_8k_to_16k.convert(lin8)
+                        if pcm16_16k:
+                            await ws_ai.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": base64.b64encode(pcm16_16k).decode("ascii"),
+                            }))
                     else:
-                        buffered_media.append(payload)
+                        buffered_ulaw.append(ulaw)
 
                 elif ev == "stop":
-                    print("[RT] Twilio 'stop' received; closing", flush=True)
+                    _log("Twilio 'stop' received; closing")
                     with contextlib.suppress(Exception):
                         if ws_ai is not None:
                             await ws_ai.send(json.dumps({"type": "input_audio_buffer.commit"}))
                     break
 
         except WebSocketDisconnect:
-            print("[RT] Twilio WS disconnect", flush=True)
+            _log("Twilio WS disconnect")
         except Exception as e:
-            print("[RT] twilio_to_ai error:", e, flush=True)
+            _log("twilio_to_ai error:", e)
 
     # Lanzar tareas en paralelo
     task_connect = asyncio.create_task(connect_ai_after_start())
