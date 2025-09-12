@@ -1,8 +1,9 @@
 
-# codigo_flask.py — Passthrough G.711 μ-law 8k (v3: respuesta inmediata)
-# - Troceo 20 ms (160 bytes) para evitar voz "lenta"
-# - Pre-roll de silencio μ-law al inicio
-# - Saludo inmediato tras start (sin esperar media) para romper posibles "deadlocks"
+# codigo_flask.py — v4: "Say-first" + anti-ruido reforzado + pacing opcional
+# - Endpoint /voice/answer_sayfirst: Twilio <Say> (saludo) + <Pause> + <Connect><Stream/>
+# - μ-law 8 kHz extremo a extremo
+# - Troceo de salida en 20 ms (160 bytes) y pacing opcional
+# - Silencio μ-law inicial tras 'start' para estabilizar el canal
 import os
 import json
 import base64
@@ -20,13 +21,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 OPENAI_VOICE = os.getenv("OPENAI_VOICE", "sage")
 TWILIO_WS_PATH = os.getenv("TWILIO_WS_PATH", "/ws/twilio")
-PUBLIC_WS_URL = os.getenv("PUBLIC_WS_URL")  # si lo defines, se usa tal cual
+PUBLIC_WS_URL = os.getenv("PUBLIC_WS_URL")  # e.g., wss://backend-spainroom.onrender.com/ws/twilio
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "Eres Nora de SpainRoom. Responde de forma clara y breve.")
-PREROLL_MS = int(os.getenv("PREROLL_MS", "240"))
-GREETING_TEXT = os.getenv("GREETING_TEXT", "Hola, soy Nora de SpainRoom. ¿En qué puedo ayudarte?")
+PREROLL_MS = int(os.getenv("PREROLL_MS", "240"))           # μ-law silencio inicial tras start
+PACE_REALTIME_MS = int(os.getenv("PACE_REALTIME_MS", "0")) # 20 = ritmo "tiempo real" por chunk; 0 = sin dormir
+SAYFIRST_TEXT = os.getenv("SAYFIRST_TEXT", "Hola, soy Nora de SpainRoom.")  # texto del <Say> TwiML
+# Nota: no enviamos saludo desde el modelo en 'start' para evitar doble saludo; Twilio lo hará con <Say>.
 
 # ========= App =========
-app = FastAPI(title="SpainRoom Voice Realtime Bridge")
+app = FastAPI(title="SpainRoom Voice Realtime Bridge v4")
 
 # ========= Util =========
 def _mask_key(key: str) -> str:
@@ -45,7 +48,7 @@ def _infer_ws_url(request: Request) -> str:
     return f"{scheme}://{host}{TWILIO_WS_PATH}"
 
 async def _send_ulaw_silence(ws_twilio: WebSocket, stream_sid: str, ms: int):
-    """Envía 'ms' milisegundos de silencio μ-law (0xFF) a 8 kHz en frames de 20 ms (160 bytes)."""
+    """Envía 'ms' ms de silencio μ-law (byte 0xFF) en frames de 20 ms (160 bytes)."""
     if not stream_sid or ms <= 0:
         return
     frames = max(1, ms // 20)
@@ -57,7 +60,8 @@ async def _send_ulaw_silence(ws_twilio: WebSocket, stream_sid: str, ms: int):
             "streamSid": stream_sid,
             "media": {"payload": payload},
         }))
-        await asyncio.sleep(0)
+        # Pacing opcional
+        await asyncio.sleep(0.0 if PACE_REALTIME_MS == 0 else PACE_REALTIME_MS / 1000.0)
 
 # ========= Health =========
 @app.get("/health")
@@ -72,9 +76,26 @@ def diag_key():
 @app.get("/voice/answer")
 @app.post("/voice/answer")
 def voice_answer(request: Request):
+    """Modo directo: conecta el stream sin <Say> previo."""
     ws_url = _infer_ws_url(request)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Connect>
+    <Stream url="{ws_url}"/>
+  </Connect>
+</Response>"""
+    return Response(twiml, media_type="application/xml; charset=utf-8")
+
+@app.get("/voice/answer_sayfirst")
+@app.post("/voice/answer_sayfirst")
+def voice_answer_sayfirst(request: Request):
+    """Modo 'Say-first': Twilio dice un saludo y luego abre el stream (reduce chasquidos/ruido)."""
+    ws_url = _infer_ws_url(request)
+    # Usamos 'alice' en es-ES para compatibilidad amplia
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice" language="es-ES">{SAYFIRST_TEXT}</Say>
+  <Pause length="1"/>
   <Connect>
     <Stream url="{ws_url}"/>
   </Connect>
@@ -94,6 +115,7 @@ def voice_test_female():
 # ========= WebSocket: Twilio ⇄ OpenAI Realtime (μ-law 8k passthrough) =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
+    # Acepta subprotocolo "audio" que envía Twilio
     await ws_twilio.accept(subprotocol="audio")
 
     if not OPENAI_API_KEY:
@@ -108,11 +130,11 @@ async def twilio_stream(ws_twilio: WebSocket):
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
     }
-
     ai_url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
+    # Conexión al modelo
     async with websockets.connect(ai_url, extra_headers=headers) as ws_ai:
-        # Configurar sesión: μ-law 8k E2E + VAD servidor
+        # μ-law 8k E2E + VAD servidor
         await ws_ai.send(json.dumps({
             "type": "session.update",
             "session": {
@@ -125,7 +147,7 @@ async def twilio_stream(ws_twilio: WebSocket):
         }))
 
         async def ai_to_twilio():
-            """Reenvía audio del modelo a Twilio en frames de 20 ms (160 bytes μ-law)."""
+            """Envía audio del modelo a Twilio en 20 ms (160 bytes μ-law)."""
             try:
                 async for raw in ws_ai:
                     evt = json.loads(raw)
@@ -145,14 +167,17 @@ async def twilio_stream(ws_twilio: WebSocket):
                                     "streamSid": stream_sid,
                                     "media": {"payload": payload},
                                 }))
-                                await asyncio.sleep(0)
+                                # pacing opcional
+                                await asyncio.sleep(0.0 if PACE_REALTIME_MS == 0 else PACE_REALTIME_MS / 1000.0)
+
+                    # (opcional) manejar otros eventos del modelo
             except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
                 pass
             except Exception as e:
                 print("ai_to_twilio error:", e)
 
         async def twilio_to_ai():
-            """Recibe audio de Twilio y lo empuja al buffer del modelo."""
+            """Recibe audio μ-law de Twilio y lo envía al modelo."""
             nonlocal stream_sid, started
             try:
                 while True:
@@ -163,15 +188,11 @@ async def twilio_stream(ws_twilio: WebSocket):
                     if ev == "start":
                         stream_sid = msg["start"]["streamSid"]
                         started = True
-
-                        # 1) Pre-roll de silencio para estabilizar el canal
+                        # Silencio inicial para evitar chasquidos/módem
                         await _send_ulaw_silence(ws_twilio, stream_sid, PREROLL_MS)
 
-                        # 2) Saludo inmediato (sin esperar media)
-                        await ws_ai.send(json.dumps({
-                            "type": "response.create",
-                            "response": {"instructions": GREETING_TEXT}
-                        }))
+                        # Importante: no enviar saludo desde aquí; ya saludó Twilio con <Say>
+                        # El modelo responderá cuando detecte la primera intervención del llamante.
 
                     elif ev == "media":
                         if not started:
@@ -186,11 +207,13 @@ async def twilio_stream(ws_twilio: WebSocket):
                         with contextlib.suppress(Exception):
                             await ws_ai.send(json.dumps({"type": "input_audio_buffer.commit"}))
                         break
+
             except WebSocketDisconnect:
                 pass
             except Exception as e:
                 print("twilio_to_ai error:", e)
 
+        # Ejecutar ambas direcciones en paralelo
         task_ai = asyncio.create_task(ai_to_twilio())
         task_twilio = asyncio.create_task(twilio_to_ai())
         done, pending = await asyncio.wait({task_ai, task_twilio}, return_when=asyncio.FIRST_COMPLETED)
@@ -206,6 +229,7 @@ async def twilio_stream(ws_twilio: WebSocket):
     with contextlib.suppress(Exception):
         await ws_twilio.close()
 
+# Dev local
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("codigo_flask:app", host="0.0.0.0", port=8000)
