@@ -1,5 +1,5 @@
 
-# codigo_flask.py — v4.3: Say-first + anti-ruido + conexión a OpenAI tras 'start' + buffer media
+# codigo_flask.py — v4.4: pacing fijo 20 ms + preroll 500 ms + Say-first + conexión a OpenAI tras 'start'
 import os
 import json
 import base64
@@ -19,15 +19,15 @@ OPENAI_VOICE = os.getenv("OPENAI_VOICE", "sage")
 TWILIO_WS_PATH = os.getenv("TWILIO_WS_PATH", "/ws/twilio")
 PUBLIC_WS_URL = os.getenv("PUBLIC_WS_URL")  # e.g., wss://backend-spainroom.onrender.com/ws/twilio
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "Eres Nora de SpainRoom. Responde de forma clara y breve.")
-PREROLL_MS = int(os.getenv("PREROLL_MS", "240"))             # μ-law silencio inicial tras start
-PACE_REALTIME_MS = int(os.getenv("PACE_REALTIME_MS", "0"))   # 20 = ritmo real por chunk; 0 = sin dormir
+PREROLL_MS = int(os.getenv("PREROLL_MS", "500"))             # μ-law silencio inicial tras start
+SLEEP_PER_CHUNK = 0.02  # pacing fijo: 20 ms por chunk de 160B μ-law
 SAYFIRST_TEXT = os.getenv("SAYFIRST_TEXT", "Hola, soy Nora de SpainRoom.")
-FOLLOWUP_GREETING_MS = int(os.getenv("FOLLOWUP_GREETING_MS", "500"))
+FOLLOWUP_GREETING_MS = int(os.getenv("FOLLOWUP_GREETING_MS", "700"))
 FOLLOWUP_GREETING_TEXT = os.getenv("FOLLOWUP_GREETING_TEXT", "¿En qué puedo ayudarte?")
 DEBUG = os.getenv("DEBUG", "1") == "1"
 
 # ========= App =========
-app = FastAPI(title="SpainRoom Voice Realtime Bridge v4.3")
+app = FastAPI(title="SpainRoom Voice Realtime Bridge v4.4")
 
 # ========= Util =========
 def _log(*args):
@@ -62,7 +62,7 @@ async def _send_ulaw_silence(ws_twilio: WebSocket, stream_sid: str, ms: int):
             "streamSid": stream_sid,
             "media": {"payload": payload},
         }))
-        await asyncio.sleep(0.0 if PACE_REALTIME_MS == 0 else PACE_REALTIME_MS / 1000.0)
+        await asyncio.sleep(SLEEP_PER_CHUNK)
 
 # ========= Health =========
 @app.get("/health")
@@ -126,9 +126,8 @@ def voice_test_female():
 # ========= WebSocket: Twilio ⇄ OpenAI Realtime (μ-law 8k passthrough) =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
-    # Acepta subprotocolo "audio" que envía Twilio
     await ws_twilio.accept(subprotocol="audio")
-    _log("WS accepted (audio)")
+    print("[RT] WS accepted (audio)", flush=True)
 
     if not OPENAI_API_KEY:
         await ws_twilio.send_text(json.dumps({"event": "error", "message": "Falta OPENAI_API_KEY"}))
@@ -151,9 +150,9 @@ async def twilio_stream(ws_twilio: WebSocket):
                 "OpenAI-Beta": "realtime=v1",
             }
             ai_url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
-            _log("Connecting to OpenAI Realtime…")
+            print("[RT] Connecting to OpenAI Realtime…", flush=True)
             ws_ai = await websockets.connect(ai_url, extra_headers=headers)
-            _log("OpenAI Realtime connected")
+            print("[RT] OpenAI Realtime connected", flush=True)
 
             # μ-law 8k E2E + VAD servidor
             await ws_ai.send(json.dumps({
@@ -167,7 +166,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                 },
             }))
             ai_ready.set()
-            _log("Session configured; flushing buffered media:", len(buffered_media))
+            print("[RT] Session configured; flushing buffered media:", len(buffered_media), flush=True)
 
             # Volcar audio que llegó antes
             while buffered_media:
@@ -177,7 +176,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                     "audio": payload,
                 }))
 
-            # Saludo de seguimiento (tras pequeña pausa) para invitar a hablar
+            # Pequeño saludo de seguimiento para que el usuario sepa que ya puede hablar
             await asyncio.sleep(FOLLOWUP_GREETING_MS / 1000.0)
             try:
                 await ws_ai.send(json.dumps({
@@ -185,7 +184,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                     "response": {"instructions": FOLLOWUP_GREETING_TEXT}
                 }))
             except Exception as e:
-                _log("Optional greet failed:", e)
+                print("[RT] Optional greet failed:", e, flush=True)
 
             # Bucle de lectura desde AI → Twilio
             try:
@@ -196,7 +195,8 @@ async def twilio_stream(ws_twilio: WebSocket):
                         ulaw_b64 = evt.get("audio") or evt.get("delta")
                         if ulaw_b64 and stream_sid and started:
                             data = base64.b64decode(ulaw_b64)
-                            for i in range(0, len(data), 160):  # 20 ms
+                            # Pacing estricto: 160B → dormir 20 ms por chunk
+                            for i in range(0, len(data), 160):
                                 chunk = data[i:i+160]
                                 if not chunk:
                                     continue
@@ -206,11 +206,11 @@ async def twilio_stream(ws_twilio: WebSocket):
                                     "streamSid": stream_sid,
                                     "media": {"payload": payload},
                                 }))
-                                await asyncio.sleep(0.0 if PACE_REALTIME_MS == 0 else PACE_REALTIME_MS / 1000.0)
+                                await asyncio.sleep(SLEEP_PER_CHUNK)
             except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
-                _log("AI socket closed")
+                print("[RT] AI socket closed", flush=True)
             except Exception as e:
-                _log("ai_to_twilio error:", e)
+                print("[RT] ai_to_twilio error:", e, flush=True)
         finally:
             with contextlib.suppress(Exception):
                 if ws_ai is not None:
@@ -227,7 +227,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                 if ev == "start":
                     stream_sid = msg["start"]["streamSid"]
                     started = True
-                    _log("Twilio 'start' received; streamSid:", stream_sid)
+                    print("[RT] Twilio 'start' received; streamSid:", stream_sid, flush=True)
                     start_evt.set()
 
                     # Silencio inicial para evitar chasquidos/módem
@@ -246,16 +246,16 @@ async def twilio_stream(ws_twilio: WebSocket):
                         buffered_media.append(payload)
 
                 elif ev == "stop":
-                    _log("Twilio 'stop' received; closing")
+                    print("[RT] Twilio 'stop' received; closing", flush=True)
                     with contextlib.suppress(Exception):
                         if ws_ai is not None:
                             await ws_ai.send(json.dumps({"type": "input_audio_buffer.commit"}))
                     break
 
         except WebSocketDisconnect:
-            _log("Twilio WS disconnect")
+            print("[RT] Twilio WS disconnect", flush=True)
         except Exception as e:
-            _log("twilio_to_ai error:", e)
+            print("[RT] twilio_to_ai error:", e, flush=True)
 
     # Lanzar tareas en paralelo
     task_connect = asyncio.create_task(connect_ai_after_start())
