@@ -18,7 +18,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response, JSONResponse, HTMLResponse
 import websockets
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
-import audioop
+import audioop          # Python ≤ 3.12
+except ModuleNotFoundError:
+    import audioop_lts as audioop   # Python 3.13+
 
 # ========= Config =========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
