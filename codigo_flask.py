@@ -1,5 +1,9 @@
-# codigo_flask.py  —  PASSTHROUGH G.711 μ-law 8k (sin resample, sin pausas)
-import os, json, asyncio, contextlib
+# codigo_flask.py — Passthrough G.711 μ-law 8k (sin resample, sin pausas)
+import os
+import json
+import base64
+import asyncio
+import contextlib
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -16,7 +20,7 @@ OPENAI_VOICE = os.getenv("OPENAI_VOICE", "marin")  # femenina por defecto
 
 TWILIO_WS_PATH = "/stream/twilio"
 
-app = FastAPI(title="SpainRoom Voice Gateway (μ-law passthrough, no-slow)")
+app = FastAPI(title="SpainRoom Voice Gateway (μ-law passthrough, sin voz lenta)")
 
 # ========= Health / Diag =========
 @app.get("/voice/health")
@@ -37,6 +41,16 @@ def voice_answer():
   <Connect>
     <Stream url="wss://backend-spainroom.onrender.com{TWILIO_WS_PATH}" />
   </Connect>
+</Response>"""
+    return Response(twiml, media_type="application/xml; charset=utf-8")
+
+# (Opcional) prueba Twilio TTS sin streaming
+@app.get("/voice/test_female")
+@app.post("/voice/test_female")
+def voice_test_female():
+    twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice" language="es-ES">Prueba del circuito. SpainRoom operativo.</Say>
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
 
@@ -62,13 +76,13 @@ async def twilio_stream(ws_twilio: WebSocket):
                 "type": "session.update",
                 "session": {
                     "voice": OPENAI_VOICE,
-                    "modalities": ["audio", "text"],                       # requerido
+                    "modalities": ["audio", "text"],  # requerido por Realtime
                     "turn_detection": {"type": "server_vad", "create_response": True},
                     "input_audio_format":  {"type": "g711_ulaw", "sample_rate_hz": 8000},
                     "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
                     "instructions": (
                         "Te llamas Nora y trabajas en SpainRoom (alquiler de HABITACIONES). "
-                        "Voz FEMENINA, cercana y ÁGIL (ritmo natural, frases cortas). "
+                        "Voz FEMENINA, cercana y ágil (ritmo natural, frases cortas). "
                         "Si preguntan por temas ajenos (muebles/limpieza/IKEA), explica que ayudas con HABITACIONES "
                         "y redirige: «¿Eres propietario o inquilino?» "
                         "Responde en el idioma del usuario (ES/EN) y permite interrupciones (barge-in)."
@@ -86,14 +100,27 @@ async def twilio_stream(ws_twilio: WebSocket):
                         if t in ("response.audio.delta", "response.output_audio.delta"):
                             ulaw_b64 = evt.get("audio") or evt.get("delta")
                             if ulaw_b64 and stream_sid and started:
-                                await ws_twilio.send_text(json.dumps({
-                                    "event": "media",
-                                    "streamSid": stream_sid,
-                                    "media": {"payload": ulaw_b64}
-                                }))
+                                # Opción A: enviar tal cual (normalmente suficiente)
+                                # await ws_twilio.send_text(json.dumps({
+                                #     "event": "media", "streamSid": stream_sid,
+                                #     "media": {"payload": ulaw_b64}
+                                # }))
+
+                                # Opción B: trocear en frames de 20 ms (160 bytes) para ritmo perfecto
+                                ulaw_bytes = base64.b64decode(ulaw_b64)
+                                CHUNK = 160  # 20 ms @ 8 kHz μ-law
+                                for i in range(0, len(ulaw_bytes), CHUNK):
+                                    payload = base64.b64encode(ulaw_bytes[i:i+CHUNK]).decode()
+                                    await ws_twilio.send_text(json.dumps({
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {"payload": payload}
+                                    }))
+                                    await asyncio.sleep(0)  # sin pausa => sin voz lenta
+
                         elif t == "error":
                             print("OPENAI REALTIME ERROR:", evt)
-                        # else:  # traza ligera opcional
+                        # else:  # traza opcional
                         #     print("RT EVT:", t)
 
                 except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
@@ -116,37 +143,5 @@ async def twilio_stream(ws_twilio: WebSocket):
                         # Saludo inicial
                         await ws_ai.send(json.dumps({
                             "type": "response.create",
-                            "response": { "instructions": "Hola, soy Nora de SpainRoom. ¿En qué puedo ayudarte?" }
-                        }))
-
-                    elif ev == "media":
-                        # μ-law 8k en base64 → buffer del modelo (SIN tocar)
-                        await ws_ai.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": msg["media"]["payload"]
-                        }))
-
-                    elif ev == "stop":
-                        break
-
-            except WebSocketDisconnect:
-                pass
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, ConnectionClosedOK, ConnectionClosedError):
-                    await task
-
-    except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
-        pass
-    except Exception as e:
-        print("Bridge error:", e)
-        with contextlib.suppress(Exception):
-            await ws_twilio.send_text(json.dumps({"event": "error", "message": str(e)}))
-    finally:
-        with contextlib.suppress(Exception):
-            await ws_twilio.close()
-
-# Dev local opcional
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("codigo_flask:app", host="0.0.0.0", port=8000)
+                            "response": { "in
+::contentReference[oaicite:0]{index=0}
