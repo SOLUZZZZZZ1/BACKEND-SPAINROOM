@@ -67,7 +67,10 @@ async def twilio_stream(ws_twilio: WebSocket):
 
     stream_sid: Optional[str] = None
     started = False
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "OpenAI-Beta": "realtime=v1",
+    }
 
     try:
         async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as ws_ai:
@@ -75,4 +78,27 @@ async def twilio_stream(ws_twilio: WebSocket):
             await ws_ai.send(json.dumps({
                 "type": "session.update",
                 "session": {
-                    "voice": OPENAI
+                    "voice": OPENAI_VOICE,
+                    "modalities": ["audio", "text"],  # requerido por Realtime
+                    "turn_detection": {"type": "server_vad", "create_response": True},
+                    "input_audio_format":  {"type": "g711_ulaw", "sample_rate_hz": 8000},
+                    "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
+                    "instructions": (
+                        "Te llamas Nora y trabajas en SpainRoom (alquiler de HABITACIONES). "
+                        "Voz FEMENINA, cercana y ágil (ritmo natural, frases cortas). "
+                        "Si preguntan por temas ajenos (muebles/limpieza/IKEA), explica que ayudas con HABITACIONES "
+                        "y redirige: «¿Eres propietario o inquilino?» "
+                        "Responde en el idioma del usuario (ES/EN) y permite interrupciones (barge-in)."
+                    )
+                }
+            }))
+
+            # ---- Modelo -> Twilio (reenviar μ-law base64 tal cual; sin pausas) ----
+            async def ai_to_twilio():
+                try:
+                    async for raw in ws_ai:
+                        evt = json.loads(raw)
+                        t = evt.get("type")
+
+                        if t in ("response.audio.delta", "response.output_audio.delta
+::contentReference[oaicite:0]{index=0}
