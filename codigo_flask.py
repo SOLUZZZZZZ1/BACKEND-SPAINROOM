@@ -34,6 +34,7 @@ BARGE_VAD_DB = float(os.getenv("BARGE_VAD_DB", "-30"))
 BARGE_RELEASE_MS = int(os.getenv("BARGE_RELEASE_MS", "500"))
 BARGE_SEND_SILENCE = os.getenv("BARGE_SEND_SILENCE", "1") == "1"
 MAX_UTTER_MS = int(os.getenv("MAX_UTTER_MS", "5500"))
+CAPTURE_TAG = os.getenv("CAPTURE_TAG", "LEAD")
 
 app = FastAPI(title="SpainRoom Voice Realtime", docs_url="/docs")
 
@@ -213,6 +214,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                     "input_audio_format": {"type": "pcm16", "sample_rate_hz": 24000, "channels": 1},
                     "output_audio_format": {"type": "pcm16", "sample_rate_hz": 24000, "channels": 1},
                     "turn_detection": {"type": "server_vad"},
+                    "modalities": ["audio","text"],
                 },
             }))
             ai_spoken_ms = 0
@@ -233,11 +235,27 @@ async def twilio_stream(ws_twilio: WebSocket):
                 await ws_ai.send(json.dumps({"type":"response.create","response":{"instructions":FOLLOWUP_GREETING_TEXT}}))
 
             try:
+                txt_buf = ""
                 async for raw in ws_ai:
                     evt = json.loads(raw); t = evt.get("type")
                     if t in ("response.created","response.started"):
                         ai_spoken_ms = 0; barge_active = False
-                    if t in ("response.audio.delta","response.output_audio.delta"):
+                    if t in ("response.output_text.delta",):
+                        # Acumular texto para capturar LEAD JSON
+                        txt = evt.get("delta") or evt.get("text") or ""
+                        if txt:
+                            txt_buf += txt
+                            start_tag = f"<<{CAPTURE_TAG}>>"
+                            end_tag = "<<END>>"
+                            if start_tag in txt_buf and end_tag in txt_buf:
+                                s = txt_buf.split(start_tag,1)[1]
+                                payload = s.split(end_tag,1)[0]
+                                with contextlib.suppress(Exception):
+                                    data = json.loads(payload)
+                                    print("[LEAD]", data)
+                                # limpiar para evitar repeticiones
+                                txt_buf = ""
+                    elif t in ("response.audio.delta","response.output_audio.delta"):
                         if barge_active: continue
                         b64 = evt.get("audio") or evt.get("delta")
                         if b64 and started and stream_sid:
