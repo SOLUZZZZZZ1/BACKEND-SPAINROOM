@@ -60,8 +60,114 @@ def voice_answer():
 # ========= WebSocket: Twilio ⇄ OpenAI Realtime =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
-    # Twilio usa subprotocolo "audio"
     await ws_twilio.accept(subprotocol="audio")
+
+    if not OPENAI_API_KEY:
+        await ws_twilio.send_text(json.dumps({"event": "error", "message": "Falta OPENAI_API_KEY"}))
+        await ws_twilio.close()
+        return
+
+    stream_sid: Optional[str] = None
+    started = False
+
+    # Resamplers con estado si los usas (deja como en tu archivo)
+    down = PcmResampler(16000, 8000)
+    up   = PcmResampler(8000, 16000)
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
+
+    try:
+        async with websockets.connect(OPENAI_REALTIME_URL, extra_headers=headers) as ws_ai:
+            # Config sesión (igual que ya tenías: voz, modalities, formats, instructions…)
+            await ws_ai.send(json.dumps({
+                "type":"session.update",
+                "session":{
+                    "voice": os.getenv("OPENAI_VOICE","marin"),
+                    "modalities": ["audio","text"],
+                    "turn_detection": {"type":"server_vad","create_response": True},
+                    "input_audio_format": {"type":"pcm16","sample_rate_hz":16000},
+                    "output_audio_format":{"type":"pcm16","sample_rate_hz":16000},
+                    "instructions": "Eres Nora de SpainRoom… (tus mismas instrucciones)"
+                }
+            }))
+
+            async def ai_to_twilio():
+                try:
+                    async for raw in ws_ai:
+                        evt = json.loads(raw)
+                        t = evt.get("type")
+
+                        if t in ("response.output_audio.delta","response.audio.delta"):
+                            b64_pcm = evt.get("delta") or evt.get("audio")
+                            if not b64_pcm:
+                                continue
+                            # ↓ si usas passthrough μ-law, reenvía b64 tal cual;
+                            # aquí dejo la ruta PCM16→8k→μ-law con estado:
+                            pcm16_16k = base64.b64decode(b64_pcm)
+                            pcm16_8k  = down.process(pcm16_16k)
+                            ulaw_8k   = audioop.lin2ulaw(pcm16_8k, 2)
+                            if stream_sid and started and ulaw_8k:
+                                CHUNK = 160
+                                for i in range(0, len(ulaw_8k), CHUNK):
+                                    payload = base64.b64encode(ulaw_8k[i:i+CHUNK]).decode()
+                                    await ws_twilio.send_text(json.dumps({
+                                        "event":"media","streamSid":stream_sid,"media":{"payload":payload}
+                                    }))
+                                    await asyncio.sleep(0)  # ← sin freno = sin voz lenta
+
+                        elif t == "error":
+                            print("OPENAI REALTIME ERROR:", evt)
+
+                except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
+                    # cierre normal del WS: salir sin escandalizar logs
+                    return
+
+            task = asyncio.create_task(ai_to_twilio())
+
+            try:
+                while True:
+                    msg = json.loads(await ws_twilio.receive_text())
+                    ev  = msg.get("event")
+
+                    if ev == "start":
+                        stream_sid = msg["start"]["streamSid"]
+                        started = True
+                        await ws_ai.send(json.dumps({
+                            "type":"response.create",
+                            "response":{"instructions":"Hola, soy Nora de SpainRoom. ¿En qué puedo ayudarte?"}
+                        }))
+
+                    elif ev == "media":
+                        ulaw_b64 = msg["media"]["payload"]
+                        ulaw_8k  = base64.b64decode(ulaw_b64)
+                        pcm16_8k = audioop.ulaw2lin(ulaw_8k, 2)
+                        pcm16_16k= up.process(pcm16_8k)
+                        await ws_ai.send(json.dumps({
+                            "type":"input_audio_buffer.append",
+                            "audio": base64.b64encode(pcm16_16k).decode()
+                        }))
+
+                    elif ev == "stop":
+                        break
+
+            except WebSocketDisconnect:
+                pass
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, ConnectionClosedOK, ConnectionClosedError):
+                    await task
+
+    except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
+        # cierre normal; no noisy logs
+        pass
+    except Exception as e:
+        print("Bridge error:", e)
+        with contextlib.suppress(Exception):
+            await ws_twilio.send_text(json.dumps({"event":"error","message":str(e)}))
+    finally:
+        with contextlib.suppress(Exception):
+            await ws_twilio.close()
+
 
     if not OPENAI_API_KEY:
         await ws_twilio.send_text(json.dumps({"event": "error", "message": "Falta OPENAI_API_KEY"}))
