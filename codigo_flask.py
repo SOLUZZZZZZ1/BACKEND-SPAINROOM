@@ -1,9 +1,8 @@
 
-# codigo_flask.py — v5.3 ROBUSTA (clocked sender + burst anti-backlog)
-# Evita que la voz se "ralentice" cuando el usuario habla:
-# - Emisor con reloj a 20 ms
-# - Si hay backlog en la cola de salida, envía ráfagas controladas para ponerse al día
-# - Transcodificación μ-law 8k <-> PCM16 16k
+# codigo_flask.py — v6 ULaw E2E + clocked sender (solución “voz lenta”)
+# - Todo el camino en G.711 μ-law 8 kHz (sin transcodificar)
+# - Emisor con reloj preciso (20 ms) y cola de salida
+# - Say-first + preroll para eliminar chasquidos
 import os
 import json
 import base64
@@ -17,31 +16,27 @@ from fastapi.responses import Response
 import websockets
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 
-import audioop  # μ-law/PCM y resampling
-
 # ========= Config =========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 OPENAI_VOICE = os.getenv("OPENAI_VOICE", "sage")
 TWILIO_WS_PATH = os.getenv("TWILIO_WS_PATH", "/ws/twilio")
-PUBLIC_WS_URL = os.getenv("PUBLIC_WS_URL")  # e.g., wss://backend-spainroom.onrender.com/ws/twilio
+PUBLIC_WS_URL = os.getenv("PUBLIC_WS_URL")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "Eres Nora de SpainRoom. Responde de forma clara y breve.")
 
 # Audio pacing
 CHUNK_MS = int(os.getenv("CHUNK_MS", "20"))                   # 20 ms por frame
 ULAW_CHUNK_BYTES = int(os.getenv("ULAW_CHUNK_BYTES", "160"))  # 20 ms @ 8 kHz μ-law
 PACE_MS = int(os.getenv("PACE_MS", str(CHUNK_MS)))            # por defecto, tiempo real
-HWM_FRAMES = int(os.getenv("HWM_FRAMES", "50"))               # umbral de backlog (~1 s si 20 ms/frame)
-BURST_MAX = int(os.getenv("BURST_MAX", "8"))                  # nº máximo de frames extra en ráfaga
+PREROLL_MS = int(os.getenv("PREROLL_MS", "320"))              # μ-law silencio inicial tras start
 
-PREROLL_MS = int(os.getenv("PREROLL_MS", "400"))              # μ-law silencio inicial tras start
 SAYFIRST_TEXT = os.getenv("SAYFIRST_TEXT", "Hola, soy Nora de SpainRoom.")
 FOLLOWUP_GREETING_MS = int(os.getenv("FOLLOWUP_GREETING_MS", "600"))
 FOLLOWUP_GREETING_TEXT = os.getenv("FOLLOWUP_GREETING_TEXT", "¿En qué puedo ayudarte?")
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 # ========= App =========
-app = FastAPI(title="SpainRoom Voice Realtime Bridge v5.3")
+app = FastAPI(title="SpainRoom Voice Realtime Bridge v6 ULaw E2E")
 
 # ========= Util =========
 def _log(*args):
@@ -63,22 +58,6 @@ def _infer_ws_url(request: Request) -> str:
     scheme = "wss" if proto == "https" else "ws"
     return f"{scheme}://{host}{TWILIO_WS_PATH}"
 
-class RateCV:
-    """Wrapper para audioop.ratecv con estado persistente."""
-    def __init__(self, src_rate: int, dst_rate: int, sampwidth: int = 2, channels: int = 1):
-        self.src_rate = src_rate
-        self.dst_rate = dst_rate
-        self.sampwidth = sampwidth
-        self.channels = channels
-        self.state = None
-
-    def convert(self, pcm: bytes) -> bytes:
-        if not pcm:
-            return b""
-        out, self.state = audioop.ratecv(pcm, self.sampwidth, self.channels,
-                                         self.src_rate, self.dst_rate, self.state)
-        return out
-
 # ========= Health =========
 @app.get("/health")
 def health():
@@ -92,7 +71,6 @@ def diag_key():
 @app.get("/voice/answer")
 @app.post("/voice/answer")
 def voice_answer(request: Request):
-    """Modo directo: conecta el stream sin <Say> previo."""
     ws_url = _infer_ws_url(request)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -105,7 +83,6 @@ def voice_answer(request: Request):
 @app.get("/voice/answer_sayfirst")
 @app.post("/voice/answer_sayfirst")
 def voice_answer_sayfirst(request: Request):
-    """Modo 'Say-first': Twilio dice un saludo y luego abre el stream (reduce chasquidos/ruido)."""
     ws_url = _infer_ws_url(request)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -117,7 +94,6 @@ def voice_answer_sayfirst(request: Request):
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
 
-# Twilio fallback: siempre contesta con audio claro
 @app.get("/voice/fallback")
 @app.post("/voice/fallback")
 def voice_fallback():
@@ -128,7 +104,6 @@ def voice_fallback():
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
 
-# Prueba Twilio TTS sin streaming
 @app.get("/voice/test_female")
 @app.post("/voice/test_female")
 def voice_test_female():
@@ -138,7 +113,7 @@ def voice_test_female():
 </Response>"""
     return Response(twiml, media_type="application/xml; charset=utf-8")
 
-# ========= WebSocket: Twilio ⇄ OpenAI (Transcoding μ-law 8k <-> PCM16 16k) =========
+# ========= WebSocket ULaw E2E =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
     await ws_twilio.accept(subprotocol="audio")
@@ -154,17 +129,12 @@ async def twilio_stream(ws_twilio: WebSocket):
     ai_ready = asyncio.Event()
     start_evt = asyncio.Event()
     ws_ai: Optional[websockets.WebSocketClientProtocol] = None
-    buffered_ulaw: List[bytes] = []  # μ-law recibido antes de que AI esté listo
 
-    # Resamplers
-    up_8k_to_16k = RateCV(8000, 16000, 2, 1)
-    down_16k_to_8k = RateCV(16000, 8000, 2, 1)
-
-    # Cola de salida y emisor con reloj + ráfagas anti-backlog
+    # Cola de salida y emisor con reloj
     ulaw_out_queue: asyncio.Queue = asyncio.Queue(maxsize=4000)
 
     async def twilio_sender():
-        """Emisor: 1 frame cada PACE_MS; si hay backlog alto, envía ráfagas para ponerse al día."""
+        """Emisor con reloj: 1 frame cada PACE_MS; drenaje estable y sin ralentizar tono."""
         next_t = time.monotonic()
         sleep_s = max(0.0, PACE_MS / 1000.0)
         while True:
@@ -175,25 +145,6 @@ async def twilio_stream(ws_twilio: WebSocket):
                 "media": {"payload": payload_b64},
             }))
             ulaw_out_queue.task_done()
-
-            # Burst si estamos por encima del umbral
-            qsz = ulaw_out_queue.qsize()
-            if qsz > HWM_FRAMES:
-                # Envia hasta BURST_MAX frames adicionales sin dormir
-                to_send = min(qsz - HWM_FRAMES, BURST_MAX)
-                for _ in range(to_send):
-                    payload_b64 = await ulaw_out_queue.get()
-                    await ws_twilio.send_text(json.dumps({
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": payload_b64},
-                    }))
-                    ulaw_out_queue.task_done()
-                # re-sincroniza el reloj
-                next_t = time.monotonic()
-                continue
-
-            # Pacing normal
             if sleep_s > 0.0:
                 next_t += sleep_s
                 delay = next_t - time.monotonic()
@@ -201,14 +152,14 @@ async def twilio_stream(ws_twilio: WebSocket):
                     await asyncio.sleep(delay)
                 else:
                     next_t = time.monotonic()
+            else:
+                await asyncio.sleep(0)
 
     async def enqueue_ulaw_frames(ulaw_bytes: bytes):
-        """Trocea μ-law en frames de ULAW_CHUNK_BYTES y encola para el emisor."""
         for i in range(0, len(ulaw_bytes), ULAW_CHUNK_BYTES):
             chunk = ulaw_bytes[i:i+ULAW_CHUNK_BYTES]
-            if not chunk:
-                continue
-            await ulaw_out_queue.put(base64.b64encode(chunk).decode("ascii"))
+            if chunk:
+                await ulaw_out_queue.put(base64.b64encode(chunk).decode("ascii"))
 
     async def enqueue_silence(ms: int):
         frames = max(1, ms // CHUNK_MS)
@@ -230,30 +181,19 @@ async def twilio_stream(ws_twilio: WebSocket):
             ws_ai = await websockets.connect(ai_url, extra_headers=headers)
             _log("OpenAI Realtime connected")
 
-            # Sesión: PCM16 16k E2E con el modelo
+            # Sesión 100% μ-law 8 kHz
             await ws_ai.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "voice": OPENAI_VOICE,
                     "instructions": SYSTEM_PROMPT,
-                    "input_audio_format": {"type": "pcm16", "sample_rate_hz": 16000, "channels": 1},
-                    "output_audio_format": {"type": "pcm16", "sample_rate_hz": 16000, "channels": 1},
+                    "input_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000, "channels": 1},
+                    "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000, "channels": 1},
                     "turn_detection": {"type": "server_vad"},
                 },
             }))
             ai_ready.set()
-            _log("Session configured; flushing buffered μ-law frames:", len(buffered_ulaw))
-
-            # Volcar μ-law buffered → PCM16 16k → append
-            while buffered_ulaw:
-                ulaw = buffered_ulaw.pop(0)
-                lin8 = audioop.ulaw2lin(ulaw, 2)
-                pcm16_16k = up_8k_to_16k.convert(lin8)
-                if pcm16_16k:
-                    await ws_ai.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": base64.b64encode(pcm16_16k).decode("ascii"),
-                    }))
+            _log("Session configured ULaw E2E")
 
             # Saludo de seguimiento (después de breve pausa)
             await asyncio.sleep(FOLLOWUP_GREETING_MS / 1000.0)
@@ -265,7 +205,7 @@ async def twilio_stream(ws_twilio: WebSocket):
             except Exception as e:
                 _log("Optional greet failed:", e)
 
-            # Bucle AI → Twilio con transcoding a μ-law 8k y encolado
+            # Bucle AI → Twilio (ULaw directo)
             try:
                 async for raw in ws_ai:
                     evt = json.loads(raw)
@@ -273,12 +213,8 @@ async def twilio_stream(ws_twilio: WebSocket):
                     if t in ("response.audio.delta", "response.output_audio.delta"):
                         b64 = evt.get("audio") or evt.get("delta")
                         if b64 and stream_sid and started:
-                            pcm16 = base64.b64decode(b64)
-                            lin8k = down_16k_to_8k.convert(pcm16)
-                            if not lin8k:
-                                continue
-                            ulaw8k = audioop.lin2ulaw(lin8k, 2)
-                            await enqueue_ulaw_frames(ulaw8k)
+                            ulaw_bytes = base64.b64decode(b64)
+                            await enqueue_ulaw_frames(ulaw_bytes)
             except (ConnectionClosedOK, ConnectionClosedError, asyncio.CancelledError):
                 _log("AI socket closed")
             except Exception as e:
@@ -301,25 +237,17 @@ async def twilio_stream(ws_twilio: WebSocket):
                     started = True
                     _log("Twilio 'start' received; streamSid:", stream_sid)
                     start_evt.set()
-
-                    # Silencio inicial para evitar chasquidos/módem (encolado con reloj)
                     await enqueue_silence(PREROLL_MS)
 
                 elif ev == "media":
                     if not started:
                         continue
                     b64 = msg["media"]["payload"]
-                    ulaw = base64.b64decode(b64)
                     if ai_ready.is_set() and ws_ai is not None:
-                        lin8 = audioop.ulaw2lin(ulaw, 2)
-                        pcm16_16k = up_8k_to_16k.convert(lin8)
-                        if pcm16_16k:
-                            await ws_ai.send(json.dumps({
-                                "type": "input_audio_buffer.append",
-                                "audio": base64.b64encode(pcm16_16k).decode("ascii"),
-                            }))
-                    else:
-                        buffered_ulaw.append(ulaw)
+                        await ws_ai.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": b64,  # μ-law directo
+                        }))
 
                 elif ev == "stop":
                     _log("Twilio 'stop' received; closing")
