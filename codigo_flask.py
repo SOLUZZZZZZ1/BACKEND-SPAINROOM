@@ -1,6 +1,6 @@
 
 # codigo_flask.py — v5.3 ROBUSTA (clocked sender + burst anti-backlog)
-# Transcodifica Twilio (G.711 μ-law 8 kHz) <-> OpenAI (PCM16 16 kHz)
+# Transcodifica Twilio (G.711 μ-law 8 kHz) <-> OpenAI (PCM16 24 kHz)
 # y evita “voz lenta/grave” cuando el usuario habla (cola+reloj con ráfagas).
 import os, json, base64, asyncio, contextlib, time
 from typing import Optional, List
@@ -88,7 +88,7 @@ def voice_answer(request: Request):
     <Stream url="{ws_url}"/>
   </Connect>
 </Response>"""
-    return Response(twiml, media_type="application/xml; charset=utf-8")
+    return Response(twiml, media_type="text/xml; charset=utf-8")
 
 @app.get("/voice/answer_sayfirst")
 @app.post("/voice/answer_sayfirst")
@@ -102,7 +102,7 @@ def voice_answer_sayfirst(request: Request):
     <Stream url="{ws_url}"/>
   </Connect>
 </Response>"""
-    return Response(twiml, media_type="application/xml; charset=utf-8")
+    return Response(twiml, media_type="text/xml; charset=utf-8")
 
 @app.get("/voice/fallback")
 @app.post("/voice/fallback")
@@ -112,7 +112,7 @@ def voice_fallback():
   <Say voice="alice" language="es-ES">En este momento no puedo atenderle. Por favor, inténtelo de nuevo en unos minutos.</Say>
   <Hangup/>
 </Response>"""
-    return Response(twiml, media_type="application/xml; charset=utf-8")
+    return Response(twiml, media_type="text/xml; charset=utf-8")
 
 @app.get("/voice/test_female")
 @app.post("/voice/test_female")
@@ -121,9 +121,9 @@ def voice_test_female():
 <Response>
   <Say voice="alice" language="es-ES">Prueba del circuito. SpainRoom operativo.</Say>
 </Response>"""
-    return Response(twiml, media_type="application/xml; charset=utf-8")
+    return Response(twiml, media_type="text/xml; charset=utf-8")
 
-# ========= WebSocket: Twilio ⇄ OpenAI (μ-law 8k <-> PCM16 16k) =========
+# ========= WebSocket: Twilio ⇄ OpenAI (μ-law 8k <-> PCM16 24k) =========
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
     await ws_twilio.accept(subprotocol="audio")
@@ -142,8 +142,8 @@ async def twilio_stream(ws_twilio: WebSocket):
     buffered_ulaw: List[bytes] = []
 
     # Resamplers
-    up_8k_to_16k = RateCV(8000, 16000, 2, 1)
-    down_16k_to_8k = RateCV(16000, 8000, 2, 1)
+    up_8k_to_16k = RateCV(8000, 24000, 2, 1)
+    down_16k_to_8k = RateCV(24000, 8000, 2, 1)
 
     # Cola de salida y emisor con reloj + ráfagas anti-backlog
     ulaw_out_queue: asyncio.Queue = asyncio.Queue(maxsize=4000)
@@ -208,14 +208,14 @@ async def twilio_stream(ws_twilio: WebSocket):
             ws_ai = await websockets.connect(ai_url, extra_headers=headers)
             _log("OpenAI Realtime connected")
 
-            # Sesión: PCM16 16k E2E con el modelo
+            # Sesión: PCM16 24k E2E con el modelo
             await ws_ai.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "voice": OPENAI_VOICE,
                     "instructions": SYSTEM_PROMPT,
-                    "input_audio_format": {"type": "pcm16", "sample_rate_hz": 16000, "channels": 1},
-                    "output_audio_format": {"type": "pcm16", "sample_rate_hz": 16000, "channels": 1},
+                    "input_audio_format": {"type": "pcm16", "sample_rate_hz": 24000, "channels": 1},
+                    "output_audio_format": {"type": "pcm16", "sample_rate_hz": 24000, "channels": 1},
                     "turn_detection": {"type": "server_vad"},
                 },
             }))
