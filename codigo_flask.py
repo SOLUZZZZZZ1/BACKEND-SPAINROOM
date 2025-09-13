@@ -1,19 +1,30 @@
 
-# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (fix)
+# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (fix + diag env)
 # FastAPI app para Twilio Voice usando <ConversationRelay> (STT+TTS por Twilio)
 # - Español solo. Espera 'setup' antes de hablar.
-# - Sin pausas artificiales (SPEAK_SLEEP_MS opcional, por defecto 0).
 # - FSM 5 campos (rol, población, zona, nombre, teléfono) + respuestas de información.
-# - Tras el lead, ofrece ayuda; cuelga solo si el usuario dice 'no/nada'.
-# Endpoints: /voice/answer_cr · /voice/fallback · WS /cr · /assign · /stripe/webhook · /health · /diag_runtime
-# Ejecutar: uvicorn codigo_flask_es_stable_fix:app --host 0.0.0.0 --port $PORT --proxy-headers
+# - Endpoints: /voice/answer_cr · /voice/fallback · WS /cr · /assign · /stripe/webhook
+# - Salud/diag: /health · /diag_runtime · /diag_env_count · /diag_env_full (valores enmascarados)
+# Ejecutar: uvicorn codigo_flask_es_stable_fix_diag:app --host 0.0.0.0 --port $PORT --proxy-headers
 
 import os, json, re, time, contextlib, hashlib
 from typing import Dict, Any
 from fastapi import FastAPI, Request, WebSocket, Header
 from fastapi.responses import Response, JSONResponse, HTMLResponse
 
-app = FastAPI(title="SpainRoom Voice — ConversationRelay ES Stable (fix)")
+MASK_KEEP = int(os.getenv("DIAG_ENV_MASK_KEEP", "4"))
+MASK_ENABLE = os.getenv("DIAG_ENV_MASK", "1") == "1"
+
+def _mask(v: str) -> str:
+    if not MASK_ENABLE or v is None:
+        return v
+    s = str(v)
+    # no enmascarar valores muy cortos
+    if len(s) <= MASK_KEEP:
+        return "*" * len(s)
+    return s[:MASK_KEEP] + "…" + "*" * (len(s) - MASK_KEEP)
+
+app = FastAPI(title="SpainRoom Voice — ConversationRelay ES Stable (fix + diag)")
 
 def _twiml(xml: str) -> Response:
     return Response(content=xml, media_type="application/xml")
@@ -46,7 +57,7 @@ async def root(request: Request):
         "<h2>SpainRoom Voice — ConversationRelay (ES)</h2>\n"
         "<p>Voice URL: <code>/voice/answer_cr</code></p>\n"
         "<p>WebSocket CR: <code>%s</code></p>\n"
-        "<p>Health: <code>/health</code> · Diag: <code>/diag_runtime</code></p>"
+        "<p>Health: <code>/health</code> · Diag: <code>/diag_runtime</code> · Env: <code>/diag_env_count</code></p>"
     ) % ws_url
     return HTMLResponse(html)
 
@@ -59,6 +70,16 @@ async def diag_runtime():
     keys = ["CR_TTS_PROVIDER","CR_LANGUAGE","CR_TRANSCRIPTION_LANGUAGE","CR_VOICE",
             "CR_WELCOME","SPEAK_SLEEP_MS","ASSIGN_URL","CI_SERVICE_SID"]
     return JSONResponse({k: _env(k) for k in keys})
+
+@app.get("/diag_env_count")
+async def diag_env_count():
+    return JSONResponse({"count": len(os.environ)})
+
+@app.get("/diag_env_full")
+async def diag_env_full():
+    # Devuelve todas las variables enmascaradas (para evitar exponer secretos)
+    items = {k: _mask(v) for k, v in sorted(os.environ.items())}
+    return JSONResponse(items)
 
 # TwiML ConversationRelay (saludo configurable)
 @app.api_route("/voice/answer_cr", methods=["GET","POST"])
@@ -103,7 +124,7 @@ async def conversation_relay(ws: WebSocket):
 
     async def speak(text: str, interruptible: bool = True):
         await ws.send_json({"type": "text", "token": text, "last": True, "interruptible": bool(interruptible)})
-        # Sin micro-pausa por defecto (SPEAK_SLEEP_MS=0)
+        # sin pausas artificiales por defecto (SPEAK_SLEEP_MS=0)
         try:
             import asyncio
             await asyncio.sleep(int(_env("SPEAK_SLEEP_MS","0"))/1000.0)
@@ -184,7 +205,7 @@ async def conversation_relay(ws: WebSocket):
 
         elif s=="name":
             if len(t_norm.split())>=2:
-                lead["nombre"]=t_norm; session["step"]="phone"; await ask_current()
+                lead["nombre"]=t_norm; session["step"]="phone"; await ask()
             else:
                 await speak("¿Su nombre completo, por favor?")
 
@@ -202,9 +223,6 @@ async def conversation_relay(ws: WebSocket):
 
         elif s=="post":
             await info(); await ask()
-
-    async def ask_current():
-        await ask()
 
     try:
         while True:
