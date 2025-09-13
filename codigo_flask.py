@@ -1,17 +1,16 @@
 
 # codigo_flask.py — SpainRoom Voice (Twilio ↔ OpenAI Realtime) + Stripe + Diagnóstico
-# FastAPI backend. Requisitos: fastapi, uvicorn, websockets, audioop (o audioop-lts), stripe (opcional).
-# Ejecutado en Render con: uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
+# Ejecutar: uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
 
 import os, json, base64, asyncio, contextlib, time
-from typing import Optional, List
+from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Header, HTTPException
 from fastapi.responses import Response, JSONResponse, HTMLResponse
 
 try:
-    import audioop  # stdlib en CPython <=3.11
-except Exception:  # fallback para builds sin audioop
+    import audioop  # stdlib (<=3.11). Si no está, instala audioop-lts.
+except Exception:  # fallback
     import audioop_lts as audioop
 
 import websockets
@@ -43,7 +42,7 @@ BURST_MAX  = int(os.getenv("BURST_MAX","0") or "0")
 PREFILL_FRAMES = int(os.getenv("PREFILL_FRAMES","2") or "2")
 DROP_OLD = os.getenv("DROP_OLD","1") == "1"
 
-# 👇 Compat: evita NameError si algún código usa 'BURST_M_'
+# Compat por si alguna referencia antigua usa 'BURST_M_'
 BURST_M_ = BURST_MAX
 
 # Anti-click & arranque suave
@@ -53,10 +52,11 @@ DECLICK_ON = os.getenv("DECLICK_ON","1") == "1"
 DECLICK_FRAMES = int(os.getenv("DECLICK_FRAMES","3") or "3")
 BARGE_SEND_SILENCE = os.getenv("BARGE_SEND_SILENCE","1") == "1"
 
-# Barge-in (VAD)
-BARGE_VAD_DB = int(os.getenv("BARGE_VAD_DB","-21") or "-21")
-MIN_BARGE_SPEECH_MS = int(os.getenv("MIN_BARGE_SPEECH_MS","500") or "500")
-BARGE_RELEASE_MS = int(os.getenv("BARGE_RELEASE_MS","1700") or "1700")
+# Barge-in (opcional). Por defecto, desactivado (evita autointerrupciones).
+BARGE_ENABLE = os.getenv("BARGE_ENABLE","0") == "1"
+BARGE_VAD_DB = int(os.getenv("BARGE_VAD_DB","-18") or "-18")
+MIN_BARGE_SPEECH_MS = int(os.getenv("MIN_BARGE_SPEECH_MS","650") or "650")
+BARGE_RELEASE_MS = int(os.getenv("BARGE_RELEASE_MS","1800") or "1800")
 
 # Ritmo de habla
 PAUSE_EVERY_MS = int(os.getenv("PAUSE_EVERY_MS","0") or "0")
@@ -116,16 +116,6 @@ def pcm24k_to_ulaw8k(pcm_bytes: bytes) -> bytes:
     ulaw = audioop.lin2ulaw(lin8k, 2)
     return ulaw
 
-def rms_db(ulaw_bytes: bytes) -> float:
-    lin = audioop.ulaw2lin(ulaw_bytes, 2)
-    try:
-        rms = audioop.rms(lin, 2)
-        if rms <= 0: return -120.0
-        import math
-        return 20.0 * math.log10(rms / 32768.0)
-    except Exception:
-        return -120.0
-
 # =========================
 #   FastAPI
 # =========================
@@ -156,7 +146,7 @@ async def diag_runtime():
         "OPENAI_REALTIME_MODEL","OPENAI_VOICE","ALLOW_ENGLISH","FORCE_LANGUAGE","FORCE_ACCENT","DISABLE_AUTO_LANG",
         "CHUNK_MS","PACE_MS","ULAW_CHUNK_BYTES","HWM_FRAMES","BURST_MAX","PREFILL_FRAMES","DROP_OLD",
         "PREROLL_MS","START_SPEAK_DELAY_MS","DECLICK_ON","DECLICK_FRAMES","BARGE_SEND_SILENCE",
-        "BARGE_VAD_DB","MIN_BARGE_SPEECH_MS","BARGE_RELEASE_MS",
+        "BARGE_ENABLE","BARGE_VAD_DB","MIN_BARGE_SPEECH_MS","BARGE_RELEASE_MS",
         "MAX_UTTER_MS","PAUSE_EVERY_MS",
         "SAYFIRST_TEXT","FOLLOWUP_GREETING_TEXT","FOLLOWUP_GREETING_MS",
         "TWILIO_WS_PATH","PUBLIC_WS_URL","CAPTURE_TAG"
@@ -199,71 +189,92 @@ async def voice_fallback():
 # =========================
 #  Twilio WS  ↔  OpenAI Realtime
 # =========================
+def _ensure_bytes(b64: str) -> bytes:
+    return base64.b64decode(b64) if b64 else b""
+
+def ulaw_to_pcm24k_b64(b64: str) -> str:
+    ulaw = _ensure_bytes(b64)
+    if not ulaw: return ""
+    pcm = audioop.ulaw2lin(ulaw, 2)
+    converted, _ = audioop.ratecv(pcm, 2, 1, 8000, 24000, None)
+    return base64.b64encode(converted).decode("ascii")
+
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_stream(ws_twilio: WebSocket):
     await ws_twilio.accept()
-    _log("Twilio WS: connection open")
-    stream_sid = ""
-    ai_queue_out_pcm24k: asyncio.Queue[bytes] = asyncio.Queue()  # deltas desde AI (PCM24k)
-    twilio_out_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=HWM_FRAMES)  # frames µ-law a Twilio
+    stream_sid: str = ""
+    ws_ai = None
 
-    # ---- Sender a Twilio (emite ulaw frames de twilio_out_queue) ----
+    # colas
+    ai_pcm24k_out: asyncio.Queue[bytes] = asyncio.Queue()      # audio delta desde AI
+    twilio_ulaw_out: asyncio.Queue[bytes] = asyncio.Queue(maxsize=HWM_FRAMES)  # frames a Twilio
+
+    # ---- Sender a Twilio (espera a 'start' y a streamSid) ----
     async def twilio_sender():
+        # Esperar a tener streamSid válido
+        while not stream_sid:
+            await asyncio.sleep(0.01)
+
         # preroll de silencio
-        preroll_frames = max(0, PREROLL_MS // CHUNK_MS)
         silent = bytes([0xFF]) * ULAW_CHUNK_BYTES
-        for _ in range(preroll_frames):
-            await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid, "media":{"payload":base64.b64encode(silent).decode("ascii")}}))
+        for _ in range(max(0, PREROLL_MS // CHUNK_MS)):
+            await ws_twilio.send_text(json.dumps({
+                "event":"media","streamSid":stream_sid,
+                "media":{"payload":base64.b64encode(silent).decode("ascii")}
+            }))
             await asyncio.sleep(CHUNK_MS/1000)
 
         pending_voice_start_delay_ms = START_SPEAK_DELAY_MS
 
         while True:
-            ulaw = await twilio_out_queue.get()
+            ulaw = await twilio_ulaw_out.get()
             try:
-                # start-speak delay solo antes del primer frame de voz
                 if pending_voice_start_delay_ms > 0 and ulaw != silent:
                     await asyncio.sleep(pending_voice_start_delay_ms/1000)
                     pending_voice_start_delay_ms = 0
 
                 payload_b64 = base64.b64encode(ulaw).decode("ascii")
-                await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":payload_b64}}))
+                await ws_twilio.send_text(json.dumps({
+                    "event":"media","streamSid":stream_sid,
+                    "media":{"payload":payload_b64}
+                }))
             finally:
-                twilio_out_queue.task_done()
+                twilio_ulaw_out.task_done()
 
     # ---- Convertidor AI->Twilio (PCM24k -> µ-law 8k) ----
     async def ai_to_twilio():
-        chunk_accumulator = b""
+        acc = b""
+        FRAME_BYTES_24K = 960  # 20 ms @ 24 kHz, 16-bit mono
         while True:
-            pcm = await ai_queue_out_pcm24k.get()
+            pcm = await ai_pcm24k_out.get()
             if pcm == b"__END__":
-                ai_queue_out_pcm24k.task_done()
+                ai_pcm24k_out.task_done()
                 continue
-            chunk_accumulator += pcm
-            # 20ms @ 24kHz = 480 muestras * 2 bytes = 960 bytes
-            FRAME_BYTES_24K = 960
-            while len(chunk_accumulator) >= FRAME_BYTES_24K:
-                frame = chunk_accumulator[:FRAME_BYTES_24K]
-                chunk_accumulator = chunk_accumulator[FRAME_BYTES_24K:]
-                ulaw = pcm24k_to_ulaw8k(frame)
-                # Anti-ráfagas
+            acc += pcm
+            while len(acc) >= FRAME_BYTES_24K:
+                frame = acc[:FRAME_BYTES_24K]; acc = acc[FRAME_BYTES_24K:]
+                lin8k, _ = audioop.ratecv(frame, 2, 1, 24000, 8000, None)
+                ulaw = audioop.lin2ulaw(lin8k, 2)
+                # anti-ráfagas
                 if DROP_OLD:
-                    while twilio_out_queue.qsize() > HWM_FRAMES:
-                        try: twilio_out_queue.get_nowait(); twilio_out_queue.task_done()
-                        except Exception: break
-                await twilio_out_queue.put(ulaw)
-            ai_queue_out_pcm24k.task_done()
+                    while twilio_ulaw_out.qsize() > HWM_FRAMES:
+                        try:
+                            twilio_ulaw_out.get_nowait(); twilio_ulaw_out.task_done()
+                        except Exception:
+                            break
+                await twilio_ulaw_out.put(ulaw)
+            ai_pcm24k_out.task_done()
 
-    # ---- Conexión a OpenAI Realtime ----
-    async def open_ai_connection():
+    # ---- OpenAI Realtime: conectar y bombear audio out->Twilio ----
+    async def open_ai_and_pump():
+        nonlocal ws_ai
         url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
         headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "OpenAI-Beta": "realtime=v1",
         }
         ws_ai = await websockets.connect(url, extra_headers=headers, max_size=10*1024*1024, ping_interval=20, ping_timeout=20)
-
-        # session.update
+        # Sesión: fijar idioma/acento, formatos de audio
         session_update = {
             "type": "session.update",
             "session": {
@@ -271,36 +282,42 @@ async def twilio_stream(ws_twilio: WebSocket):
                 "voice": OPENAI_VOICE,
                 "input_audio_format": {"type":"pcm16","sample_rate_hz":24000},
                 "output_audio_format": {"type":"pcm16","sample_rate_hz":24000},
-                "turn_detection": {"type":"server_vad","silence_duration_ms":650},
                 "modalities": ["text","audio"],
                 "language": "es-ES",
             },
         }
         await ws_ai.send(json.dumps(session_update))
-        # Follow-up de arranque
+
+        # Pedir la primera pregunta (después del <Say> de Twilio)
         await ws_ai.send(json.dumps({
             "type": "response.create",
             "response": {"instructions": FOLLOWUP_GREETING_TEXT}
         }))
 
-        async def reader_ai():
+        async def reader():
             while True:
                 try:
                     msg = await ws_ai.recv()
-                except Exception:
+                except Exception as e:
                     break
                 evt = json.loads(msg)
                 et = evt.get("type")
                 if et == "response.output_audio.delta":
                     b = base64.b64decode(evt.get("delta",""))
-                    await ai_queue_out_pcm24k.put(b)
+                    await ai_pcm24k_out.put(b)
                 elif et in ("response.output_audio.end","response.completed"):
-                    await ai_queue_out_pcm24k.put(b"__END__")
-        asyncio.create_task(reader_ai())
+                    await ai_pcm24k_out.put(b"__END__")
+                elif et == "error":
+                    # Loguear y continuar para no parar la llamada
+                    _ = evt
+
+        asyncio.create_task(reader())
         return ws_ai
 
-    # Lanzar tasks
-    sender_task = None
+    # Lanzar tareas auxiliares (el sender arranca después de "start")
+    ai_to_twilio_task = asyncio.create_task(ai_to_twilio())
+    sender_task: Optional[asyncio.Task] = None
+    ws_ai = await open_ai_and_pump()
 
     # Bucle principal Twilio
     try:
@@ -311,24 +328,23 @@ async def twilio_stream(ws_twilio: WebSocket):
 
             if ev == "start":
                 stream_sid = data.get("streamSid","")
+                if sender_task is None:
+                    sender_task = asyncio.create_task(twilio_sender())
                 continue
 
             if ev == "media":
-                # Audio entrante desde Twilio (µ-law base64)
+                # Audio entrante desde Twilio (µ-law base64) -> AI
                 b64 = data.get("media",{}).get("payload","")
                 if not b64:
                     continue
-                ulaw = base64.b64decode(b64)
-
-                # Convertir a PCM 24k y enviar a AI
+                # Convertir a PCM 24k y enviar a AI como input
                 if ws_ai:
                     try:
-                        pcm24 = ulaw8k_to_pcm24k(ulaw)
-                        await ws_ai.send(json.dumps({"type":"input_audio_buffer.append","audio": base64.b64encode(pcm24).decode("ascii")}))
+                        await ws_ai.send(json.dumps({"type":"input_audio_buffer.append","audio": ulaw_to_pcm24k_b64(b64)}))
                         await ws_ai.send(json.dumps({"type":"input_audio_buffer.commit"}))
                         await ws_ai.send(json.dumps({"type":"response.create"}))
                     except Exception as e:
-                        _log("AI send audio err:", e)
+                        _ = e
                 continue
 
             if ev == "stop":
@@ -337,15 +353,15 @@ async def twilio_stream(ws_twilio: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        _log("Twilio WS err:", e)
+        _ = e
     finally:
         with contextlib.suppress(Exception):
-            await twilio_out_queue.put(bytes([0xFF]) * ULAW_CHUNK_BYTES)  # cierre suave
+            await twilio_ulaw_out.put(bytes([0xFF]) * ULAW_CHUNK_BYTES)  # cierre suave
         with contextlib.suppress(Exception):
             if ws_ai: await ws_ai.close()
         with contextlib.suppress(Exception):
-            ai_audio_to_twilio_task.cancel()
-            sender_task.cancel()
+            if sender_task: sender_task.cancel()
+            ai_to_twilio_task.cancel()
 
 # =========================
 #   /assign (stub simple)
