@@ -1,5 +1,5 @@
 
-# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (Final Fix)
+# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (De-dup, Final)
 # Start Command: uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
 
 import os, json, re, time, contextlib, hashlib
@@ -83,7 +83,7 @@ async def answer_cr(request: Request):
     tts_provider = _env("CR_TTS_PROVIDER", "Google")
     tts_voice = _env("CR_VOICE", "")
     ci_sid = _env("CI_SERVICE_SID", "")
-    welcome = _env("CR_WELCOME", "Para atenderle: ¿Es usted propietario o inquilino?")
+    welcome = _env("CR_WELCOME", "")  # vacío recomendado para evitar duplicados
 
     attrs = [
         f"url={quoteattr(ws_url)}",
@@ -120,10 +120,19 @@ async def voice_fallback():
 @app.websocket("/cr")
 async def conversation_relay(ws: WebSocket):
     await ws.accept()
+
     session: Dict[str, Any] = {
         "step": "await_setup",
         "lead": {"role": "", "poblacion": "", "zona": "", "nombre": "", "telefono": ""},
+        "last_q": None,
+        "last_q_ts": 0.0,
+        "last_user": None,
+        "last_user_ts": 0.0,
+        "info_stage": 0,
     }
+
+    def _now_ms() -> float:
+        return time.monotonic() * 1000.0
 
     async def speak(text: str, interruptible: bool = True):
         await ws.send_json(
@@ -138,6 +147,32 @@ async def conversation_relay(ws: WebSocket):
 
     def _norm(t: str) -> str:
         return re.sub(r"\s+", " ", (t or "").strip())
+
+    def _dup_user(t: str) -> bool:
+        t = _norm(t).lower()
+        now = _now_ms()
+        if session["last_user"] == t and (now - session["last_user_ts"]) < 1200:
+            return True
+        session["last_user"] = t
+        session["last_user_ts"] = now
+        return False
+
+    async def ask_once(step_key: str):
+        now = _now_ms()
+        if session["last_q"] == step_key and (now - session["last_q_ts"]) < 1200:
+            return
+        session["last_q"] = step_key
+        session["last_q_ts"] = now
+
+        prompts = {
+            "role": "Para atenderle: ¿Es usted propietario o inquilino?",
+            "city": "¿En qué población está interesado?",
+            "zone": "¿Qué zona o barrio?",
+            "name": "¿Su nombre completo?",
+            "phone": "¿Su teléfono de contacto, por favor?",
+            "post": "¿Desea más información o ayuda?",
+        }
+        await speak(prompts.get(step_key, ""))
 
     def _is_no(t: str) -> bool:
         t = t.lower()
@@ -166,25 +201,17 @@ async def conversation_relay(ws: WebSocket):
         ]
         return any(k in t for k in keys)
 
-    async def info():
-        await speak("SpainRoom alquila habitaciones de medio y largo plazo.")
-        await speak("Intermediamos, validamos y firmamos digitalmente.")
-        await speak("Pagos seguros con Stripe y soporte cercano.")
-
-    async def ask():
-        s = session["step"]
-        if s == "role":
-            await speak("Para atenderle: ¿Es usted propietario o inquilino?")
-        elif s == "city":
-            await speak("¿En qué población está interesado?")
-        elif s == "zone":
-            await speak("¿Qué zona o barrio?")
-        elif s == "name":
-            await speak("¿Su nombre completo?")
-        elif s == "phone":
-            await speak("¿Su teléfono de contacto, por favor?")
-        elif s == "post":
-            await speak("¿Desea más información o ayuda?")
+    async def info_once():
+        stage = session["info_stage"]
+        if stage == 0:
+            await speak("SpainRoom alquila habitaciones de medio y largo plazo.")
+            await speak("Intermediamos, validamos y firmamos digitalmente.")
+        elif stage == 1:
+            await speak("Pagos seguros con Stripe y soporte cercano durante la estancia.")
+            await speak("Estancias mínimas de un mes; precio según habitación y zona.")
+        else:
+            await speak("¿Qué desea saber? Precios, contrato, proceso o documentación.")
+        session["info_stage"] = min(stage + 1, 2)
 
     async def finish():
         lead = session["lead"].copy()
@@ -197,18 +224,21 @@ async def conversation_relay(ws: WebSocket):
                 pass
         print("<<LEAD>>" + json.dumps(lead, ensure_ascii=False) + "<<END>>", flush=True)
         session["step"] = "post"
-        await ask()
+        await ask_once("post")
 
-    async def handle(t: str):
-        t_norm = _norm(t)
-        tl = t_norm.lower()
+    async def handle_text(user_text: str):
+        if _dup_user(user_text):
+            return
+
+        t = _norm(user_text)
+        tl = t.lower()
         s = session["step"]
         lead = session["lead"]
 
         if _is_info(tl):
-            await info()
+            await info_once()
             if s != "await_setup":
-                await ask()
+                await ask_once(s)
             return
 
         if s == "post" and _is_no(tl):
@@ -221,41 +251,41 @@ async def conversation_relay(ws: WebSocket):
                 lead["role"] = "propietario"
                 session["step"] = "city"
                 await speak("Gracias.")
-                await ask()
+                await ask_once("city")
             elif "inquil" in tl or "alquil" in tl:
                 lead["role"] = "inquilino"
                 session["step"] = "city"
                 await speak("Gracias.")
-                await ask()
+                await ask_once("city")
             else:
-                await speak("¿Propietario o inquilino?")
+                await ask_once("role")
 
         elif s == "city":
             if len(tl) >= 2:
-                lead["poblacion"] = t_norm.title()
+                lead["poblacion"] = t.title()
                 session["step"] = "zone"
-                await ask()
+                await ask_once("zone")
             else:
-                await ask()
+                await ask_once("city")
 
         elif s == "zone":
             if len(tl) >= 2:
-                lead["zona"] = t_norm.title()
+                lead["zona"] = t.title()
                 session["step"] = "name"
-                await ask()
+                await ask_once("name")
             else:
-                await ask()
+                await ask_once("zone")
 
         elif s == "name":
-            if len(t_norm.split()) >= 2:
-                lead["nombre"] = t_norm
+            if len(t.split()) >= 2:
+                lead["nombre"] = t
                 session["step"] = "phone"
-                await ask()
+                await ask_once("phone")
             else:
                 await speak("¿Su nombre completo, por favor?")
 
         elif s == "phone":
-            d = _digits(t_norm)
+            d = _digits(t)
             if d.startswith("34") and len(d) >= 11:
                 d = d[-9:]
             if len(d) == 9 and d[0] in "6789":
@@ -267,33 +297,31 @@ async def conversation_relay(ws: WebSocket):
         elif s == "await_setup":
             pass
 
-        elif s == "post":
-            await info()
-            await ask()
-
     try:
         while True:
             msg = await ws.receive_json()
-            mtype = msg.get("type")
+            tp = msg.get("type")
 
-            if mtype == "setup":
+            if tp == "setup":
                 session["step"] = "role"
-                await ask()
+                await ask_once("role")
 
-            elif mtype == "prompt":
+            elif tp == "prompt":
                 txt = msg.get("voicePrompt", "") or ""
-                if msg.get("last", True) and txt:
-                    await handle(txt)
+                is_last = bool(msg.get("last", True))
+                if is_last and txt:
+                    await handle_text(txt)
 
-            elif mtype == "interrupt":
-                await ask()
+            elif tp == "interrupt":
+                await ask_once(session["step"])
 
-            elif mtype == "dtmf":
+            elif tp == "dtmf":
                 pass
 
-            elif mtype == "error":
+            elif tp == "error":
                 await speak("Disculpe. Estamos teniendo problemas. Inténtelo más tarde.", interruptible=False)
                 break
+
     except Exception as e:
         print("CR ws error:", e, flush=True)
     finally:
@@ -305,11 +333,5 @@ async def conversation_relay(ws: WebSocket):
 async def assign(payload: dict):
     zone_key = f"{(payload.get('poblacion') or '').strip().lower()}-{(payload.get('zona') or '').strip().lower()}"
     fid = hashlib.sha1(zone_key.encode("utf-8")).hexdigest()[:10]
-    task = {
-        "title": "Contactar lead",
-        "zone_key": zone_key,
-        "franchisee_id": fid,
-        "lead": payload,
-        "created_at": int(time.time()),
-    }
+    task = {"title": "Contactar lead", "zone_key": zone_key, "franchisee_id": fid, "lead": payload, "created_at": int(time.time())}
     return JSONResponse({"ok": True, "task": task})
