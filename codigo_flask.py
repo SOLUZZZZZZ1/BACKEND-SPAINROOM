@@ -3,12 +3,12 @@
 # • 24 kHz end-to-end (tono correcto)
 # • TwiML GET/POST (+ <Parameter> callSid/from)
 # • Anti-click 1: frames μ-law exactos (160 bytes / 20 ms)
-# • Anti-click 2: “de-click” (micro-fade de 1–2 frames al cortar por barge-in)
+# • Anti-click 2: “de-click” (micro-fade 1–2 frames al cortar por barge-in)
 # • Barge-in fino + start-speak delay (no pisa, no retoma de golpe)
-# • Voz forzada en saludo (evita cambios de acento/dialecto)
-# • Captura LEAD en texto (<<LEAD>>{...}<<END>>) y envío a Slack/Webhook
-# • Endpoints /diag_keys, /diag_runtime
-# • Endpoint /assign (regla 10k=1 franquiciado; tabla Barcelona)
+# • PREFILL de cola y política “drop-old” (sin ráfagas): adiós audio acelerado/entrecortado
+# • Voz forzada es-ES y guion férreo “no hotel”
+# • Captura LEAD (<<LEAD>>{...}<<END>>) + envío Slack/Webhook
+# • Endpoints /diag_keys, /diag_runtime y /assign (regla 10k=1; tabla Barcelona)
 # • Compatibilidad Python 3.13 (audioop-lts)
 # • Logs limpios: CancelledError silenciada, HEAD / soportado
 #
@@ -48,13 +48,16 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT",
     "Mantenga SIEMPRE es-ES; PROHIBIDO cambiar o comentar acento/dialecto."
 )
 
-# Audio / ritmo
+# Audio / ritmo (reloj estable: mantener PACE_MS == CHUNK_MS)
 CHUNK_MS = int(os.getenv("CHUNK_MS", "20"))                   # 20 ms por frame
 ULAW_CHUNK_BYTES = int(os.getenv("ULAW_CHUNK_BYTES", "160"))  # 20 ms @ 8 kHz μ-law
-PACE_MS = int(os.getenv("PACE_MS", str(CHUNK_MS)))            # reloj estable: mantener igual a CHUNK_MS
-HWM_FRAMES = int(os.getenv("HWM_FRAMES", "50"))
-BURST_MAX = int(os.getenv("BURST_MAX", "4"))
-PREROLL_MS = int(os.getenv("PREROLL_MS", "1300"))
+PACE_MS = int(os.getenv("PACE_MS", str(CHUNK_MS)))
+HWM_FRAMES = int(os.getenv("HWM_FRAMES", "60"))               # umbral de cola; drop-old si lo supera
+BURST_MAX = int(os.getenv("BURST_MAX", "0"))                  # 0 = sin ráfagas (no acelerar nunca)
+PREROLL_MS = int(os.getenv("PREROLL_MS", "1400"))             # acolchado de arranque por turno
+
+# Prefill: frames mínimos en cola antes de hablar (≈60 ms por defecto)
+PREFILL_FRAMES = int(os.getenv("PREFILL_FRAMES", "3"))
 
 SAYFIRST_TEXT = os.getenv("SAYFIRST_TEXT",
     "Bienvenido a SpainRoom. Alquilamos habitaciones a medio y largo plazo (mínimo un mes). "
@@ -68,8 +71,8 @@ MAX_UTTER_MS = int(os.getenv("MAX_UTTER_MS", "3400"))
 BARGE_VAD_DB = float(os.getenv("BARGE_VAD_DB", "-28"))
 BARGE_RELEASE_MS = int(os.getenv("BARGE_RELEASE_MS", "1000"))
 BARGE_SEND_SILENCE = os.getenv("BARGE_SEND_SILENCE", "1") == "1"
-START_SPEAK_DELAY_MS = int(os.getenv("START_SPEAK_DELAY_MS", "350"))
-MIN_BARGE_SPEECH_MS = int(os.getenv("MIN_BARGE_SPEECH_MS", "220"))
+START_SPEAK_DELAY_MS = int(os.getenv("START_SPEAK_DELAY_MS", "380"))
+MIN_BARGE_SPEECH_MS = int(os.getenv("MIN_BARGE_SPEECH_MS", "240"))
 
 # De-click (micro fade-out al cortar)
 DECLICK_ON = os.getenv("DECLICK_ON", "1") == "1"
@@ -86,7 +89,7 @@ DEBUG = os.getenv("DEBUG", "0") == "1"
 # ========= App =========
 app = FastAPI(title="SpainRoom Voice Realtime", docs_url="/docs", redoc_url=None)
 
-def _log(*a):
+def _log(*a):  # logs solo si DEBUG=1
     if DEBUG: print("[SRV]", *a)
 
 def _mask(key: str) -> str:
@@ -384,78 +387,6 @@ async def twilio_stream(ws_twilio: WebSocket):
             _log("de-click error", e)
         return out
 
-    async def twilio_sender():
-        try:
-            nonlocal stream_sid, barge_active, ai_spoken_ms, speak_gate_until, last_ulaw_sent
-            next_t = time.monotonic(); sleep_s = max(0.0, PACE_MS / 1000.0); played_since_pause_ms = 0
-            while True:
-                now = time.monotonic()
-                if speak_gate_until and now < speak_gate_until:
-                    if BARGE_SEND_SILENCE and stream_sid:
-                        silent = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode('ascii')
-                        await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":silent}}))
-                    if sleep_s > 0.0: await asyncio.sleep(sleep_s)
-                    continue
-
-                if barge_active:
-                    # acolchado anti-click + silencio de reloj
-                    for b64 in _declick_frames_from_last():
-                        await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":b64}}))
-                    if BARGE_SEND_SILENCE and stream_sid:
-                        silent = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode('ascii')
-                        await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":silent}}))
-                    # vaciar backlog
-                    try:
-                        while True:
-                            _ = ulaw_out_queue.get_nowait(); ulaw_out_queue.task_done()
-                    except asyncio.QueueEmpty:
-                        pass
-                    if sleep_s > 0.0: await asyncio.sleep(sleep_s)
-                    continue
-
-                payload_b64 = await ulaw_out_queue.get()
-                # Recordar último frame no silencioso
-                try:
-                    raw = base64.b64decode(payload_b64)
-                    if raw != bytes([0xFF]) * ULAW_CHUNK_BYTES:
-                        last_ulaw_sent = raw
-                except Exception:
-                    pass
-
-                await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":payload_b64}}))
-                ulaw_out_queue.task_done()
-
-                ai_spoken_ms += CHUNK_MS; played_since_pause_ms += CHUNK_MS
-
-                if PAUSE_EVERY_MS > 0 and played_since_pause_ms >= PAUSE_EVERY_MS:
-                    if stream_sid:
-                        silent = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode('ascii')
-                        await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":silent}}))
-                    played_since_pause_ms = 0; next_t = time.monotonic(); continue
-
-                if MAX_UTTER_MS > 0 and ai_spoken_ms >= MAX_UTTER_MS:
-                    barge_active = True; barge_last_voice = time.monotonic()
-
-                qsz = ulaw_out_queue.qsize()
-                if qsz >= HWM_FRAMES:
-                    to_send = min(qsz - HWM_FRAMES, BURST_MAX)
-                    for _ in range(to_send):
-                        payload_b64 = await ulaw_out_queue.get()
-                        await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":payload_b64}}))
-                        ulaw_out_queue.task_done()
-                    next_t = time.monotonic(); continue
-
-                if sleep_s > 0.0:
-                    next_t += sleep_s; delay = next_t - time.monotonic()
-                    if delay > 0: await asyncio.sleep(delay)
-                    else: next_t = time.monotonic()
-        except asyncio.CancelledError:
-            _log("sender cancelled")
-            return
-        except Exception as e:
-            _log("sender error:", e)
-            return
-
     async def enqueue_ulaw_frames(ulaw_bytes: bytes):
         nonlocal ulaw_carry
         ulaw_carry.extend(ulaw_bytes)
@@ -472,6 +403,93 @@ async def twilio_stream(ws_twilio: WebSocket):
         b64 = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode("ascii")
         for _ in range(frames): await ulaw_out_queue.put(b64)
 
+    async def twilio_sender():
+        try:
+            nonlocal stream_sid, barge_active, ai_spoken_ms, speak_gate_until, last_ulaw_sent
+            next_t = time.monotonic(); sleep_s = max(0.0, PACE_MS / 1000.0); played_since_pause_ms = 0
+            while True:
+                now = time.monotonic()
+
+                # Puerta de arranque + PREFILL (colchón mínimo)
+                if (speak_gate_until and now < speak_gate_until) or ulaw_out_queue.qsize() < PREFILL_FRAMES:
+                    if BARGE_SEND_SILENCE and stream_sid:
+                        silent = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode('ascii')
+                        await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":silent}}))
+                    if sleep_s > 0.0:
+                        await asyncio.sleep(sleep_s)
+                    continue
+
+                # Si el cliente habla: acolchado de-click + silencio + limpiar backlog (sin ráfagas)
+                if barge_active:
+                    for b64 in _declick_frames_from_last():
+                        await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":b64}}))
+                    if BARGE_SEND_SILENCE and stream_sid:
+                        silent = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode('ascii')
+                        await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":silent}}))
+                    try:
+                        while True:
+                            _ = ulaw_out_queue.get_nowait(); ulaw_out_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                    if sleep_s > 0.0:
+                        await asyncio.sleep(sleep_s)
+                    continue
+
+                # Enviar 1 frame a ritmo real
+                payload_b64 = await ulaw_out_queue.get()
+                try:
+                    raw = base64.b64decode(payload_b64)
+                    if raw != bytes([0xFF]) * ULAW_CHUNK_BYTES:
+                        last_ulaw_sent = raw
+                except Exception:
+                    pass
+                await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":payload_b64}}))
+                ulaw_out_queue.task_done()
+
+                ai_spoken_ms += CHUNK_MS
+                played_since_pause_ms += CHUNK_MS
+
+                # Pausas naturales (desactivadas por defecto)
+                if PAUSE_EVERY_MS > 0 and played_since_pause_ms >= PAUSE_EVERY_MS:
+                    if stream_sid:
+                        silent = base64.b64encode(bytes([0xFF]) * ULAW_CHUNK_BYTES).decode('ascii')
+                        await ws_twilio.send_text(json.dumps({"event":"media","streamSid":stream_sid,"media":{"payload":silent}}))
+                    played_since_pause_ms = 0
+                    next_t = time.monotonic()
+                    continue
+
+                # Cortar frases demasiado largas
+                if MAX_UTTER_MS > 0 and ai_spoken_ms >= MAX_UTTER_MS:
+                    barge_active = True
+                    barge_last_voice = time.monotonic()
+
+                # Política “drop-old” (NUNCA acelerar): si hay backlog, tirar lo viejo
+                qsz = ulaw_out_queue.qsize()
+                if qsz > HWM_FRAMES:
+                    to_drop = qsz - HWM_FRAMES
+                    try:
+                        for _ in range(to_drop):
+                            _ = ulaw_out_queue.get_nowait(); ulaw_out_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                    next_t = time.monotonic()
+                    continue
+
+                # Reloj real (sin ráfagas)
+                if sleep_s > 0.0:
+                    next_t += sleep_s
+                    delay = next_t - time.monotonic()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    else:
+                        next_t = time.monotonic()
+        except asyncio.CancelledError:
+            _log("sender cancelled")
+            return
+        except Exception as e:
+            _log("sender error:", e)
+            return
+
     async def connect_ai_after_start():
         nonlocal ws_ai, ai_spoken_ms, barge_active, speak_gate_until
         await start_evt.wait()
@@ -482,6 +500,7 @@ async def twilio_stream(ws_twilio: WebSocket):
             ws_ai = await websockets.connect(ai_url, extra_headers=headers)
             _log("OpenAI Realtime connected")
 
+            # Configurar sesión
             await ws_ai.send(json.dumps({
                 "type": "session.update",
                 "session": {
@@ -495,6 +514,18 @@ async def twilio_stream(ws_twilio: WebSocket):
             }))
             ai_spoken_ms = 0; barge_active = False
 
+            # Volcar lo buffered (si llegó audio del cliente antes de abrir AI)
+            while buffered_ulaw:
+                ulaw = buffered_ulaw.pop(0)
+                lin8 = audioop.ulaw2lin(ulaw, 2)
+                pcm24 = up_8k_to_24k.convert(lin8)
+                if pcm24:
+                    await ws_ai.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(pcm24).decode("ascii"),
+                    }))
+
+            # Saludo inicial (voz forzada)
             await asyncio.sleep(FOLLOWUP_GREETING_MS / 1000.0)
             with contextlib.suppress(Exception):
                 await ws_ai.send(json.dumps({
@@ -502,15 +533,18 @@ async def twilio_stream(ws_twilio: WebSocket):
                     "response":{"instructions":FOLLOWUP_GREETING_TEXT, "voice":OPENAI_VOICE}
                 }))
 
+            # Loop AI → Twilio
             try:
                 txt_buf = ""
                 async for raw in ws_ai:
                     evt = json.loads(raw); t = evt.get("type")
 
+                    # Nuevo turno IA
                     if t in ("response.created","response.started"):
                         ai_spoken_ms = 0; barge_active = False
                         speak_gate_until = time.monotonic() + (START_SPEAK_DELAY_MS / 1000.0)
 
+                    # Captura LEAD (texto incremental)
                     if t in ("response.output_text.delta",):
                         delta = evt.get("delta") or evt.get("text") or ""
                         if delta:
@@ -525,8 +559,10 @@ async def twilio_stream(ws_twilio: WebSocket):
                                     lead.update({"timestamp": int(time.time()*1000), "source": "twilio-voice"})
                                     await deliver_lead(lead)
 
+                    # Audio IA → Twilio
                     if t in ("response.audio.delta","response.output_audio.delta"):
-                        if barge_active: continue
+                        if barge_active:  # no enviar si el cliente está hablando
+                            continue
                         b64 = evt.get("audio") or evt.get("delta")
                         if b64 and started and stream_sid:
                             pcm24 = base64.b64decode(b64)
@@ -566,6 +602,8 @@ async def twilio_stream(ws_twilio: WebSocket):
                     ulaw = base64.b64decode(msg["media"]["payload"])
                     lin = audioop.ulaw2lin(ulaw, 2)
                     rms = max(1, audioop.rms(lin, 2)); db = 20.0 * math.log10(rms / 32767.0); now = time.monotonic()
+
+                    # VAD: activar barge-in si hay voz del cliente suficiente
                     if db >= BARGE_VAD_DB:
                         vad_hot_ms = min(vad_hot_ms + CHUNK_MS, 2000)
                         if vad_hot_ms >= MIN_BARGE_SPEECH_MS:
@@ -582,6 +620,7 @@ async def twilio_stream(ws_twilio: WebSocket):
                         if barge_active and (now - barge_last_voice) * 1000.0 >= BARGE_RELEASE_MS:
                             barge_active = False
 
+                    # Cliente → IA (24 kHz) (si AI no lista, buffer μ-law)
                     if ws_ai is not None:
                         pcm24 = up_8k_to_24k.convert(lin)
                         if pcm24:
@@ -618,6 +657,7 @@ async def twilio_stream(ws_twilio: WebSocket):
     with contextlib.suppress(Exception, asyncio.CancelledError):
         await asyncio.gather(*pending, return_exceptions=True)
 
+# Dev local
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("codigo_flask:app", host="0.0.0.0", port=8000)
