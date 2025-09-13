@@ -1,30 +1,19 @@
 
-# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (fix + diag env)
+# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (TwiML Escaped, FINAL)
 # FastAPI app para Twilio Voice usando <ConversationRelay> (STT+TTS por Twilio)
 # - Español solo. Espera 'setup' antes de hablar.
+# - TwiML con atributos ESCAPADOS (evita errores de XML).
 # - FSM 5 campos (rol, población, zona, nombre, teléfono) + respuestas de información.
-# - Endpoints: /voice/answer_cr · /voice/fallback · WS /cr · /assign · /stripe/webhook
-# - Salud/diag: /health · /diag_runtime · /diag_env_count · /diag_env_full (valores enmascarados)
-# Ejecutar: uvicorn codigo_flask_es_stable_fix_diag:app --host 0.0.0.0 --port $PORT --proxy-headers
+# Endpoints: /voice/answer_cr · /voice/fallback · WS /cr · /assign · /health · /diag_runtime
+# Ejecutar: uvicorn codigo_flask_es_stable_escaped:app --host 0.0.0.0 --port $PORT --proxy-headers
 
 import os, json, re, time, contextlib, hashlib
 from typing import Dict, Any
 from fastapi import FastAPI, Request, WebSocket, Header
 from fastapi.responses import Response, JSONResponse, HTMLResponse
+from xml.sax.saxutils import quoteattr
 
-MASK_KEEP = int(os.getenv("DIAG_ENV_MASK_KEEP", "4"))
-MASK_ENABLE = os.getenv("DIAG_ENV_MASK", "1") == "1"
-
-def _mask(v: str) -> str:
-    if not MASK_ENABLE or v is None:
-        return v
-    s = str(v)
-    # no enmascarar valores muy cortos
-    if len(s) <= MASK_KEEP:
-        return "*" * len(s)
-    return s[:MASK_KEEP] + "…" + "*" * (len(s) - MASK_KEEP)
-
-app = FastAPI(title="SpainRoom Voice — ConversationRelay ES Stable (fix + diag)")
+app = FastAPI(title="SpainRoom Voice — ConversationRelay ES Stable (Escaped)")
 
 def _twiml(xml: str) -> Response:
     return Response(content=xml, media_type="application/xml")
@@ -34,6 +23,26 @@ def _env(k: str, default: str = "") -> str:
 
 def _normalize_ws_host(request: Request) -> str:
     return request.headers.get("host") or request.url.hostname or "localhost"
+
+async def _post_json(url: str, payload: dict, timeout: float = 2.0) -> None:
+    import urllib.request
+    try:
+        req = urllib.request.Request(url,
+                                     data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                     headers={"Content-Type":"application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            _ = r.read()
+    except Exception:
+        pass
+
+def _digits(t: str) -> str:
+    return "".join(ch for ch in (t or "") if ch.isdigit())
+
+@app.get("/")
+async def root(request: Request):
+    host = _normalize_ws_host(request)
+    ws_url = f"wss://{host}/cr"
+    html = (
 
 async def _post_json(url: str, payload: dict, timeout: float = 2.0) -> None:
     import urllib.request
