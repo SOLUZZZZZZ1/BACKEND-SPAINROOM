@@ -78,7 +78,7 @@ async def answer_cr(request: Request):
         f"language={quoteattr(lang)}",
         f"transcriptionLanguage={quoteattr(trans_lang)}",
         f"ttsProvider={quoteattr(tts_provider)}",
-        'interruptible="speech"',
+        "interruptible="speech"", 
         'reportInputDuringAgentSpeech="none"',
     ]
     if welcome.strip():
