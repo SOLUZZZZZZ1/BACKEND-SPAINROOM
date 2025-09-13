@@ -300,9 +300,7 @@ async def twilio_stream(ws_twilio: WebSocket):
         return ws_ai
 
     # Lanzar tasks
-    sender_task = asyncio.create_task(twilio_sender())
-    ai_audio_to_twilio_task = asyncio.create_task(ai_to_twilio())
-    ws_ai = await open_ai_connection()
+    sender_task = None
 
     # Bucle principal Twilio
     try:
