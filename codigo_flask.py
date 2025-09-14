@@ -1,5 +1,5 @@
 
-# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (Greeting once, Info x2, Goodbye, No Loop)
+# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (Info x3 + Goodbye)
 # Start: python -m uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
 
 import os, json, re, time, contextlib, hashlib
@@ -10,14 +10,15 @@ from xml.sax.saxutils import quoteattr
 
 app = FastAPI(title="SpainRoom Voice — ConversationRelay (ES Stable)")
 
-# ---------- helpers ----------
+
 def _twiml(xml: str) -> Response: return Response(content=xml, media_type="application/xml")
 def _env(k: str, default: str = "") -> str: return os.getenv(k, default)
 def _host(req: Request) -> str: return req.headers.get("host") or req.url.hostname or "localhost"
 
-# ---------- health & diag ----------
+
 @app.get("/health")
 async def health(): return JSONResponse({"ok": True})
+
 
 @app.get("/diag_runtime")
 async def diag_runtime():
@@ -25,36 +26,30 @@ async def diag_runtime():
             "CR_WELCOME","SPEAK_SLEEP_MS","COOLDOWN_MS","MIN_TTS_GAP_MS","ASSIGN_URL"]
     return JSONResponse({k: _env(k) for k in keys})
 
-# ---------- TwiML (greeting via Twilio; no barge-in) ----------
+
 @app.api_route("/voice/answer_cr", methods=["GET","POST"])
 async def answer_cr(request: Request):
     host = _host(request)
     ws = f"wss://{host}/cr"
-    lang = _env("CR_LANGUAGE","es-ES")
-    tr   = _env("CR_TRANSCRIPTION_LANGUAGE",lang)
-    prov = _env("CR_TTS_PROVIDER","Google")
-    voice= _env("CR_VOICE","es-ES-Standard-A")
+    lang = _env("CR_LANGUAGE","es-ES"); tr=_env("CR_TRANSCRIPTION_LANGUAGE",lang)
+    prov=_env("CR_TTS_PROVIDER","Google"); voice=_env("CR_VOICE","es-ES-Standard-A")
     welcome=_env("CR_WELCOME","Bienvenido a SpainRoom.")
-    attrs = [
-        f"url={quoteattr(ws)}",
-        f"language={quoteattr(lang)}",
-        f"transcriptionLanguage={quoteattr(tr)}",
-        f"ttsProvider={quoteattr(prov)}",
-        'interruptible="speech"',
-        'reportInputDuringAgentSpeech="none"'
-    ]
+    # Sin barge-in: máxima estabilidad
+    attrs = [f"url={quoteattr(ws)}", f"language={quoteattr(lang)}", f"transcriptionLanguage={quoteattr(tr)}",
+             f"ttsProvider={quoteattr(prov)}", 'interruptible="speech"', 'reportInputDuringAgentSpeech="none"']
     if welcome.strip(): attrs.append(f"welcomeGreeting={quoteattr(welcome.strip())}")
     if voice.strip():   attrs.append(f"voice={quoteattr(voice.strip())}")
     twiml = '<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Connect>\n    <ConversationRelay %s />\n  </Connect>\n</Response>' % (" ".join(attrs))
     return _twiml(twiml)
 
-# ---------- WebSocket ConversationRelay (ES) ----------
+
 @app.websocket("/cr")
 async def cr(ws: WebSocket):
     await ws.accept()
-    COOLDOWN_MS    = int(_env("COOLDOWN_MS","2200"))   # anti eco/repetición
-    MIN_TTS_GAP_MS = int(_env("MIN_TTS_GAP_MS","0"))   # 0 => permite encadenar 2 frases
+    COOLDOWN_MS    = int(_env("COOLDOWN_MS","2200"))
+    MIN_TTS_GAP_MS = int(_env("MIN_TTS_GAP_MS","0"))   # 0 → permite encadenar líneas seguidas
     SPEAK_SLEEP_MS = int(_env("SPEAK_SLEEP_MS","0"))
+
     session: Dict[str, Any] = {
         "step": "await_setup",
         "lead": {"role":"","poblacion":"","zona":"","nombre":"","telefono":""},
@@ -63,26 +58,26 @@ async def cr(ws: WebSocket):
         "last_tts_ts": 0.0
     }
 
-    def _now_ms(): return time.monotonic()*1000.0
-    def _norm(t):   return re.sub(r"\s+"," ", (t or "").strip())
+    def _now(): return time.monotonic()*1000.0
+    def _norm(t): return re.sub(r"\s+"," ", (t or "").strip())
 
     async def speak(txt, interruptible=True):
-        now = _now_ms()
+        now=_now()
         if (now - session["last_tts_ts"]) < MIN_TTS_GAP_MS:
             return
         await ws.send_json({"type":"text","token":txt,"last":True,"interruptible":bool(interruptible)})
-        session["last_tts_ts"] = _now_ms()
+        session["last_tts_ts"] = _now()
         try:
             import asyncio; await asyncio.sleep(SPEAK_SLEEP_MS/1000.0)
         except Exception: pass
 
     def _dup_user(t):
-        t = _norm(t).lower(); now=_now_ms()
+        t=_norm(t).lower(); now=_now()
         if session["last_user"]==t and (now-session["last_user_ts"])<COOLDOWN_MS: return True
         session["last_user"]=t; session["last_user_ts"]=now; return False
 
     async def ask_once(key):
-        now=_now_ms()
+        now=_now()
         if session["last_q"]==key and (now-session["last_q_ts"])<COOLDOWN_MS: return
         session["last_q"]=key; session["last_q_ts"]=now
         prompts = {
@@ -94,7 +89,7 @@ async def cr(ws: WebSocket):
         }
         if key in prompts: await speak(prompts[key])
 
-    # intents
+    # Intents
     HELP_RE  = re.compile(r"\b(ayuda|asesor|llamar|contacto|tel[eé]fono)\b", re.I)
     INFO_RE  = re.compile(r"\b(info|informaci[oó]n|m[aá]s info|saber m[aá]s|cu[ée]ntame|dime|explica|detalles)\b", re.I)
     PRICE_RE = re.compile(r"\b(precio|precios|tarifa|coste|costos)\b", re.I)
@@ -103,38 +98,43 @@ async def cr(ws: WebSocket):
     DOCS_RE  = re.compile(r"\b(document|dni|pasaporte|papeles)\b", re.I)
 
     async def info_general():
-        await speak("SpainRoom alquila habitaciones medio y largo plazo. No somos hotel.")
+        await speak("SpainRoom alquila habitaciones de medio y largo plazo.")
+        await speak("No somos hotel ni turismo; convivencia segura y responsable.")
         await speak("Proceso: solicitud, verificación, contrato digital y entrada.")
 
     async def info_topic(tl: str) -> bool:
         if PRICE_RE.search(tl):
-            await speak("El precio depende de ciudad y habitación. Mínimo un mes.")
-            await speak("Podemos comparar opciones en su presupuesto.")
+            await speak("El precio depende de ciudad y habitación; mínimo un mes.")
+            await speak("Gastos según vivienda; te damos opciones comparadas.")
+            await speak("Ajustamos al presupuesto y zona que prefiera.")
             return True
         if CONT_RE.search(tl):
             await speak("Contrato electrónico con validez legal y justificantes.")
-            await speak("Todo el proceso es online y trazable.")
+            await speak("Cláusulas claras: uso de espacios, visitas y depósito.")
+            await speak("Todo online; trazabilidad y copia para ambas partes.")
             return True
         if PROC_RE.search(tl):
             await speak("Pasos: solicitud, verificación, contrato digital y entrada.")
-            await speak("Le guiamos en cada paso y resolvemos dudas.")
+            await speak("Revisión de requisitos y match por ciudad y zona.")
+            await speak("Soporte cercano; incidencias por teléfono y email.")
             return True
         if DOCS_RE.search(tl):
             await speak("Inquilino: DNI o pasaporte y teléfono verificado.")
-            await speak("Podemos pedir referencias si procede.")
+            await speak("Podemos pedir referencias según el caso y la vivienda.")
+            await speak("Propietario: DNI y checklist básico del hogar.")
             return True
         return False
 
     async def finish_lead():
-        lead = session["lead"].copy()
+        lead=session["lead"].copy()
         await speak("Gracias. Tomamos sus datos. Le contactaremos en breve.", interruptible=False)
-        url = _env("ASSIGN_URL","")
+        url=_env("ASSIGN_URL","")
         if url:
             try:
                 import urllib.request
-                req = urllib.request.Request(url, data=json.dumps(lead, ensure_ascii=False).encode("utf-8"),
-                                             headers={"Content-Type":"application/json"})
-                with urllib.request.urlopen(req, timeout=2.0) as r: _ = r.read()
+                req=urllib.request.Request(url, data=json.dumps(lead, ensure_ascii=False).encode("utf-8"),
+                                           headers={"Content-Type":"application/json"})
+                with urllib.request.urlopen(req, timeout=2.0) as r: _=r.read()
             except Exception: pass
         print("<<LEAD>>"+json.dumps(lead, ensure_ascii=False)+"<<END>>", flush=True)
         session["step"]="post"  # no repreguntar en post
@@ -144,14 +144,14 @@ async def cr(ws: WebSocket):
         if _dup_user(t): return
         s=session["step"]; lead=session["lead"]
 
-        # Escalado ayuda
+        # Ayuda
         if HELP_RE.search(tl):
             if not lead.get("telefono"):
                 session["step"]="phone"; await speak("Para ayudarle ahora, ¿su teléfono de contacto?"); return
             await speak(f"De acuerdo. Un asesor le llamará al {lead['telefono']} en breve.")
             session["step"]="post"; return
 
-        # Información: dos frases; si estamos en post, despedida
+        # Información (dos o tres líneas). Si ya estamos en post → despedida y colgar.
         if INFO_RE.search(tl):
             in_post = (s=="post")
             if not await info_topic(tl):
@@ -183,32 +183,29 @@ async def cr(ws: WebSocket):
             if len(d)==9 and d[0] in "6789": lead["telefono"]=d; await finish_lead(); return
             await speak("¿Me facilita un teléfono de nueve dígitos?"); return
         if s=="post":
-            # No repreguntar; queda a la escucha
+            # Silencio en post; a la espera de 'información' o 'ayuda'
             return
 
-    # event loop
+    # Event loop
     try:
         while True:
             msg = await ws.receive_json()
             tp = msg.get("type")
             if tp=="setup":
-                session["step"]="role"
-                await ask_once("role")
+                session["step"]="role"; await ask_once("role")
             elif tp=="prompt":
                 if msg.get("last", True):
                     await handle(msg.get("voicePrompt","") or "")
             elif tp=="interrupt":
-                # permitir que interrumpa: reset del gap
                 session["last_tts_ts"]=0.0
             elif tp=="error":
-                await ws.send_json({"type":"text","token":"Disculpe. Estamos teniendo problemas.","last":True,"interruptible":False})
-                break
+                await ws.send_json({"type":"text","token":"Disculpe. Estamos teniendo problemas.","last":True,"interruptible":False}); break
     except Exception as e:
         print("CR ws error:", e, flush=True)
     finally:
         with contextlib.suppress(Exception): await ws.close()
 
-# ---------- /assign passthrough ----------
+# /assign passthrough
 @app.post("/assign")
 async def assign(payload: dict):
     zone_key = f"{(payload.get('poblacion') or payload.get('ciudad','') or '').strip().lower()}-{(payload.get('zona','') or '').strip().lower()}"
