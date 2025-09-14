@@ -1,36 +1,21 @@
+# Re-create the file /mnt/data/codigo_flask.py (ES Stable: Greeting + No-Loop, No Barge-In)
+from textwrap import dedent
 
-# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (Franquicia Routing)
-# Start Command: uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
-#
-# Ruteo franquicia:
-#  - Detecta "franquicia/franquiciado" en cualquier momento.
-#  - Pregunta si es FRANQUICIADO ACTUAL o INTERESADO en franquiciarse.
-#  - Genera lead_type = 'franchise_prospect' | 'franchisee_support' y envía a:
-#      ASSIGN_URL_EXPANSION (prospect)  |  ASSIGN_URL_SUPPORT (soporte)  |  fallback ASSIGN_URL.
-#
+codigo = dedent(r"""
+# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (Greeting + No-Loop, No Barge-In)
+# Start: python -m uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
+
 import os, json, re, time, contextlib, hashlib
 from typing import Dict, Any
-from fastapi import FastAPI, Request, WebSocket, Header
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response, JSONResponse, HTMLResponse
 from xml.sax.saxutils import quoteattr
 
-app = FastAPI(title="SpainRoom Voice — ConversationRelay (ES, Franquicia Routing)")
+app = FastAPI(title="SpainRoom Voice — ConversationRelay (ES Stable)")
 
 def _twiml(xml: str) -> Response: return Response(content=xml, media_type="application/xml")
 def _env(k: str, default: str = "") -> str: return os.getenv(k, default)
 def _host(req: Request) -> str: return req.headers.get("host") or req.url.hostname or "localhost"
-
-async def _post_json(url: str, payload: dict, timeout: float = 2.0) -> None:
-    import urllib.request
-    try:
-        req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                                     headers={"Content-Type":"application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            _ = r.read()
-    except Exception:
-        pass
-
-def _digits(t: str) -> str: return "".join(ch for ch in (t or "") if ch.isdigit())
 
 @app.get("/health")
 async def health(): return JSONResponse({"ok": True})
@@ -38,7 +23,8 @@ async def health(): return JSONResponse({"ok": True})
 @app.get("/diag_runtime")
 async def diag_runtime():
     keys = ["CR_TTS_PROVIDER","CR_LANGUAGE","CR_TRANSCRIPTION_LANGUAGE","CR_VOICE",
-            "CR_WELCOME","SPEAK_SLEEP_MS","ASSIGN_URL","ASSIGN_URL_EXPANSION","ASSIGN_URL_SUPPORT"]
+            "CR_WELCOME","SPEAK_SLEEP_MS","COOLDOWN_MS","MIN_TTS_GAP_MS","POST_PROMPT_OFF",
+            "ASSIGN_URL","ASSIGN_URL_EXPANSION","ASSIGN_URL_SUPPORT"]
     return JSONResponse({k: _env(k) for k in keys})
 
 @app.api_route("/voice/answer_cr", methods=["GET","POST"])
@@ -47,7 +33,8 @@ async def answer_cr(request: Request):
     ws = f"wss://{host}/cr"
     lang = _env("CR_LANGUAGE","es-ES"); tr=_env("CR_TRANSCRIPTION_LANGUAGE",lang)
     prov=_env("CR_TTS_PROVIDER","Google"); voice=_env("CR_VOICE","es-ES-Standard-A")
-    welcome=_env("CR_WELCOME","")
+    welcome=_env("CR_WELCOME","")  # Ej.: Bienvenido a SpainRoom.
+    # Sin barge-in para máxima estabilidad (no cierra el WS al pisar)
     attrs = [f"url={quoteattr(ws)}", f"language={quoteattr(lang)}", f"transcriptionLanguage={quoteattr(tr)}",
              f"ttsProvider={quoteattr(prov)}", 'interruptible="speech"', 'reportInputDuringAgentSpeech="none"']
     if welcome.strip(): attrs.append(f"welcomeGreeting={quoteattr(welcome.strip())}")
@@ -55,34 +42,33 @@ async def answer_cr(request: Request):
     twiml = '<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Connect>\n    <ConversationRelay %s />\n  </Connect>\n</Response>' % (" ".join(attrs))
     return _twiml(twiml)
 
-@app.post("/voice/fallback")
-async def voice_fallback():
-    return _twiml('<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say language="es-ES">Disculpe. Estamos teniendo problemas. Inténtelo más tarde.</Say>\n</Response>')
-
 # ---------------- WebSocket ConversationRelay (ES) ----------------
-from fastapi import WebSocket
-
 @app.websocket("/cr")
 async def cr(ws: WebSocket):
     await ws.accept()
-    COOLDOWN_MS = 1200
+    COOLDOWN_MS = int(_env("COOLDOWN_MS","3000"))      # 3 s anti eco
+    MIN_TTS_GAP_MS = int(_env("MIN_TTS_GAP_MS","600")) # evita TTS pegadas
+    POST_PROMPT_OFF = _env("POST_PROMPT_OFF","1") == "1"  # por defecto NO preguntar en post
+    SPEAK_SLEEP_MS = int(_env("SPEAK_SLEEP_MS","0"))
     session: Dict[str, Any] = {
         "step": "await_setup",
         "lead": {"role":"","poblacion":"","zona":"","nombre":"","telefono":""},
         "last_q": None, "last_q_ts": 0.0,
         "last_user": None, "last_user_ts": 0.0,
-        # Franquicia
-        "fr_mode": None,        # None|prospect|support
-        "fr_categoria": "",     # pagos|contratos|crm|operativa|incidencia
-        "fr_detalle": ""
+        "last_tts_ts": 0.0,
+        "fr_mode": None, "fr_categoria":"", "fr_detalle":""
     }
     def _now(): return time.monotonic()*1000.0
     def _norm(t): return re.sub(r"\s+"," ",(t or "").strip())
 
     async def speak(txt, interruptible=True):
+        now=_now()
+        if (now - session["last_tts_ts"]) < MIN_TTS_GAP_MS:  # freno
+            return
         await ws.send_json({"type":"text","token":txt,"last":True,"interruptible":bool(interruptible)})
+        session["last_tts_ts"] = _now()
         try:
-            import asyncio; await asyncio.sleep(int(_env("SPEAK_SLEEP_MS","0"))/1000.0)
+            import asyncio; await asyncio.sleep(SPEAK_SLEEP_MS/1000.0)
         except Exception: pass
 
     def _dup_user(t):
@@ -99,169 +85,193 @@ async def cr(ws: WebSocket):
             "city":"¿En qué población está interesado?",
             "zone":"¿Qué zona o barrio?",
             "name":"¿Su nombre completo?",
-            "phone":"¿Su teléfono de contacto, por favor?",
-            "post":"¿Desea más información o ayuda?",
-            "fr_type":"¿Es franquiciado actual o desea información de franquicia?",
-            "fr_city":"¿En qué ciudad o zona desea operar?",
-            "fr_exp":"¿Tiene experiencia inmobiliaria u operativa?",
-            "fr_cat":"Motivo de soporte: pagos, contratos, CRM, operativa o incidencias?",
-            "fr_det":"¿Detalle breve del caso?"
+            "phone":"¿Su teléfono de contacto, por favor?"
         }
-        await speak(prompts.get(key,""))
+        if key in prompts: await speak(prompts[key])
+
+    # Detectores
+    INFO_RE = re.compile(r"\b(info|informaci[oó]n|m[aá]s info|saber m[aá]s|cu[ée]ntame|dime|explica|detalles)\b", re.I)
+    HELP_RE = re.compile(r"\b(ayuda|asesor|llamar|contacto|por favor|tel[eé]fono)\b", re.I)
+    PRICES_RE = re.compile(r"\b(precio|precios|tarifa|coste|costos)\b", re.I)
+    CONTRACT_RE = re.compile(r"\b(contrato|firm[ao]|logalty)\b", re.I)
+    PROCESS_RE = re.compile(r"\b(proceso|pasos|c[oó]mo func|como func)\b", re.I)
+    DOCS_RE = re.compile(r"\b(document|dni|pasaporte|papeles)\b", re.I)
+    FR_RE = re.compile(r"\b(franquic|royalty|licencia|territor|expansi[oó]n|soy franquiciado|mi zona)\b", re.I)
+
+    async def info_general():
+        await speak("SpainRoom alquila habitaciones medio y largo plazo. No somos hotel.")
+        await speak("Proceso: solicitud, verificación, contrato digital y entrada.")
+        await speak("¿Qué desea saber? Precios, contrato, proceso o documentación.")
+
+    async def info_topic(tl: str) -> bool:
+        if PRICES_RE.search(tl):
+            await speak("El precio depende de ciudad y habitación. Mínimo un mes.")
+            await speak("Podemos comparar opciones en su presupuesto.")
+            return True
+        if CONTRACT_RE.search(tl):
+            await speak("Contrato electrónico con validez legal y justificantes.")
+            await speak("Todo el proceso es online y trazable.")
+            return True
+        if PROCESS_RE.search(tl):
+            await speak("Pasos: solicitud, verificación, contrato digital y entrada.")
+            await speak("Le guiamos en cada paso y resolvemos dudas.")
+            return True
+        if DOCS_RE.search(tl):
+            await speak("Inquilino: DNI o pasaporte y teléfono verificado.")
+            await speak("Podemos pedir referencias si procede.")
+            return True
+        return False
 
     async def finish_normal():
         lead=session["lead"].copy()
         await speak("Gracias. Tomamos sus datos. Le contactaremos en breve.", interruptible=False)
         url = _env("ASSIGN_URL","")
         if url:
-            try: await _post_json(url, lead, timeout=2.0)
+            try:
+                import urllib.request
+                req = urllib.request.Request(url, data=json.dumps(lead, ensure_ascii=False).encode("utf-8"),
+                                             headers={"Content-Type":"application/json"})
+                with urllib.request.urlopen(req, timeout=2.0) as r: _ = r.read()
             except Exception: pass
         print("<<LEAD>>"+json.dumps(lead, ensure_ascii=False)+"<<END>>", flush=True)
-        session["step"]="post"; await ask_once("post")
+        session["step"]="post"  # no preguntar en post
 
-    async def finish_franchise():
-        # Construye payload según modo
-        if session["fr_mode"]=="prospect":
-            payload = {
-                "lead_type":"franchise_prospect",
-                "nombre": session["lead"].get("nombre",""),
-                "telefono": session["lead"].get("telefono",""),
-                "ciudad": session["lead"].get("poblacion",""),
-                "zona": session["lead"].get("zona",""),
-                "experiencia": _norm(session.get("fr_detalle",""))
-            }
+    async def finish_franchise(mode: str):
+        if mode=="prospect":
+            payload = {"lead_type":"franchise_prospect",
+                       "nombre": session["lead"].get("nombre",""),
+                       "telefono": session["lead"].get("telefono",""),
+                       "ciudad": session["lead"].get("poblacion",""),
+                       "zona": session["lead"].get("zona",""),
+                       "experiencia": ""}
             url = _env("ASSIGN_URL_EXPANSION", _env("ASSIGN_URL",""))
             await speak("Gracias. Expansión le llamará en 24–48 horas.", interruptible=False)
         else:
-            payload = {
-                "lead_type":"franchisee_support",
-                "nombre": session["lead"].get("nombre",""),
-                "zona": session["lead"].get("zona",""),
-                "email_corp":"",   # opcional por voz
-                "telefono": session["lead"].get("telefono",""),
-                "categoria": session.get("fr_categoria",""),
-                "detalle": _norm(session.get("fr_detalle","")),
-                "prioridad":"media"
-            }
+            payload = {"lead_type":"franchisee_support",
+                       "nombre": session["lead"].get("nombre",""),
+                       "zona": session["lead"].get("zona",""),
+                       "email_corp":"",
+                       "telefono": session["lead"].get("telefono",""),
+                       "categoria": session["fr_categoria"],
+                       "detalle": session["fr_detalle"],
+                       "prioridad":"media"}
             url = _env("ASSIGN_URL_SUPPORT", _env("ASSIGN_URL",""))
             await speak("Gracias. Soporte franquiciados registra su caso hoy.", interruptible=False)
         if url:
-            try: await _post_json(url, payload, timeout=2.0)
+            try:
+                import urllib.request
+                req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                             headers={"Content-Type":"application/json"})
+                with urllib.request.urlopen(req, timeout=2.0) as r: _ = r.read()
             except Exception: pass
         print("<<LEAD>>"+json.dumps(payload, ensure_ascii=False)+"<<END>>", flush=True)
-        session["step"]="post"; await ask_once("post")
+        session["step"]="post"
 
-    def _is_help(tl:str)->bool:
-        return any(w in tl for w in ["ayuda","asesor","llamar","contacto","por favor"])
+    async def handle(txt: str):
+        t=_norm(txt); tl=t.lower()
+        now=_now()
+        if session["last_user"]==tl and (now-session["last_user_ts"])<COOLDOWN_MS: return
+        session["last_user"]=tl; session["last_user_ts"]=now
 
-    def _fr_hit(tl:str)->bool:
-        return any(w in tl for w in ["franquic","royalty","licencia","zona","territor","expansion","expansión","soporte franquic","soy franquiciado"])
+        s=session["step"]; lead=session["lead"]
 
-    async def handle(txt:str):
-        if _dup_user(txt): return
-        t=_norm(txt); tl=t.lower(); s=session["step"]; lead=session["lead"]
+        # Franquicia
+        if FR_RE.search(tl) and session["fr_mode"] is None:
+            session["fr_mode"]="ask"; await speak("¿Es franquiciado actual o desea información de franquicia?"); return
 
-        # FRANQUICIA: detección en cualquier momento
-        if _fr_hit(tl) and session["fr_mode"] is None:
-            session["fr_mode"]="ask"  # pedir tipo
-            await ask_once("fr_type"); return
-
-        # Ayuda / escalado normal
-        if _is_help(tl) and session["fr_mode"] is None:
+        # Ayuda
+        if HELP_RE.search(tl) and session["fr_mode"] is None:
             if not lead.get("telefono"):
                 session["step"]="phone"; await speak("Para ayudarle ahora, ¿su teléfono de contacto?"); return
             await speak(f"De acuerdo. Un asesor le llamará al {lead['telefono']} en breve.")
-            session["step"]="post"; await ask_once("post"); return
+            session["step"]="post"; return
 
-        # Flujo FRANQUICIA
-        if session["fr_mode"]:
-            if session["fr_mode"]=="ask":
+        # Información (general o por tema)
+        if session["fr_mode"] is None and (INFO_RE.search(tl) or PRICES_RE.search(tl) or CONTRACT_RE.search(tl) or PROCESS_RE.search(tl) or DOCS_RE.search(tl)):
+            if not await info_topic(tl):
+                await info_general()
+            return
+
+        # Franquicia det
+        if session.get("fr_mode"):
+            mode=session["fr_mode"]
+            if mode=="ask":
                 if "actual" in tl or "soy franquiciado" in tl:
-                    session["fr_mode"]="support"; session["step"]="fr_cat"; await ask_once("fr_cat"); return
+                    session["fr_mode"]="support"; session["step"]="fr_cat"; await speak("Motivo: pagos, contratos, CRM, operativa o incidencias?"); return
                 if "informaci" in tl or "ser franquiciado" in tl or "abrir" in tl:
-                    session["fr_mode"]="prospect"; session["step"]="fr_city"; await ask_once("fr_city"); return
-                await ask_once("fr_type"); return
-            if session["fr_mode"]=="prospect":
+                    session["fr_mode"]="prospect"; session["step"]="fr_city"; await speak("¿En qué ciudad o zona desea operar?"); return
+                await speak("¿Es franquiciado actual o desea información de franquicia?"); return
+            if mode=="prospect":
                 if s=="fr_city":
-                    if len(tl)>=2: lead["poblacion"]=t.title(); session["step"]="zone"; await ask_once("zone"); return
-                    await ask_once("fr_city"); return
+                    if len(tl)>=2: lead["poblacion"]=t.title(); session["step"]="zone"; await speak("¿Qué zona o barrio?"); return
+                    await speak("¿En qué ciudad o zona desea operar?"); return
                 if s=="zone":
-                    if len(tl)>=2: lead["zona"]=t.title(); session["step"]="name"; await ask_once("name"); return
-                    await ask_once("zone"); return
+                    if len(tl)>=2: lead["zona"]=t.title(); session["step"]="name"; await speak("¿Su nombre completo?"); return
+                    await speak("¿Qué zona o barrio?"); return
                 if s=="name":
-                    if len(t.split())>=2: lead["nombre"]=t; session["step"]="phone"; await ask_once("phone"); return
+                    if len(t.split())>=2: lead["nombre"]=t; session["step"]="phone"; await speak("¿Su teléfono de contacto?"); return
                     await speak("¿Su nombre completo, por favor?"); return
                 if s=="phone":
                     d=_digits(t); 
                     if d.startswith("34") and len(d)>=11: d=d[-9:]
-                    if len(d)==9 and d[0] in "6789": lead["telefono"]=d; session["step"]="fr_exp"; await ask_once("fr_exp"); return
+                    if len(d)==9 and d[0] in "6789": lead["telefono"]=d; session["step"]="fr_exp"; await speak("¿Tiene experiencia inmobiliaria u operativa?"); return
                     await speak("¿Me facilita un teléfono de nueve dígitos?"); return
                 if s=="fr_exp":
-                    session["fr_detalle"]=t; await finish_franchise(); return
-            if session["fr_mode"]=="support":
+                    session["fr_detalle"]=t; await finish_franchise("prospect"); return
+            if mode=="support":
                 if s=="fr_cat":
                     cats = ["pagos","contratos","crm","operativa","incidenc"]
                     for c in cats:
-                        if c in tl: session["fr_categoria"]="pagos" if "pago" in tl else ("contratos" if "contrato" in tl else ("crm" if "crm" in tl else ("operativa" if "operat" in tl else "incidencia")))
-                    session["step"]="fr_det"; await ask_once("fr_det"); return
+                        if c in tl:
+                            session["fr_categoria"]="pagos" if "pago" in tl else ("contratos" if "contrato" in tl else ("crm" if "crm" in tl else ("operativa" if "operat" in tl else "incidencia")))
+                            break
+                    session["step"]="fr_det"; await speak("¿Detalle breve del caso?"); return
                 if s=="fr_det":
                     session["fr_detalle"]=t
-                    # Asegurar teléfono
                     if not lead.get("telefono"):
-                        session["step"]="phone"; await ask_once("phone"); return
-                    await finish_franchise(); return
+                        session["step"]="phone"; await speak("¿Su teléfono de contacto?"); return
+                    await finish_franchise("support"); return
                 if s=="phone":
                     d=_digits(t); 
                     if d.startswith("34") and len(d)>=11: d=d[-9:]
-                    if len(d)>=9: lead["telefono"]=d; await finish_franchise(); return
+                    if len(d)>=9: lead["telefono"]=d; await finish_franchise("support"); return
                     await speak("¿Me facilita un teléfono de nueve dígitos?"); return
-            # En cualquier otro caso dentro de franquicia, pide tipo
-            await ask_once("fr_type"); return
+            await speak("¿Es franquiciado actual o desea información de franquicia?"); return
 
-        # Flujo normal de captación 5 campos
+        # Flujo normal (5 campos)
         if s=="role":
-            if "propiet" in tl: lead["role"]="propietario"; session["step"]="city"; await speak("Gracias."); await ask_once("city"); return
-            if "inquil" in tl or "alquil" in tl: lead["role"]="inquilino"; session["step"]="city"; await speak("Gracias."); await ask_once("city"); return
-            await ask_once("role"); return
+            if "propiet" in tl: lead["role"]="propietario"; session["step"]="city"; await speak("Gracias."); await speak("¿En qué población está interesado?"); return
+            if "inquil" in tl or "alquil" in tl: lead["role"]="inquilino"; session["step"]="city"; await speak("Gracias."); await speak("¿En qué población está interesado?"); return
+            await speak("Para atenderle: ¿Es usted propietario o inquilino?"); return
         if s=="city":
-            if len(tl)>=2: lead["poblacion"]=t.title(); session["step"]="zone"; await ask_once("zone"); return
-            await ask_once("city"); return
+            if len(tl)>=2: lead["poblacion"]=t.title(); session["step"]="zone"; await speak("¿Qué zona o barrio?"); return
+            await speak("¿En qué población está interesado?"); return
         if s=="zone":
-            if len(tl)>=2: lead["zona"]=t.title(); session["step"]="name"; await ask_once("name"); return
-            await ask_once("zone"); return
+            if len(tl)>=2: lead["zona"]=t.title(); session["step"]="name"; await speak("¿Su nombre completo?"); return
+            await speak("¿Qué zona o barrio?"); return
         if s=="name":
-            if len(t.split())>=2: lead["nombre"]=t; session["step"]="phone"; await ask_once("phone"); return
+            if len(t.split())>=2: lead["nombre"]=t; session["step"]="phone"; await speak("¿Su teléfono de contacto, por favor?"); return
             await speak("¿Su nombre completo, por favor?"); return
         if s=="phone":
             d=_digits(t); 
             if d.startswith("34") and len(d)>=11: d=d[-9:]
             if len(d)==9 and d[0] in "6789": lead["telefono"]=d; await finish_normal(); return
             await speak("¿Me facilita un teléfono de nueve dígitos?"); return
+
         if s=="post":
-            await speak("¿Necesita algo más?"); return
-        # await_setup: ignore
+            # Por defecto, no preguntar nada en post (evita bucle de “¿Necesita algo más?”)
+            return
 
-    try:
-        while True:
-            msg = await ws.receive_json()
-            tp = msg.get("type")
-            if tp=="setup": session["step"]="role"; await ask_once("role")
-            elif tp=="prompt":
-                txt = msg.get("voicePrompt","") or ""
-                if msg.get("last", True) and txt: await handle(txt)
-            elif tp=="interrupt":
-                session["last_q_ts"] = _now()
-            elif tp=="error":
-                await ws.send_json({"type":"text","token":"Disculpe. Estamos teniendo problemas.","last":True,"interruptible":False}); break
-    except Exception as e:
-        print("CR ws error:", e, flush=True)
-    finally:
-        with contextlib.suppress(Exception): await ws.close()
-
-# --- Optional: /assign passthrough (sigue disponible) ---
+# --- /assign passthrough ---
 @app.post("/assign")
 async def assign(payload: dict):
     zone_key = f"{(payload.get('poblacion') or payload.get('ciudad','') or '').strip().lower()}-{(payload.get('zona','') or '').strip().lower()}"
     fid = hashlib.sha1(zone_key.encode("utf-8")).hexdigest()[:10]
     task = {"title":"Contactar lead","zone_key":zone_key,"franchisee_id":fid,"lead":payload,"created_at":int(time.time())}
     return JSONResponse({"ok": True, "task": task})
+""")
+
+with open('/mnt/data/codigo_flask.py','w',encoding='utf-8') as f:
+    f.write(code)
+
+print("/mnt/data/codigo_flask.py")
