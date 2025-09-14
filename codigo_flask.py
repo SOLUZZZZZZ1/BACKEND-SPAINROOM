@@ -1,5 +1,5 @@
 
-# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (Info x3 + Goodbye)
+# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (Info x3 + Urgencia + Goodbye)
 # Start: python -m uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
 
 import os, json, re, time, contextlib, hashlib
@@ -55,7 +55,9 @@ async def cr(ws: WebSocket):
         "lead": {"role":"","poblacion":"","zona":"","nombre":"","telefono":""},
         "last_q": None, "last_q_ts": 0.0,
         "last_user": None, "last_user_ts": 0.0,
-        "last_tts_ts": 0.0
+        "last_tts_ts": 0.0,
+        "help_pending": False,
+        "urgencia": ""  # inmediata | hoy | mañana | sin_prisa
     }
 
     def _now(): return time.monotonic()*1000.0
@@ -88,6 +90,9 @@ async def cr(ws: WebSocket):
             "phone":"¿Su teléfono de contacto, por favor?"
         }
         if key in prompts: await speak(prompts[key])
+
+    async def ask_urgency():
+        await speak("¿Nivel de urgencia del contacto? Inmediata, hoy, mañana o sin prisa.")
 
     # Intents
     HELP_RE  = re.compile(r"\b(ayuda|asesor|llamar|contacto|tel[eé]fono)\b", re.I)
@@ -125,9 +130,29 @@ async def cr(ws: WebSocket):
             return True
         return False
 
-    async def finish_lead():
+    def _norm_urg(tl: str) -> str:
+        tl = tl.lower()
+        if "inmedi" in tl or "ahora" in tl or "urgent" in tl: return "inmediata"
+        if "hoy" in tl: return "hoy"
+        if "mañ" in tl or "manana" in tl: return "mañana"
+        if "sin prisa" in tl or "cuando puedas" in tl: return "sin_prisa"
+        # por defecto, hoy si no está claro
+        return "hoy"
+
+    async def finish_lead(origen="lead"):
         lead=session["lead"].copy()
-        await speak("Gracias. Tomamos sus datos. Le contactaremos en breve.", interruptible=False)
+        if session.get("urgencia"): lead["urgencia"]=session["urgencia"]
+        if origen=="lead":
+            await speak("Gracias. Tomamos sus datos. Le contactaremos en breve.", interruptible=False)
+        elif origen=="help":
+            texto = {
+                "inmediata": "Gracias. Le llamamos de inmediato.",
+                "hoy": "Gracias. Le llamamos hoy.",
+                "mañana": "Gracias. Le llamamos mañana.",
+                "sin_prisa": "Gracias. Le llamamos en breve, sin prisa."
+            }[lead.get("urgencia","hoy")]
+            await speak(texto, interruptible=False)
+
         url=_env("ASSIGN_URL","")
         if url:
             try:
@@ -144,12 +169,24 @@ async def cr(ws: WebSocket):
         if _dup_user(t): return
         s=session["step"]; lead=session["lead"]
 
-        # Ayuda
-        if HELP_RE.search(tl):
+        # Escalado ayuda → pedir urgencia
+        if HELP_RE.search(tl) and not session["help_pending"]:
+            session["help_pending"]=True
             if not lead.get("telefono"):
                 session["step"]="phone"; await speak("Para ayudarle ahora, ¿su teléfono de contacto?"); return
-            await speak(f"De acuerdo. Un asesor le llamará al {lead['telefono']} en breve.")
-            session["step"]="post"; return
+            session["step"]="urgency"; await ask_urgency(); return
+
+        # Estado 'urgency': guardar y cerrar con finish_lead('help')
+        if s=="urgency":
+            session["urgencia"]=_norm_urg(tl)
+            await finish_lead(origen="help"); return
+
+        # Si acabamos de pedir teléfono por ayuda, al recibirlo ir a urgencia
+        if s=="phone" and session["help_pending"]:
+            d="".join(ch for ch in t if ch.isdigit())
+            if d.startswith("34") and len(d)>=11: d=d[-9:]
+            if len(d)>=9: lead["telefono"]=d; session["step"]="urgency"; await ask_urgency(); return
+            await speak("¿Me facilita un teléfono de nueve dígitos?"); return
 
         # Información (dos o tres líneas). Si ya estamos en post → despedida y colgar.
         if INFO_RE.search(tl):
@@ -163,7 +200,7 @@ async def cr(ws: WebSocket):
                 except Exception: pass
             return
 
-        # 5 campos
+        # 5 campos estándar
         if s=="role":
             if "propiet" in tl: lead["role"]="propietario"; session["step"]="city"; await speak("Gracias."); await ask_once("city"); return
             if "inquil" in tl or "alquil" in tl: lead["role"]="inquilino"; session["step"]="city"; await speak("Gracias."); await ask_once("city"); return
