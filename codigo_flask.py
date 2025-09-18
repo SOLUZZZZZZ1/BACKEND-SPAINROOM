@@ -1,13 +1,13 @@
-# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE (Ayuda en post + De-dup)
+# SpainRoom — Voice Backend (ConversationRelay) — ES STABLE
 # Start: uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
 
 import os, json, re, time, contextlib, hashlib
 from typing import Dict, Any
-from fastapi import FastAPI, Request, WebSocket, Header
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response, JSONResponse, HTMLResponse
 from xml.sax.saxutils import quoteattr
 
-app = FastAPI(title="SpainRoom Voice — ConversationRelay (ES STABLE, Ayuda)")
+app = FastAPI(title="SpainRoom Voice — ConversationRelay (ES)")
 
 def _twiml(xml: str) -> Response:
     return Response(content=xml, media_type="application/xml")
@@ -53,7 +53,7 @@ async def diag_runtime():
             "CR_WELCOME","SPEAK_SLEEP_MS","ASSIGN_URL"]
     return JSONResponse({k: _env(k) for k in keys})
 
-# PRIMARY: aceptar GET y POST y devolver ConversationRelay
+# PRIMARY: aceptar GET y POST, devolver ConversationRelay
 @app.api_route("/voice/answer_cr", methods=["GET","POST"])
 async def answer_cr(request: Request):
     host = _normalize_ws_host(request)
@@ -83,7 +83,7 @@ async def answer_cr(request: Request):
 async def voice_fallback(request: Request):
     return await answer_cr(request)
 
-# ---------------- Conocimiento SpainRoom + De-dup ----------------
+# ---------------- Conocimiento SpainRoom ----------------
 KNOWLEDGE: Dict[str, Dict[str, Any]] = {
     "que_hace": {
         "patterns": ["que hac","qué hac","quienes sois","qué es spainroom","que es spainroom"],
@@ -182,129 +182,3 @@ async def conversation_relay(ws: WebSocket):
         session["last_user"]=t; session["last_user_ts"]=now; return False
 
     async def ask_once(step_key: str):
-        now=_now_ms()
-        if session["last_q"] == step_key and (now - session["last_q_ts"]) < 1200: return
-        session["last_q"]=step_key; session["last_q_ts"]=now
-        prompts={
-            "role":"Para atenderle: ¿Es usted propietario o inquilino?",
-            "city":"¿En qué población está interesado?",
-            "zone":"¿Qué zona o barrio?",
-            "name":"¿Su nombre completo?",
-            "phone":"¿Su teléfono de contacto, por favor?",
-            "post":"¿Desea más información o ayuda?"
-        }
-        await speak(prompts.get(step_key,""))
-
-    def _match_topic(tl: str):
-        for k, cfg in KNOWLEDGE.items():
-            for pat in cfg["patterns"]:
-                if pat in tl:
-                    return k
-        return None
-
-    def _is_yes_help(tl: str) -> bool:
-        tl=tl.lower()
-        yes_words = ["ayuda","asesor","llamar","llamada","contacto","sí","si ","quiero","necesito","por favor"]
-        return any(w in tl for w in yes_words)
-
-    async def answer_topic(topic: str):
-        idx = session["info_hits"].get(topic,0)
-        answers = KNOWLEDGE[topic]["answers"]
-        text = answers[idx % len(answers)]
-        session["info_hits"][topic] = idx + 1
-        await speak(text)
-
-    async def finish():
-        lead=session["lead"].copy()
-        await speak("Gracias. Tomamos sus datos. Le contactaremos en breve.", interruptible=False)
-        au=_env("ASSIGN_URL","")
-        if au:
-            try: await _post_json(au, lead, timeout=2.0)
-            except Exception: pass
-        print("<<LEAD>>"+json.dumps(lead, ensure_ascii=False)+"<<END>>", flush=True)
-        session["step"]="post"; await ask_once("post")
-
-    async def handle_text(user_text: str):
-        if _dup_user(user_text): return
-        t=_norm(user_text); tl=t.lower(); s=session["step"]; lead=session["lead"]
-
-        # Ayuda explícita en cualquier momento
-        if _is_yes_help(tl):
-            if not lead.get("telefono"):
-                session["step"]="phone"
-                await speak("Perfecto. Para ayudarle ahora mismo, ¿su teléfono de contacto?")
-                return
-            else:
-                await speak(f"De acuerdo. Un asesor le llamará al {lead['telefono']} en breve.")
-                session["step"]="post"
-                await ask_once("post")
-                return
-
-        topic = _match_topic(tl)
-        if topic:
-            await answer_topic(topic)
-            if s != "await_setup":
-                await ask_once(s)
-            return
-
-        if s=="post":
-            await speak("¿Quiere que le llame un asesor? Si es así, dígame 'ayuda'.")
-            return
-
-        if s=="role":
-            if "propiet" in tl:
-                lead["role"]="propietario"; session["step"]="city"; await speak("Gracias."); await ask_once("city")
-            elif "inquil" in tl or "alquil" in tl:
-                lead["role"]="inquilino";  session["step"]="city"; await speak("Gracias."); await ask_once("city")
-            else:
-                await ask_once("role")
-
-        elif s=="city":
-            if len(tl)>=2: lead["poblacion"]=t.title(); session["step"]="zone"; await ask_once("zone")
-            else: await ask_once("city")
-
-        elif s=="zone":
-            if len(tl)>=2: lead["zona"]=t.title(); session["step"]="name"; await ask_once("name")
-            else: await ask_once("zone")
-
-        elif s=="name":
-            if len(t.split())>=2: lead["nombre"]=t; session["step"]="phone"; await ask_once("phone")
-            else: await speak("¿Su nombre completo, por favor?")
-
-        elif s=="phone":
-            d=_digits(t); 
-            if d.startswith("34") and len(d)>=11: d=d[-9:]
-            if len(d)==9 and d[0] in "6789": lead["telefono"]=d; await finish()
-            else: await speak("¿Me facilita un teléfono de nueve dígitos?")
-
-        elif s=="await_setup":
-            # Si por lo que sea pasara, volvemos a arrancar
-            session["step"]="role"; await ask_once("role")
-
-    try:
-        while True:
-            msg = await ws.receive_json()
-            tp = msg.get("type")
-            if tp=="setup":
-                session["step"]="role"; await ask_once("role")
-            elif tp=="prompt":
-                txt = msg.get("voicePrompt","") or ""
-                if msg.get("last", True) and txt: await handle_text(txt)
-            elif tp=="interrupt":
-                await ask_once(session["step"])
-            elif tp=="dtmf":
-                pass
-            elif tp=="error":
-                await speak("Disculpe. Estamos teniendo problemas. Inténtelo más tarde.", interruptible=False); break
-    except Exception as e:
-        print("CR ws error:", e, flush=True)
-    finally:
-        with contextlib.suppress(Exception):
-            await ws.close()
-
-@app.post("/assign")
-async def assign(payload: dict):
-    zone_key = f"{(payload.get('poblacion') or '').strip().lower()}-{(payload.get('zona') or '').strip().lower()}"
-    fid = hashlib.sha1(zone_key.encode("utf-8")).hexdigest()[:10]
-    task = {"title":"Contactar lead","zone_key":zone_key,"franchisee_id":fid,"lead":payload,"created_at":int(time.time())}
-    return JSONResponse({"ok": True, "task": task})
