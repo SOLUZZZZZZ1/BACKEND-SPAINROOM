@@ -30,6 +30,20 @@ SQLALCHEMY_DATABASE_URI = f"sqlite:///{DB_PATH}"
 
 db = SQLAlchemy()
 
+# --- helper para cargar módulos locales por ruta cuando no hay paquete ---
+import importlib.util as _importlib_util
+
+def _load_local_module(_name: str, _path: str):
+    """Carga un .py concreto por ruta, evitando colisiones de nombre."""
+    _path = str(_path)
+    if not os.path.exists(_path):
+        raise FileNotFoundError(_path)
+    _spec = _importlib_util.spec_from_file_location(f"_fr_{_name}", _path)
+    _mod = _importlib_util.module_from_spec(_spec)
+    assert _spec and _spec.loader
+    _spec.loader.exec_module(_mod)
+    return _mod
+
 
 def create_app():
     app = Flask(__name__, instance_path=str(INSTANCE_DIR))
@@ -75,8 +89,15 @@ def create_app():
     # Importar modelos de Franquicia si el flag está activo (para que create_all cree tablas)
     try:
         if os.getenv("BACKEND_FEATURE_FRANQ_PLAZAS", "off").lower() == "on":
-            from franquicia import models as _fr_models  # noqa: F401
-            print("[FRANQ] Modelos de Franquicia importados (flag ON).")
+            try:
+                # Preferencia: paquete franquicia/
+                from franquicia import models as _fr_models  # noqa: F401
+                print("[FRANQ] Modelos de Franquicia importados (paquete).")
+            except Exception:
+                # Fallback: ficheros sueltos en RAÍZ (models.py)
+                _models_path = BASE_DIR / "models.py"
+                _fr_models = _load_local_module("models", _models_path)  # noqa: F401
+                print("[FRANQ] Modelos de Franquicia importados (raíz).")
         else:
             print("[FRANQ] Flag OFF: no se importan modelos de Franquicia.")
     except Exception as e:
@@ -135,7 +156,17 @@ def create_app():
     # =========================
     try:
         if os.getenv("BACKEND_FEATURE_FRANQ_PLAZAS", "off").lower() == "on":
-            from franquicia.routes import bp_franquicia
+            try:
+                # Preferencia: paquete franquicia/
+                from franquicia.routes import bp_franquicia
+                print("[FRANQ] Blueprint (paquete) localizado.")
+            except Exception:
+                # Fallback: fichero suelto en RAÍZ (routes.py) con bp_franquicia
+                _routes_path = BASE_DIR / "routes.py"
+                _fr_routes = _load_local_module("routes", _routes_path)
+                bp_franquicia = getattr(_fr_routes, "bp_franquicia")
+                print("[FRANQ] Blueprint (raíz) localizado.")
+
             app.register_blueprint(bp_franquicia, url_prefix="/api/admin/franquicia")
             print("[FRANQ] Blueprint Franquicia (interno) registrado.")
         else:
