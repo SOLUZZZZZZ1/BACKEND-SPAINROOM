@@ -73,7 +73,7 @@ async def answer_cr(request: Request):
     trans_lang = _env("CR_TRANSCRIPTION_LANGUAGE", lang)
     tts_provider = _env("CR_TTS_PROVIDER", "Google")
     tts_voice = _env("CR_VOICE", "")
-    welcome = _env("CR_WELCOME", "")  # RECOMENDADO: "Bienvenido a SpainRoom."
+    welcome = _env("CR_WELCOME", "")  # recomendado: "Bienvenido a SpainRoom."
     attrs = [
         f"url={quoteattr(ws_url)}",
         f"language={quoteattr(lang)}",
@@ -98,10 +98,10 @@ async def answer_cr(request: Request):
 
 @app.api_route("/voice/fallback", methods=["GET", "POST"])
 async def voice_fallback(request: Request):
-    # Fallback idéntico: ConversationRelay (no <Say>), así Twilio guarda sin error y siempre usa Google.
+    # Fallback idéntico: ConversationRelay
     return await answer_cr(request)
 
-# === Conocimiento ============================================================
+# === Conocimiento y utilidades de intención =================================
 
 KNOWLEDGE: Dict[str, Dict[str, Any]] = {
     "que_hace": {
@@ -133,4 +133,284 @@ KNOWLEDGE: Dict[str, Dict[str, Any]] = {
         ],
     },
     "pagos": {
-        "patterns": ["pago", "stripe
+        "patterns": ["pago", "stripe", "cobro", "tarjeta"],
+        "answers": [
+            "Los pagos son seguros con Stripe. La plataforma cobra y gestiona las transferencias.",
+            "Propietarios y franquiciados reciben sus pagos según la política acordada.",
+        ],
+    },
+    "propietarios": {
+        # Patrones más explícitos para no chocar con 'propietario'
+        "patterns": ["info propietarios", "informacion propietarios", "para propietarios"],
+        "answers": [
+            "Para propietarios: publicamos, filtramos inquilinos, hacemos contrato y cobramos.",
+            "Requisitos básicos: cerradura, cama 135×200 y buen estado.",
+        ],
+    },
+    "soporte": {
+        "patterns": ["soporte", "ayuda", "contacto", "telefono", "teléfono", "llamar", "asesor"],
+        "answers": [
+            "Tiene soporte durante la estancia por chat y teléfono.",
+            "Si quiere, tomamos sus datos y le llama un asesor.",
+        ],
+    },
+    "contrato": {
+        "patterns": ["contrato", "logalty", "firma"],
+        "answers": [
+            "Los contratos se firman digitalmente con plena validez legal.",
+            "Guardamos los justificantes para auditoría y tranquilidad de ambas partes.",
+        ],
+    },
+}
+
+def _role_owner(tl: str) -> bool:
+    return bool(re.search(r"\bpropiet(ario|aria|arios|arias)?\b|\bdueñ[oa]s?\b", tl))
+
+def _role_tenant(tl: str) -> bool:
+    return bool(re.search(r"\binquil(in|ino|ina|inos|inas)?\b|\balquil(ar|o|a|as|amos|an)?\b", tl))
+
+def _match_topic(tl: str, step: str):
+    if step in ("role", "city", "zone", "name", "phone"):
+        return None
+    if _role_owner(tl) or _role_tenant(tl):
+        return None
+    for k, cfg in KNOWLEDGE.items():
+        for pat in cfg["patterns"]:
+            if pat in tl:
+                return k
+    return None
+
+def _is_yes_help(tl: str) -> bool:
+    tl = tl.lower()
+    yes_words = [" ayuda ", " asesor ", " llamar ", " llamada ", " contacto ", " por favor "]
+    s = f" {tl} "
+    return any(w in s for w in yes_words)
+
+# === Conversación (WS) =======================================================
+
+@app.websocket("/cr")
+async def conversation_relay(ws: WebSocket):
+    await ws.accept()
+
+    session: Dict[str, Any] = {
+        "step": "await_setup",
+        "lead": {"role": "", "poblacion": "", "zona": "", "nombre": "", "telefono": ""},
+        "last_q": None,
+        "last_q_ts": 0.0,
+        "last_user": None,
+        "last_user_ts": 0.0,
+        "info_hits": {k: 0 for k in KNOWLEDGE.keys()},
+    }
+
+    # ARRANQUE INMEDIATO — marcar como ya preguntado para evitar duplicados
+    now_ms = time.monotonic() * 1000.0
+    session["step"] = "role"
+    session["last_q"] = "role"
+    session["last_q_ts"] = now_ms
+    await ws.send_json({
+        "type": "text",
+        "token": "Para atenderle: ¿Es usted propietario o inquilino?",
+        "last": True,
+        "interruptible": True
+    })
+
+    def _now_ms() -> float:
+        return time.monotonic() * 1000.0
+
+    async def speak(text: str, interruptible: bool = True):
+        await ws.send_json({"type": "text", "token": text, "last": True, "interruptible": bool(interruptible)})
+        try:
+            import asyncio
+            await asyncio.sleep(int(_env("SPEAK_SLEEP_MS", "0")) / 1000.0)
+        except Exception:
+            pass
+
+    def _norm(t: str) -> str:
+        return re.sub(r"\s+", " ", (t or "").strip())
+
+    def _dup_user(t: str) -> bool:
+        t = _norm(t).lower()
+        now = _now_ms()
+        if session["last_user"] == t and (now - session["last_user_ts"]) < 1200:
+            return True
+        session["last_user"] = t
+        session["last_user_ts"] = now
+        return False
+
+    async def ask_once(step_key: str):
+        now = _now_ms()
+        if session["last_q"] == step_key and (now - session["last_q_ts"]) < 1200:
+            return
+        session["last_q"] = step_key
+        session["last_q_ts"] = now
+        prompts = {
+            "role": "Para atenderle: ¿Es usted propietario o inquilino?",
+            "city": "¿En qué población está interesado?",
+            "zone": "¿Qué zona o barrio?",
+            "name": "¿Su nombre completo?",
+            "phone": "¿Su teléfono de contacto, por favor?",
+            "post": "¿Desea más información o ayuda?",
+        }
+        await speak(prompts.get(step_key, ""))
+
+    async def answer_topic(topic: str):
+        idx = session["info_hits"].get(topic, 0)
+        answers = KNOWLEDGE[topic]["answers"]
+        text = answers[idx % len(answers)]
+        session["info_hits"][topic] = idx + 1
+        await speak(text)
+
+    async def finish():
+        lead = session["lead"].copy()
+        await speak("Gracias. Tomamos sus datos. Le contactaremos en breve.", interruptible=False)
+        print("<<LEAD>>" + json.dumps(lead, ensure_ascii=False) + "<<END>>", flush=True)
+        session["step"] = "post"
+        await ask_once("post")
+
+    async def handle_text(user_text: str):
+        if _dup_user(user_text):
+            return
+        t  = _norm(user_text)
+        tl = t.lower()
+        s  = session["step"]
+        lead = session["lead"]
+
+        # Ayuda explícita
+        if _is_yes_help(tl):
+            if not lead.get("nombre"):
+                session["step"] = "name"
+                await speak("Perfecto. Antes, ¿su nombre completo, por favor?")
+                return
+            if not lead.get("telefono"):
+                session["step"] = "phone"
+                await speak("De acuerdo. ¿Su teléfono de contacto?")
+                return
+            await speak(f"De acuerdo. Un asesor le llamará al {lead['telefono']} en breve.")
+            session["step"] = "post"
+            await ask_once("post")
+            return
+
+        # Si da muchos dígitos fuera de 'phone', reconducimos
+        if s != "phone":
+            only_digits = _digits(t)
+            if len(only_digits) >= 7:
+                if not lead.get("nombre"):
+                    session["step"] = "name"
+                    await speak("Tomamos nota, pero primero necesito su nombre completo, por favor.")
+                    return
+                session["step"] = "phone"
+                await speak("Ahora sí, ¿su teléfono de contacto, por favor?")
+                return
+
+        # Flujo por pasos
+        if s == "role":
+            if _role_owner(tl):
+                lead["role"] = "propietario"
+                session["step"] = "city"
+                await speak("Gracias.")
+                await ask_once("city")
+                return
+            if _role_tenant(tl):
+                lead["role"] = "inquilino"
+                session["step"] = "city"
+                await speak("Gracias.")
+                await ask_once("city")
+                return
+            await ask_once("role")
+            return
+
+        elif s == "city":
+            if len(tl) >= 2:
+                lead["poblacion"] = t.title()
+                session["step"] = "zone"
+                await ask_once("zone")
+                return
+            await ask_once("city")
+            return
+
+        elif s == "zone":
+            if len(tl) >= 2:
+                lead["zona"] = t.title()
+                session["step"] = "name"
+                await ask_once("name")
+                return
+            await ask_once("zone")
+            return
+
+        elif s == "name":
+            if len(t.split()) >= 2:
+                lead["nombre"] = t
+                session["step"] = "phone"
+                await ask_once("phone")
+                return
+            await speak("¿Su nombre completo, por favor?")
+            return
+
+        elif s == "phone":
+            d = _digits(t)
+            if d.startswith("34") and len(d) >= 11:
+                d = d[-9:]
+            if len(d) == 9 and d[0] in "6789":
+                lead["telefono"] = d
+                await finish()
+                return
+            await speak("¿Me facilita un teléfono de nueve dígitos?")
+            return
+
+        elif s == "post":
+            await speak("¿Quiere que le llame un asesor? Si es así, dígame 'ayuda'.")
+            return
+
+        elif s == "await_setup":
+            session["step"] = "role"
+            await ask_once("role")
+            return
+
+        # Conocimiento SOLO fuera del flujo principal
+        topic = _match_topic(tl, s)
+        if topic:
+            await answer_topic(topic)
+            if session["step"] != "await_setup":
+                await ask_once(session["step"])
+            return
+
+        await ask_once(session["step"])
+
+    try:
+        while True:
+            msg = await ws.receive_json()
+            tp = msg.get("type")
+            if tp == "setup":
+                # No re-preguntar si ya la hicimos al arrancar
+                if session.get("last_q") != "role":
+                    session["step"] = "role"
+                    await ask_once("role")
+            elif tp == "prompt":
+                txt = msg.get("voicePrompt", "") or ""
+                if msg.get("last", True) and txt:
+                    await handle_text(txt)
+            elif tp == "interrupt":
+                await ask_once(session["step"])
+            elif tp == "dtmf":
+                pass
+            elif tp == "error":
+                await speak("Disculpe. Estamos teniendo problemas. Inténtelo más tarde.", interruptible=False)
+                break
+    except Exception as e:
+        print("CR ws error:", e, flush=True)
+    finally:
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+@app.post("/assign")
+async def assign(payload: dict):
+    zone_key = f"{(payload.get('poblacion') or '').strip().lower()}-{(payload.get('zona') or '').strip().lower()}"
+    fid = hashlib.sha1(zone_key.encode("utf-8")).hexdigest()[:10]
+    task = {
+        "title": "Contactar lead",
+        "zone_key": zone_key,
+        "franchisee_id": fid,
+        "lead": payload,
+        "created_at": int(time.time()),
+    }
+    return JSONResponse({"ok": True, "task": task})
