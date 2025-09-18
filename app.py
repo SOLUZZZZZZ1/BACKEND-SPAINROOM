@@ -1,15 +1,14 @@
 # --- BEGIN: Fix sys.path for local modules ---
 import os, sys
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
+BASE_DIR_STR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR_STR not in sys.path:
+    sys.path.insert(0, BASE_DIR_STR)
 # --- END ---
 # -*- coding: utf-8 -*-
-import os
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, Blueprint
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from flask_sqlalchemy import SQLAlchemy
@@ -17,8 +16,8 @@ from flask_sqlalchemy import SQLAlchemy
 # =========================
 # Configuración base
 # =========================
-BASE_PATH = Path(__file__).resolve().parent
-INSTANCE_DIR = BASE_PATH / "instance"
+BASE_DIR = Path(BASE_DIR_STR)
+INSTANCE_DIR = BASE_DIR / "instance"
 UPLOAD_DIR = INSTANCE_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
@@ -29,54 +28,71 @@ SQLALCHEMY_DATABASE_URI = f"sqlite:///{DB_PATH}"
 db = SQLAlchemy()
 
 # =========================
-# Helpers de carga dinámica (fallback franquicia)
+# Helpers de carga (Franquicia)
 # =========================
 import importlib.util as _importlib_util
 import types as _types
 
-def _load_local_module(_name: str, _path: Path):
-    """Carga un .py por ruta concreta, evitando colisiones de nombre."""
+def _load_local_module(_qualified_name: str, _path: Path):
+    """Carga un .py por ruta con un nombre totalmente calificado para evitar colisiones."""
     _p = str(_path)
     if not os.path.exists(_p):
         raise FileNotFoundError(_p)
-    _spec = _importlib_util.spec_from_file_location(f"_fr_{_name}", _p)
+    _spec = _importlib_util.spec_from_file_location(_qualified_name, _p)
     _mod = _importlib_util.module_from_spec(_spec)
     assert _spec and _spec.loader
     _spec.loader.exec_module(_mod)
     return _mod
 
-def _build_franquicia_pkg_from_root():
+def _ensure_franquicia_package():
     """
-    Crea un paquete virtual 'franquicia' a partir de archivos en raíz:
-    models.py -> franquicia.models
-    services.py -> franquicia.services
-    routes.py -> franquicia.routes
-    Permite imports relativos en routes.py (from .services import ...).
+    Garantiza que existe un paquete 'franquicia' válido en sys.modules y
+    devuelve el módulo routes cargado. Intenta en este orden:
+
+    1) Paquete real franquicia/ (from franquicia.routes import ...)
+    2) Paquete virtual montado desde archivos sueltos en raíz:
+       - models.py   -> franquicia.models
+       - services.py -> franquicia.services
+       - routes.py   -> franquicia.routes
     """
+    # Caso 1: ya está importado (real o virtual)
+    if "franquicia.routes" in sys.modules:
+        return sys.modules["franquicia.routes"], "ya_importado"
+
+    # Intento 1a: paquete real en el repo
+    try:
+        import importlib
+        routes_mod = importlib.import_module("franquicia.routes")
+        return routes_mod, "paquete"
+    except Exception:
+        pass
+
+    # Intento 2: construir paquete virtual desde raíz (sin duplicar cargas)
+    import sys as _sys
     pkg = _types.ModuleType("franquicia")
-    pkg.__path__ = [str(BASE_PATH)]
-    sys.modules["franquicia"] = pkg
+    pkg.__path__ = [str(BASE_DIR)]
+    _sys.modules.setdefault("franquicia", pkg)
 
-    models_mod   = _load_local_module("franquicia.models",   BASE_PATH / "models.py")
-    services_mod = _load_local_module("franquicia.services", BASE_PATH / "services.py")
-    routes_mod   = _load_local_module("franquicia.routes",   BASE_PATH / "routes.py")
+    # Cargar solo si no están ya
+    if "franquicia.models" not in _sys.modules and (BASE_DIR / "models.py").exists():
+        _sys.modules["franquicia.models"] = _load_local_module("franquicia.models", BASE_DIR / "models.py")
+    if "franquicia.services" not in _sys.modules and (BASE_DIR / "services.py").exists():
+        _sys.modules["franquicia.services"] = _load_local_module("franquicia.services", BASE_DIR / "services.py")
+    if "franquicia.routes" not in _sys.modules and (BASE_DIR / "routes.py").exists():
+        _sys.modules["franquicia.routes"] = _load_local_module("franquicia.routes", BASE_DIR / "routes.py")
 
-    sys.modules["franquicia.models"]   = models_mod
-    sys.modules["franquicia.services"] = services_mod
-    sys.modules["franquicia.routes"]   = routes_mod
-    return routes_mod
+    if "franquicia.routes" in _sys.modules:
+        return _sys.modules["franquicia.routes"], "virtual"
+    raise RuntimeError("No se pudo localizar franquicia.routes ni en paquete ni en raíz")
 
 
 def create_app():
     app = Flask(__name__, instance_path=str(INSTANCE_DIR))
 
-    # Clave Flask
+    # Clave Flask / DB / Uploads
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "spainroom-dev-secret")
-    # DB
     app.config["SQLALCHEMY_DATABASE_URI"] = SQLALCHEMY_DATABASE_URI
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-    # Subidas
     app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024  # 30MB
     app.config["UPLOAD_FOLDER"] = str(UPLOAD_DIR)
 
@@ -89,38 +105,41 @@ def create_app():
     ]
     CORS(app, resources={r"/*": {"origins": allowed_origins}}, supports_credentials=True)
 
-    # Defensa (opcional)
+    # Defensa (opcional) — ejecutar dentro de app context por seguridad
     try:
         from defense import init_defense
-        init_defense(app)
+        with app.app_context():
+            init_defense(app)
         print("[DEFENSE] Defense stack initialized.")
     except Exception as e:
         print("[DEFENSE] No se pudo activar defensa:", e)
 
-    # DB + contexto
+    # Inicializa DB
     db.init_app(app)
-    # Importar modelos de Franquicia si el flag está activo (para que create_all cree tablas)
-    try:
-        if os.getenv("BACKEND_FEATURE_FRANQ_PLAZAS", "off").lower() == "on":
-            try:
-                from franquicia import models as _fr_models  # noqa: F401
-                print("[FRANQ] Modelos importados (paquete).")
-            except Exception:
-                _ = _load_local_module("models", BASE_PATH / "models.py")  # noqa: F401
-                print("[FRANQ] Modelos importados (raíz).")
-        else:
-            print("[FRANQ] Flag OFF: no se importan modelos.")
-    except Exception as e:
-        print("[WARN] Import modelos Franquicia:", e)
 
-    # Crear tablas bajo contexto
+    # =========================
+    # Cargar Franquicia (modelos y rutas) UNA sola vez
+    # =========================
+    flag_on = os.getenv("BACKEND_FEATURE_FRANQ_PLAZAS", "off").lower() == "on"
+    routes_mod = None
+    if flag_on:
+        try:
+            # Intenta montar todo el paquete (real o virtual) de una vez
+            routes_mod, how = _ensure_franquicia_package()
+            print(f"[FRANQ] paquete routes localizado por: {how}")
+        except Exception as e:
+            print("[FRANQ] No se pudo localizar paquete/rutas:", e)
+
+    # Crear tablas (si flag on, ya están los modelos en sys.modules)
     with app.app_context():
         try:
             db.create_all()
         except Exception as e:
             print("[DB] Aviso create_all:", e)
 
-    # Blueprints opcionales
+    # =========================
+    # Blueprints opcionales (try/except tolerantes)
+    # =========================
     try:
         from auth import bp_auth, register_auth_models
         try:
@@ -156,40 +175,44 @@ def create_app():
     except Exception as e:
         print("[WARN] Voice:", e)
 
-    # Franquicia (interno, por flag) — con 3 niveles: paquete, paquete virtual, placeholder
-    try:
-        if os.getenv("BACKEND_FEATURE_FRANQ_PLAZAS", "off").lower() == "on":
+    # =========================
+    # Registrar Franquicia (Admin Interno)
+    # =========================
+    if flag_on:
+        try:
             bp_franquicia = None
-            try:
-                # 1) Paquete real
-                from franquicia.routes import bp_franquicia as _bp
-                bp_franquicia = _bp
-                print("[FRANQ] Blueprint (paquete) localizado.")
-            except Exception as e_pkg:
-                try:
-                    # 2) Paquete virtual desde raíz
-                    _fr_routes = _build_franquicia_pkg_from_root()
-                    bp_franquicia = getattr(_fr_routes, "bp_franquicia")
-                    print("[FRANQ] Blueprint (raíz c/ paquete virtual) localizado.")
-                except Exception as e_virt:
-                    # 3) Placeholder mínimo para validar wiring
-                    print("[FRANQ] Fallback placeholder por error:", e_virt or e_pkg)
-                    from flask import Blueprint
-                    _bp = Blueprint("franquicia", __name__)
-                    @_bp.get("/api/admin/franquicia/summary")
-                    def _fr_placeholder():
-                        return jsonify(ok=True, placeholder=True, note="Blueprint mínimo activo"), 200
-                    bp_franquicia = _bp
-                    print("[FRANQ] Blueprint placeholder registrado (temporal).")
+            if routes_mod is not None:
+                # Ya tenemos franquicia.routes cargado (real o virtual)
+                bp_franquicia = getattr(routes_mod, "bp_franquicia", None)
+                if bp_franquicia is not None:
+                    app.register_blueprint(bp_franquicia, url_prefix="/api/admin/franquicia")
+                    print("[FRANQ] Blueprint Franquicia registrado.")
+                else:
+                    raise AttributeError("bp_franquicia no encontrado en routes")
+            else:
+                # Último fallback: blueprint placeholder para no devolver 404
+                _bp = Blueprint("franquicia_placeholder", __name__)
+                @_bp.get("/api/admin/franquicia/summary")
+                def _fr_placeholder():
+                    return jsonify(ok=True, placeholder=True, note="Blueprint mínimo activo"), 200
+                app.register_blueprint(_bp, url_prefix="")
+                print("[FRANQ] Blueprint placeholder registrado (temporal).")
+        except Exception as e:
+            print("[WARN] Franquicia:", e)
+            # Si algo peta, deja placeholder para validar wiring
+            _bp = Blueprint("franquicia_placeholder2", __name__)
+            @_bp.get("/api/admin/franquicia/summary")
+            def _fr_placeholder2():
+                return jsonify(ok=True, placeholder=True, note="Blueprint mínimo activo (fallback 2)"), 200
+            app.register_blueprint(_bp, url_prefix="")
+            print("[FRANQ] Blueprint placeholder2 registrado.")
 
-            app.register_blueprint(bp_franquicia, url_prefix="")
-            print("[FRANQ] Blueprint Franquicia registrado.")
-        else:
-            print("[FRANQ] Flag OFF: módulo Franquicia no registrado.")
-    except Exception as e:
-        print("[WARN] Franquicia:", e)
+    else:
+        print("[FRANQ] Flag OFF: módulo Franquicia no registrado.")
 
+    # =========================
     # Rutas base
+    # =========================
     @app.route("/health")
     def health():
         return jsonify(ok=True, service="spainroom-backend")
@@ -197,14 +220,18 @@ def create_app():
     @app.get("/api/rooms")
     def list_rooms():
         rooms = [
-            {"id": 1, "title": "Habitación centro Madrid", "description": "Luminoso y céntrico",
-             "price": 400, "city": "Madrid", "address": "Calle Mayor, 1", "photo": None,
-             "created_at": datetime(2025, 9, 3, 17, 59, 37, 673635).isoformat(),
-             "updated_at": datetime(2025, 9, 3, 17, 59, 37, 673647).isoformat()},
-            {"id": 2, "title": "Habitación en Valencia", "description": "Cerca de la playa",
-             "price": 380, "city": "Valencia", "address": "Avenida del Puerto, 22", "photo": None,
-             "created_at": datetime(2025, 9, 3, 17, 59, 37, 673654).isoformat(),
-             "updated_at": datetime(2025, 9, 3, 17, 59, 37, 673658).isoformat()},
+            {
+                "id": 1, "title": "Habitación centro Madrid", "description": "Luminoso y céntrico",
+                "price": 400, "city": "Madrid", "address": "Calle Mayor, 1", "photo": None,
+                "created_at": datetime(2025, 9, 3, 17, 59, 37, 673635).isoformat(),
+                "updated_at": datetime(2025, 9, 3, 17, 59, 37, 673647).isoformat(),
+            },
+            {
+                "id": 2, "title": "Habitación en Valencia", "description": "Cerca de la playa",
+                "price": 380, "city": "Valencia", "address": "Avenida del Puerto, 22", "photo": None,
+                "created_at": datetime(2025, 9, 3, 17, 59, 37, 673654).isoformat(),
+                "updated_at": datetime(2025, 9, 3, 17, 59, 37, 673658).isoformat(),
+            },
         ]
         return jsonify(rooms)
 
