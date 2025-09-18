@@ -95,4 +95,123 @@ def create_app():
     # Auth (sin dependencia de SQLAlchemy)
     try:
         from auth import bp_auth, register_auth_models
-        register_auth_models(db)  # es no-op en algunas versiones
+        try:
+            register_auth_models(db)  # es no-op en algunas versiones
+        except Exception as e:
+            print("[WARN] register_auth_models falló (no crítico):", e)
+        app.register_blueprint(bp_auth)
+        print("[AUTH] Blueprint auth registrado.")
+    except Exception as e:
+        print("[WARN] Auth module not loaded:", e)
+
+    # Payments (Stripe) — opcional: requiere STRIPE_SECRET_KEY
+    try:
+        from payments import bp_pay
+        if not os.getenv("STRIPE_SECRET_KEY"):
+            raise RuntimeError("'STRIPE_SECRET_KEY' no configurada")
+        app.register_blueprint(bp_pay)
+        print("[PAY] Blueprint payments registrado.")
+    except Exception as e:
+        print("[WARN] Payments module not loaded:", e)
+
+    # Opportunities (formulario de oportunidades/colaboradores)
+    try:
+        from opportunities import bp_opps
+        app.register_blueprint(bp_opps)
+        print("[OPPS] Blueprint opportunities registrado.")
+    except Exception as e:
+        print("[WARN] Opportunities module not loaded:", e)
+
+    # Voice bot (Twilio) — opcional
+    try:
+        from voice_bot import bp_voice
+        app.register_blueprint(bp_voice, url_prefix="/voice")
+        print("[VOICE] Blueprint voice registrado.")
+    except Exception as e:
+        print("[WARN] Voice module not loaded:", e)
+
+    # =========================
+    # Franquicia (INTERNAL Admin) detrás de feature flag
+    # =========================
+    try:
+        if os.getenv("BACKEND_FEATURE_FRANQ_PLAZAS", "off").lower() == "on":
+            from franquicia.routes import bp_franquicia
+            app.register_blueprint(bp_franquicia, url_prefix="/api/admin/franquicia")
+            print("[FRANQ] Blueprint Franquicia (interno) registrado.")
+        else:
+            print("[FRANQ] Flag OFF: módulo Franquicia no registrado (seguro por defecto).")
+    except Exception as e:
+        print("[WARN] Franquicia module not loaded:", e)
+
+    # =========================
+    # Rutas base
+    # =========================
+
+    @app.route("/health")
+    def health():
+        return jsonify(ok=True, service="spainroom-backend")
+
+    # Demo Rooms (en memoria)
+    @app.get("/api/rooms")
+    def list_rooms():
+        rooms = [
+            {
+                "id": 1,
+                "title": "Habitación centro Madrid",
+                "description": "Luminoso y céntrico",
+                "price": 400,
+                "city": "Madrid",
+                "address": "Calle Mayor, 1",
+                "photo": None,
+                "created_at": datetime(2025, 9, 3, 17, 59, 37, 673635).isoformat(),
+                "updated_at": datetime(2025, 9, 3, 17, 59, 37, 673647).isoformat(),
+            },
+            {
+                "id": 2,
+                "title": "Habitación en Valencia",
+                "description": "Cerca de la playa",
+                "price": 380,
+                "city": "Valencia",
+                "address": "Avenida del Puerto, 22",
+                "photo": None,
+                "created_at": datetime(2025, 9, 3, 17, 59, 37, 673654).isoformat(),
+                "updated_at": datetime(2025, 9, 3, 17, 59, 37, 673658).isoformat(),
+            },
+        ]
+        return jsonify(rooms)
+
+    # Subida de ficheros (imágenes de habitaciones, etc.)
+    @app.post("/api/upload")
+    def upload_file():
+        if "file" not in request.files:
+            return jsonify(error="Archivo requerido"), 400
+
+        f = request.files["file"]
+        if f.filename == "":
+            return jsonify(error="Archivo inválido"), 400
+
+        filename = secure_filename(f.filename)
+        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+        name, ext = os.path.splitext(filename)
+        safe_name = f"{name}-{ts}{ext}".replace(" ", "_")
+        target = UPLOAD_DIR / safe_name
+        f.save(target)
+
+        return jsonify(ok=True, path=f"/uploads/{safe_name}")
+
+    # Servir ficheros subidos
+    @app.get("/uploads/<path:filename>")
+    def serve_upload(filename):
+        return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=False)
+
+    return app
+
+
+# =========================
+# CLI / dev runner
+# =========================
+if __name__ == "__main__":
+    app = create_app()
+    print(f">>> SQLALCHEMY_DATABASE_URI = {SQLALCHEMY_DATABASE_URI}")
+    # Flask Dev Server (solo desarrollo)
+    app.run(host="127.0.0.1", port=int(os.getenv("PORT", "5001")), debug=True)
