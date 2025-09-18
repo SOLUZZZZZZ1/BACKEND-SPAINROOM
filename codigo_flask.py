@@ -101,7 +101,7 @@ async def voice_fallback(request: Request):
     # Fallback idéntico: también inicia ConversationRelay (no <Say>)
     return await answer_cr(request)
 
-# === Motor de conversación ====================================================
+# === Conocimiento ============================================================
 
 KNOWLEDGE: Dict[str, Dict[str, Any]] = {
     "que_hace": {
@@ -140,7 +140,8 @@ KNOWLEDGE: Dict[str, Dict[str, Any]] = {
         ],
     },
     "propietarios": {
-        "patterns": ["propietar", "duen", "dueñ", "propiedad"],
+        # OJO: no incluimos 'propietar' para evitar colisiones con 'propietario'
+        "patterns": ["para propietarios", "informacion propietarios", "info propietarios"],
         "answers": [
             "Para propietarios: publicamos, filtramos inquilinos, hacemos contrato y cobramos.",
             "Requisitos básicos: cerradura, cama 135×200 y buen estado.",
@@ -162,6 +163,35 @@ KNOWLEDGE: Dict[str, Dict[str, Any]] = {
     },
 }
 
+def _role_owner(tl: str) -> bool:
+    # palabras con límites; evita activar por 'propietarios'
+    return bool(re.search(r"\bpropiet(ario|aria|arios|arias)?\b|\bdueñ[oa]s?\b", tl))
+
+def _role_tenant(tl: str) -> bool:
+    return bool(re.search(r"\binquil(in|ino|ina|inos|inas)?\b|\balquil(ar|o|a|as|amos|an)?\b", tl))
+
+def _match_topic(tl: str, step: str):
+    # Nunca activar conocimiento mientras estamos en el flujo principal
+    if step in ("role", "city", "zone", "name", "phone"):
+        return None
+    # Ignorar si solo dice 'propietario' o 'inquilino'
+    if _role_owner(tl) or _role_tenant(tl):
+        return None
+    for k, cfg in KNOWLEDGE.items():
+        for pat in cfg["patterns"]:
+            if pat in tl:
+                return k
+    return None
+
+def _is_yes_help(tl: str) -> bool:
+    # Palabras claritas; evitamos 'si' para no colisionar
+    tl = tl.lower()
+    yes_words = [" ayuda ", " asesor ", " llamar ", " llamada ", " contacto ", " por favor "]
+    s = f" {tl} "
+    return any(w in s for w in yes_words)
+
+# === Conversación (WS) =======================================================
+
 @app.websocket("/cr")
 async def conversation_relay(ws: WebSocket):
     await ws.accept()
@@ -176,16 +206,14 @@ async def conversation_relay(ws: WebSocket):
         "info_hits": {k: 0 for k in KNOWLEDGE.keys()},
     }
 
-    # ARRANQUE INMEDIATO por si Twilio no envía "setup"
+    # ARRANQUE INMEDIATO
     session["step"] = "role"
-    await ws.send_json(
-        {
-            "type": "text",
-            "token": "Para atenderle: ¿Es usted propietario o inquilino?",
-            "last": True,
-            "interruptible": True,
-        }
-    )
+    await ws.send_json({
+        "type": "text",
+        "token": "Para atenderle: ¿Es usted propietario o inquilino?",
+        "last": True,
+        "interruptible": True
+    })
 
     def _now_ms() -> float:
         return time.monotonic() * 1000.0
@@ -226,19 +254,6 @@ async def conversation_relay(ws: WebSocket):
         }
         await speak(prompts.get(step_key, ""))
 
-    def _match_topic(tl: str):
-        for k, cfg in KNOWLEDGE.items():
-            for pat in cfg["patterns"]:
-                if pat in tl:
-                    return k
-        return None
-
-    def _is_yes_help(tl: str) -> bool:
-        # Palabras claritas para pedir ayuda; evitamos "si " que causaba falsos positivos
-        tl = tl.lower()
-        yes_words = ["ayuda", "asesor", "llamar", "llamada", "contacto", "por favor"]
-        return any((" " + w + " ") in (" " + tl + " ") for w in yes_words)
-
     async def answer_topic(topic: str):
         idx = session["info_hits"].get(topic, 0)
         answers = KNOWLEDGE[topic]["answers"]
@@ -249,27 +264,19 @@ async def conversation_relay(ws: WebSocket):
     async def finish():
         lead = session["lead"].copy()
         await speak("Gracias. Tomamos sus datos. Le contactaremos en breve.", interruptible=False)
-        # Si quieres reactivar el envío al backend, descomenta:
-        # au = _env("ASSIGN_URL", "")
-        # if au:
-        #     try:
-        #         await _post_json(au, lead, timeout=2.0)
-        #     except Exception:
-        #         pass
         print("<<LEAD>>" + json.dumps(lead, ensure_ascii=False) + "<<END>>", flush=True)
         session["step"] = "post"
         await ask_once("post")
 
-    # ======== ORDEN CORRECTO: flujo primero, conocimiento después =============
     async def handle_text(user_text: str):
         if _dup_user(user_text):
             return
-        t = _norm(user_text)
+        t  = _norm(user_text)
         tl = t.lower()
-        s = session["step"]
+        s  = session["step"]
         lead = session["lead"]
 
-        # 0) Ayuda explícita (prioridad)
+        # --- Ayuda explícita ---
         if _is_yes_help(tl):
             if not lead.get("nombre"):
                 session["step"] = "name"
@@ -284,7 +291,7 @@ async def conversation_relay(ws: WebSocket):
             await ask_once("post")
             return
 
-        # Defensa: si da números fuera de 'phone', redirigimos ordenadamente
+        # --- Si da muchos dígitos fuera de 'phone', reconducimos ---
         if s != "phone":
             only_digits = _digits(t)
             if len(only_digits) >= 7:
@@ -296,15 +303,15 @@ async def conversation_relay(ws: WebSocket):
                 await speak("Ahora sí, ¿su teléfono de contacto, por favor?")
                 return
 
-        # 1) Flujo por pasos
+        # --- Flujo por pasos ---
         if s == "role":
-            if any(k in tl for k in ["propiet", "dueñ", "duen"]):
+            if _role_owner(tl):
                 lead["role"] = "propietario"
                 session["step"] = "city"
                 await speak("Gracias.")
                 await ask_once("city")
                 return
-            if any(k in tl for k in ["inquil", "alquil"]):
+            if _role_tenant(tl):
                 lead["role"] = "inquilino"
                 session["step"] = "city"
                 await speak("Gracias.")
@@ -360,15 +367,14 @@ async def conversation_relay(ws: WebSocket):
             await ask_once("role")
             return
 
-        # 2) Conocimiento SOLO si estamos fuera del flujo principal
-        topic = _match_topic(tl) if s in ("post", "await_setup") else None
+        # --- Conocimiento SOLO fuera del flujo principal ---
+        topic = _match_topic(tl, s)
         if topic:
             await answer_topic(topic)
             if session["step"] != "await_setup":
                 await ask_once(session["step"])
             return
 
-        # 3) Fallback amable
         await ask_once(session["step"])
 
     try:
