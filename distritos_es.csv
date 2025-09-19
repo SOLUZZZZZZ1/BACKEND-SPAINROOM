@@ -1,0 +1,36 @@
+provincia,ciudad,distrito,cod_distrito,poblacion
+Madrid,Madrid,Centro,01,149718
+Madrid,Madrid,Arganzuela,02,156561
+Madrid,Madrid,Retiro,03,118909
+Madrid,Madrid,Salamanca,04,147707
+Madrid,Madrid,Chamartín,05,142960
+Madrid,Madrid,Tetuán,06,159604
+Madrid,Madrid,Chamberí,07,141673
+Madrid,Madrid,Fuencarral-El Pardo,08,243155
+Madrid,Madrid,Moncloa-Aravaca,09,119804
+Madrid,Madrid,Latina,10,236321
+Madrid,Madrid,Carabanchel,11,246984
+Madrid,Madrid,Usera,12,142886
+Madrid,Madrid,Puente de Vallecas,13,237506
+Madrid,Madrid,Moratalaz,14,95036
+Madrid,Madrid,Ciudad Lineal,15,219104
+Madrid,Madrid,Hortaleza,16,191129
+Madrid,Madrid,Villaverde,17,149105
+Madrid,Madrid,Villa de Vallecas,18,131601
+Madrid,Madrid,Vicálvaro,19,79098
+Madrid,Madrid,San Blas-Canillejas,20,158682
+Madrid,Madrid,Barajas,21,50000
+Barcelona,Barcelona,Ciutat Vella,01,101000
+Barcelona,Barcelona,Eixample,02,265000
+Barcelona,Barcelona,Sants-Montjuïc,03,180000
+Barcelona,Barcelona,Les Corts,04,82000
+Barcelona,Barcelona,Sarrià-Sant Gervasi,05,145000
+Barcelona,Barcelona,Gràcia,06,121000
+Barcelona,Barcelona,Horta-Guinardó,07,170000
+Barcelona,Barcelona,Nou Barris,08,165000
+Barcelona,Barcelona,Sant Andreu,09,150000
+Barcelona,Barcelona,Sant Martí,10,240000
+Sevilla,Sevilla,Casco Antiguo,01,58000
+Sevilla,Sevilla,Macarena,02,110000
+Sevilla,Sevilla,Nervión,03,75000
+Sevilla,Sevilla,Triana,04,70000
