@@ -4,6 +4,7 @@ SpainRoom BACKEND (API)
 Flask + SQLAlchemy + CORS + logging + health.
 
 Blueprints activos:
+  - /api/auth/*                -> routes_auth.bp_auth
   - /api/contacto/*            -> routes_contact.bp_contact
   - /api/contracts/*           -> routes_contracts.bp_contracts
   - /api/rooms/*               -> routes_rooms.bp_rooms
@@ -15,9 +16,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from flask import Flask, jsonify
-from flask_sqlalchemy import SQLAlchemy
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+
+from extensions import db   # << db global (evita import circular)
 
 # ---------------- Config ----------------
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,18 +28,6 @@ DEFAULT_DB = f"sqlite:///{(BASE_DIR / 'spainroom.db').as_posix()}"
 SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", DEFAULT_DB)
 JWT_SECRET  = os.environ.get("JWT_SECRET", os.environ.get("SECRET_KEY", "sr-dev-secret"))
 JWT_TTL_MIN = int(os.environ.get("JWT_TTL_MIN", "720"))
-
-db = SQLAlchemy()
-
-# Modelo demo opcional
-class SimpleUser(db.Model):
-    __tablename__ = "auth_users"
-    id    = db.Column(db.Integer, primary_key=True)
-    phone = db.Column(db.String(64), unique=True, nullable=False)
-    role  = db.Column(db.String(32), default="user", nullable=False)
-    created_at = db.Column(db.DateTime, server_default=db.func.current_timestamp())
-    def to_dict(self):
-        return {"id": self.id, "phone": self.phone, "role": self.role, "created_at": str(self.created_at)}
 
 # ---------------- App factory ----------------
 def create_app(test_config=None):
@@ -59,29 +49,33 @@ def create_app(test_config=None):
     if test_config:
         app.config.update(test_config)
 
+    # Extensiones
     db.init_app(app)
-    CORS(app, origins="*", supports_credentials=True)
+    CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     _init_logging(app)
 
     # ========== IMPORTAR MODELOS Y RUTAS ANTES DE CREAR TABLAS ==========
+    # Auth (OTP/JWT)
+    from routes_auth import bp_auth
+    import models_auth
+
     # Contacto (oportunidades / tenants)
     from routes_contact import bp_contact
-    import models_contact           # ContactMessage
+    import models_contact
 
-    # Contratos / Habitaciones / Uploads de habitaciones
+    # Contratos + líneas (sub_ref) / Habitaciones / Uploads de habitaciones
     from routes_contracts import bp_contracts
-    import models_contracts         # Contract, ContractItem
+    import models_contracts
 
     from routes_rooms import bp_rooms
-    import models_rooms             # Room
+    import models_rooms
 
     from routes_uploads_rooms import bp_upload_rooms
-    import models_uploads           # Upload
+    import models_uploads
 
-    # (Opcionales: descomenta cuando existan)
-    # from routes_auth import bp_auth; import models_auth
-    # from routes_owner import bp_owner; import models_owner
+    # (Opcionales — descomenta cuando estén listos)
     # from franquicia.routes import bp_franquicia; import franquicia.models
+    # from routes_owner import bp_owner; import models_owner
 
     # ======================= CREAR TABLAS =======================
     with app.app_context():
@@ -89,15 +83,32 @@ def create_app(test_config=None):
         app.logger.info("DB create_all() OK")
 
     # ===================== REGISTRAR BLUEPRINTS =================
+    app.register_blueprint(bp_auth, url_prefix="/api/auth")
     app.register_blueprint(bp_contact)        # /api/contacto/*
     app.register_blueprint(bp_contracts)      # /api/contracts/*
     app.register_blueprint(bp_rooms)          # /api/rooms/*
     app.register_blueprint(bp_upload_rooms)   # /api/rooms/upload_photos
-
-    # Opcionales:
-    # app.register_blueprint(bp_auth, url_prefix="/api/auth")
-    # app.register_blueprint(bp_owner)
     # app.register_blueprint(bp_franquicia, url_prefix="/api/admin/franquicia")
+    # app.register_blueprint(bp_owner)
+
+    # ===================== CORS GLOBAL (after_request) =================
+    ALLOWED_ORIGINS = {
+        "http://localhost:5176",
+        "http://127.0.0.1:5176",
+        # añade aquí tus URLs de Vercel si las usas, p.ej.:
+        # "https://frontend-xxxxx.vercel.app",
+    }
+
+    @app.after_request
+    def add_cors_headers(resp):
+        origin = request.headers.get("Origin")
+        if origin and (origin in ALLOWED_ORIGINS or origin.endswith(".vercel.app")):
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key, X-Franquiciado"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        return resp
 
     # ====================== RUTAS BÁSICAS =======================
     @app.get("/health")
@@ -107,11 +118,6 @@ def create_app(test_config=None):
     @app.get("/")
     def index():
         return jsonify(ok=True, msg="SpainRoom API")
-
-    @app.get("/api/users")
-    def list_users():
-        u = SimpleUser.query.limit(50).all()
-        return jsonify([x.to_dict() for x in u])
 
     @app.errorhandler(404)
     def nf(e): return jsonify(ok=False, error="not_found"), 404
