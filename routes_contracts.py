@@ -1,121 +1,84 @@
-# routes_contact.py
-import os, re, smtplib, time
-from email.mime.text import MIMEText
+# routes_contracts.py
 from flask import Blueprint, request, jsonify
 from extensions import db
-from models_contact import ContactMessage
+from models_contracts import Contract, ContractItem
+from models_rooms import Room
 
-bp_contact = Blueprint("contact", __name__)
+bp_contracts = Blueprint("contracts", __name__)
 
-# -------- helpers --------
-def norm_phone(p: str) -> str:
-    p = re.sub(r"[^\d+]", "", p or "")
-    if p.startswith("+"): return p
-    if p.startswith("34"): return "+"+p
-    if re.fullmatch(r"\d{9,15}", p): return "+34"+p
-    return p
+@bp_contracts.post("/api/contracts/create")
+def create_contract():
+    """
+    Crea contrato (draft) y sus líneas con sub_ref SR-XXXXX-01..N
+    body: { owner_id, tenant_id, franchisee_id?, rooms:[{id}], splits?{owner,franq}, meta_json? }
+    """
+    data = request.get_json(force=True)
+    owner_id  = (data.get("owner_id") or "").strip()
+    tenant_id = (data.get("tenant_id") or "").strip()
+    franchisee_id = (data.get("franchisee_id") or "").strip() or None
+    rooms_in  = data.get("rooms") or []
+    splits_in = data.get("splits") or {}
 
-# rate limit simple (memoria)
-_rl = {}
-def rate_limit(key: str, per_sec: float) -> bool:
-    now = time.time()
-    last = _rl.get(key, 0)
-    if now - last < per_sec:
-        return False
-    _rl[key] = now
-    return True
+    if not owner_id or not tenant_id or not rooms_in:
+        return jsonify(ok=False, error="missing_fields"), 400
 
-def send_email(to_email: str, subject: str, body: str) -> bool:
-    host = os.getenv("SMTP_HOST")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USER")
-    pwd  = os.getenv("SMTP_PASS")
-    from_email = os.getenv("MAIL_FROM", user or "no-reply@spainroom.es")
-    if not (host and user and pwd and to_email):
-        print("[CONTACT] SMTP no configurado — no se envía email")
-        return False
-    try:
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"]    = from_email
-        msg["To"]      = to_email
-        with smtplib.SMTP(host, port, timeout=10) as s:
-            s.starttls()
-            s.login(user, pwd)
-            s.sendmail(from_email, [to_email], msg.as_string())
-        return True
-    except Exception as e:
-        print("[CONTACT] Error SMTP:", e)
-        return False
+    ref = Contract.new_ref()
+    c = Contract(ref=ref, owner_id=owner_id, tenant_id=tenant_id, franchisee_id=franchisee_id,
+                 status="draft", meta_json=data.get("meta_json"))
+    db.session.add(c); db.session.flush()
 
-# -------- endpoints --------
-@bp_contact.post("/api/contacto/oportunidades")
-def contacto_oportunidades():
-    ip = request.headers.get("x-forwarded-for") or request.remote_addr or "0.0.0.0"
-    if not rate_limit(f"contact:opp:{ip}", per_sec=2.0):
-        return jsonify(ok=False, error="rate_limited"), 429
+    base_owner_split = float(splits_in.get("owner", 0.80))
+    base_franq_split = float(splits_in.get("franq", 0.20))
 
-    data = request.get_json(silent=True) or {}
-    tipo      = (data.get("tipo") or "oportunidades").strip()            # inversion | publicidad | colaboracion | ...
-    nombre    = (data.get("nombre") or "").strip()
-    email     = (data.get("email")  or "").strip()
-    telefono  = (data.get("telefono") or "").strip()
-    zona      = (data.get("zona") or data.get("sector") or "").strip()
-    mensaje   = (data.get("mensaje") or "").strip()
-    via       = (data.get("via") or "web_oportunidades").strip()
-    meta      = data.get("meta_json") if isinstance(data.get("meta_json"), dict) else None
+    idx = 0
+    for r in rooms_in:
+        rid = r.get("id")
+        if rid is None:
+            continue
+        room = db.session.get(Room, int(rid))
+        if not room:
+            continue
+        idx += 1
+        sub_ref = ContractItem.make_sub_ref(ref, idx)
+        db.session.add(ContractItem(
+            contract_id=c.id, sub_ref=sub_ref, room_id=room.id,
+            owner_id=owner_id, franchisee_id=franchisee_id,
+            status="draft", split_owner=base_owner_split, split_franchisee=base_franq_split
+        ))
 
-    if len(nombre.split()) < 2:
-        return jsonify(ok=False, error="bad_nombre"), 400
-    if email and ("@" not in email or "." not in email.split("@")[-1]):
-        return jsonify(ok=False, error="bad_email"), 400
-    teln = norm_phone(telefono) if telefono else None
-    if telefono and not re.fullmatch(r"\+\d{9,15}", teln):
-        return jsonify(ok=False, error="bad_telefono"), 400
-    if not mensaje:
-        return jsonify(ok=False, error="bad_mensaje"), 400
+    db.session.commit()
+    return jsonify(ok=True, ref=ref, id=c.id, items=idx)
 
-    row = ContactMessage(
-        tipo=tipo, nombre=nombre, email=email or "",
-        telefono=teln, mensaje=mensaje, zona=zona, via=via, meta_json=meta
-    )
-    db.session.add(row); db.session.commit()
+@bp_contracts.post("/api/contracts/mark_signed")
+def mark_signed():
+    """ Marca contrato como firmado; habilita subidas por franquiciado. """
+    data = request.get_json(force=True)
+    ref = (data.get("ref") or "").strip().upper()
+    if not ref:
+        return jsonify(ok=False, error="missing_ref"), 400
+    c = Contract.query.filter_by(ref=ref).first()
+    if not c:
+        return jsonify(ok=False, error="not_found"), 404
+    c.status = "signed"
+    for it in c.items:
+        if it.status == "draft":
+            it.status = "ready"
+    db.session.commit()
+    return jsonify(ok=True, ref=c.ref, status=c.status)
 
-    # Notifica admin (opcional)
-    mail_admin = os.getenv("MAIL_TO_ADMIN")
-    if mail_admin:
-        subj = f"[CONTACT/{row.tipo.upper()}] {row.nombre} <{row.email}>"
-        body = (
-            f"Nombre: {row.nombre}\nEmail: {row.email}\nTeléfono: {row.telefono or '-'}\n"
-            f"Zona/Sector: {row.zona or '-'}\nMensaje:\n{row.mensaje}\n\nVía: {row.via}\nID: {row.id}\n"
-        )
-        send_email(mail_admin, subj, body)
-
-    return jsonify(ok=True, id=row.id)
-
-@bp_contact.post("/api/contacto/tenants")
-def contacto_tenants():
-    ip = request.headers.get("x-forwarded-for") or request.remote_addr or "0.0.0.0"
-    if not rate_limit(f"contact:ten:{ip}", per_sec=2.0):
-        return jsonify(ok=False, error="rate_limited"), 429
-
-    data = request.get_json(silent=True) or {}
-    nombre   = (data.get("nombre") or "").strip()
-    email    = (data.get("email")  or "").strip()
-    mensaje  = (data.get("mensaje") or "").strip()
-    fecha    = (data.get("fecha")   or "").strip()   # opcional
-    via      = (data.get("via") or "web_tenant_prerequest").strip()
-
-    if len(nombre.split()) < 2:
-        return jsonify(ok=False, error="bad_nombre"), 400
-    if email and ("@" not in email or "." not in email.split("@")[-1]):
-        return jsonify(ok=False, error="bad_email"), 400
-    if not mensaje:
-        return jsonify(ok=False, error="bad_mensaje"), 400
-
-    row = ContactMessage(
-        tipo="tenants", nombre=nombre, email=email or "", telefono=None,
-        mensaje=mensaje, zona=None, via=via, meta_json={"fecha": fecha} if fecha else None
-    )
-    db.session.add(row); db.session.commit()
-    return jsonify(ok=True, id=row.id)
+@bp_contracts.get("/api/contracts/<ref>")
+def get_contract(ref):
+    c = Contract.query.filter_by(ref=ref.upper()).first()
+    if not c:
+        return jsonify(ok=False, error="not_found"), 404
+    return jsonify(ok=True, contract={
+        "ref": c.ref, "status": c.status,
+        "owner_id": c.owner_id, "tenant_id": c.tenant_id, "franchisee_id": c.franchisee_id,
+        "items": [
+            {"sub_ref": it.sub_ref, "room_id": it.room_id, "status": it.status,
+             "owner_id": it.owner_id, "franchisee_id": it.franchisee_id,
+             "split_owner": it.split_owner, "split_franchisee": it.split_franchisee}
+            for it in c.items
+        ],
+        "meta": c.meta_json
+    })
