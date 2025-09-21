@@ -4,38 +4,32 @@ SpainRoom BACKEND (API)
 Flask + SQLAlchemy + CORS + logging + health.
 
 Blueprints activos:
-  - /api/auth/*                -> routes_auth.bp_auth
-  - /api/contacto/*            -> routes_contact.bp_contact
-  - /api/contracts/*           -> routes_contracts.bp_contracts
-  - /api/rooms/*               -> routes_rooms.bp_rooms
-  - /api/rooms/upload_photos   -> routes_uploads_rooms.bp_upload_rooms
+  - /api/auth/*                  -> routes_auth.bp_auth
+  - /api/contacto/*              -> routes_contact.bp_contact
+  - /api/contracts/*             -> routes_contracts.bp_contracts
+  - /api/rooms/*                 -> routes_rooms.bp_rooms
+  - /api/rooms/upload_photos     -> routes_uploads_rooms.bp_upload_rooms
+  - /api/upload                  -> routes_upload_generic.bp_upload_generic
+  - /api/franchise/*             -> routes_franchise.bp_franchise
 """
 
-import os
-import logging
-import sys, types
+import os, sys, types, logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-# -------------------------------------------------------------------
-# DB robusto: intenta importar extensions.db; si no existe, lo crea
-# -------------------------------------------------------------------
+# ====================== DB: import robusto ======================
 try:
-    from extensions import db  # lo normal cuando extensions.py existe
+    from extensions import db
 except Exception:
     from flask_sqlalchemy import SQLAlchemy
     db = SQLAlchemy()
-    ext_mod = types.ModuleType("extensions")
-    ext_mod.db = db
-    sys.modules["extensions"] = ext_mod
+    mod = types.ModuleType("extensions"); mod.db = db; sys.modules["extensions"] = mod
 
 # ---------------- Config ----------------
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = f"sqlite:///{(BASE_DIR / 'spainroom.db').as_posix()}"
-
 SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", DEFAULT_DB)
 JWT_SECRET  = os.environ.get("JWT_SECRET", os.environ.get("SECRET_KEY", "sr-dev-secret"))
 JWT_TTL_MIN = int(os.environ.get("JWT_TTL_MIN", "720"))
@@ -44,7 +38,7 @@ JWT_TTL_MIN = int(os.environ.get("JWT_TTL_MIN", "720"))
 def create_app(test_config=None):
     app = Flask(__name__, static_folder="public", static_url_path="/")
 
-    # Asegura instance/ y uploads
+    # instance/ para uploads y logs
     try:
         Path(app.instance_path).mkdir(parents=True, exist_ok=True)
         Path(app.instance_path, "uploads").mkdir(parents=True, exist_ok=True)
@@ -65,28 +59,35 @@ def create_app(test_config=None):
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     _init_logging(app)
 
-    # ========== IMPORTAR MODELOS Y RUTAS ANTES DE CREAR TABLAS ==========
+    # ======== IMPORTAR MODELOS Y RUTAS ANTES DE CREAR TABLAS ========
     # Auth (OTP/JWT)
     from routes_auth import bp_auth
     import models_auth
 
-    # Contacto (oportunidades / tenants)
+    # Contacto (oportunidades/tenants)
     from routes_contact import bp_contact
     import models_contact
 
-    # Contratos / líneas (sub_ref) / Habitaciones / Uploads
+    # Contratos / líneas / Habitaciones / Uploads
     from routes_contracts import bp_contracts
-    import models_contracts
+    import models_contracts          # Contract, ContractItem
 
     from routes_rooms import bp_rooms
-    import models_rooms
+    import models_rooms              # Room
+    import models_roomleads          # RoomLead (para leads de búsqueda)  <-- NUEVO
 
-    from routes_uploads_rooms import bp_upload_rooms
-    import models_uploads
+    from routes_uploads_rooms import bp_upload_rooms   # requiere Pillow (PIL)
+    import models_uploads           # Upload
 
-    # (Opcionales)
+    # Upload genérico (owner/tenant/franchise_app)
+    from routes_upload_generic import bp_upload_generic
+
+    # Franquicia (pre-onboarding)
+    from routes_franchise import bp_franchise
+    import models_franchise
+
+    # (Opcional) Admin franquicia
     # from franquicia.routes import bp_franquicia; import franquicia.models
-    # from routes_owner import bp_owner; import models_owner
 
     # ======================= CREAR TABLAS =======================
     with app.app_context():
@@ -95,18 +96,19 @@ def create_app(test_config=None):
 
     # ===================== REGISTRAR BLUEPRINTS =================
     app.register_blueprint(bp_auth, url_prefix="/api/auth")
-    app.register_blueprint(bp_contact)        # /api/contacto/*
-    app.register_blueprint(bp_contracts)      # /api/contracts/*
-    app.register_blueprint(bp_rooms)          # /api/rooms/*
-    app.register_blueprint(bp_upload_rooms)   # /api/rooms/upload_photos
+    app.register_blueprint(bp_contact)           # /api/contacto/*
+    app.register_blueprint(bp_contracts)         # /api/contracts/*
+    app.register_blueprint(bp_rooms)             # /api/rooms/*
+    app.register_blueprint(bp_upload_rooms)      # /api/rooms/upload_photos
+    app.register_blueprint(bp_upload_generic)    # /api/upload
+    app.register_blueprint(bp_franchise)         # /api/franchise/*
     # app.register_blueprint(bp_franquicia, url_prefix="/api/admin/franquicia")
-    # app.register_blueprint(bp_owner)
 
     # ===================== CORS GLOBAL (after_request) =================
     ALLOWED_ORIGINS = {
         "http://localhost:5176",
         "http://127.0.0.1:5176",
-        # añade aquí tu dominio de Vercel si lo usas
+        # añade tus dominios Vercel si los usas:
         # "https://frontend-xxxxx.vercel.app",
     }
 
@@ -131,7 +133,7 @@ def create_app(test_config=None):
         return jsonify(ok=True, msg="SpainRoom API")
 
     @app.errorhandler(404)
-    def nf(e): return jsonify(ok=False, error="not_found"), 404
+    def nf(e): return jsonify(ok=False, error="not_found", message="No encontrado"), 404
 
     @app.errorhandler(500)
     def se(e):
@@ -143,20 +145,13 @@ def create_app(test_config=None):
 # ---------------- Logging ----------------
 def _init_logging(app):
     app.logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-
-    sh = logging.StreamHandler()
-    sh.setFormatter(formatter)
-    sh.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
     app.logger.addHandler(sh)
-
-    logs_dir = BASE_DIR / "logs"
-    logs_dir.mkdir(exist_ok=True)
+    logs_dir = BASE_DIR / "logs"; logs_dir.mkdir(exist_ok=True)
     fh = RotatingFileHandler(logs_dir / "backend.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(formatter)
-    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt); fh.setLevel(logging.INFO)
     app.logger.addHandler(fh)
-
     app.logger.info("Logging listo")
 
 # ---------------- Run (local) ----------------
