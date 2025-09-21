@@ -13,13 +13,25 @@ Blueprints activos:
 
 import os
 import logging
+import sys, types
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from extensions import db   # << db global (evita import circular)
+# -------------------------------------------------------------------
+# DB robusto: intenta importar extensions.db; si no existe, lo crea
+# -------------------------------------------------------------------
+try:
+    from extensions import db  # lo normal cuando extensions.py existe
+except Exception:
+    from flask_sqlalchemy import SQLAlchemy
+    db = SQLAlchemy()
+    # Creamos un módulo "extensions" dinámico para que otros imports funcionen
+    ext_mod = types.ModuleType("extensions")
+    ext_mod.db = db
+    sys.modules["extensions"] = ext_mod
 
 # ---------------- Config ----------------
 BASE_DIR = Path(__file__).resolve().parent
@@ -57,23 +69,23 @@ def create_app(test_config=None):
     # ========== IMPORTAR MODELOS Y RUTAS ANTES DE CREAR TABLAS ==========
     # Auth (OTP/JWT)
     from routes_auth import bp_auth
-    import models_auth
+    import models_auth  # User, Otp
 
     # Contacto (oportunidades / tenants)
     from routes_contact import bp_contact
-    import models_contact
+    import models_contact  # ContactMessage
 
-    # Contratos + líneas (sub_ref) / Habitaciones / Uploads de habitaciones
+    # Contratos / líneas / Habitaciones / Uploads
     from routes_contracts import bp_contracts
-    import models_contracts
+    import models_contracts  # Contract, ContractItem
 
     from routes_rooms import bp_rooms
-    import models_rooms
+    import models_rooms      # Room
 
     from routes_uploads_rooms import bp_upload_rooms
-    import models_uploads
+    import models_uploads    # Upload
 
-    # (Opcionales — descomenta cuando estén listos)
+    # (Opcionales)
     # from franquicia.routes import bp_franquicia; import franquicia.models
     # from routes_owner import bp_owner; import models_owner
 
@@ -92,11 +104,10 @@ def create_app(test_config=None):
     # app.register_blueprint(bp_owner)
 
     # ===================== CORS GLOBAL (after_request) =================
+    # Permite localhost de Vite y (si usas previas) *.vercel.app
     ALLOWED_ORIGINS = {
         "http://localhost:5176",
         "http://127.0.0.1:5176",
-        # añade aquí tus URLs de Vercel si las usas, p.ej.:
-        # "https://frontend-xxxxx.vercel.app",
     }
 
     @app.after_request
@@ -132,22 +143,4 @@ def create_app(test_config=None):
 # ---------------- Logging ----------------
 def _init_logging(app):
     app.logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
-    app.logger.addHandler(sh)
-    logs_dir = BASE_DIR / "logs"; logs_dir.mkdir(exist_ok=True)
-    fh = RotatingFileHandler(logs_dir / "backend.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt); fh.setLevel(logging.INFO)
-    app.logger.addHandler(fh)
-    app.logger.info("Logging listo")
-
-# ---------------- Run (local) ----------------
-def run_dev():
-    app = create_app()
-    debug = os.environ.get("FLASK_DEBUG", "1") in ("1", "true", "True")
-    port  = int(os.environ.get("PORT", "5000"))
-    app.logger.info("Dev http://127.0.0.1:%s (debug=%s)", port, debug)
-    app.run(host="0.0.0.0", port=port, debug=debug)
-
-if __name__ == "__main__":
-    run_dev()
+    fmt
