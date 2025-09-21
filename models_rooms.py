@@ -1,6 +1,6 @@
 # models_rooms.py
 from datetime import datetime
-from app import db
+from extensions import db
 
 class Room(db.Model):
     __tablename__ = "rooms"
