@@ -6,4 +6,6 @@ Flask-Cors
 Flask-SQLAlchemy
 gunicorn
 PyJWT==2.10.1
+Pillow==10.4.0
+
 
