@@ -11,6 +11,7 @@ Blueprints activos:
   - /api/rooms/upload_photos     -> routes_uploads_rooms.bp_upload_rooms
   - /api/upload                  -> routes_upload_generic.bp_upload_generic
   - /api/franchise/*             -> routes_franchise.bp_franchise
+  - /api/kyc/*                   -> routes_kyc.bp_kyc   (placeholder verificación selfie)
 """
 
 import os, sys, types, logging
@@ -21,8 +22,9 @@ from flask_cors import CORS
 
 # ====================== DB: import robusto ======================
 try:
-    from extensions import db
+    from extensions import db  # debe existir extensions.py con: from flask_sqlalchemy import SQLAlchemy; db=SQLAlchemy()
 except Exception:
+    # Fallback: crea un módulo 'extensions' en caliente para evitar import circular
     from flask_sqlalchemy import SQLAlchemy
     db = SQLAlchemy()
     mod = types.ModuleType("extensions"); mod.db = db; sys.modules["extensions"] = mod
@@ -74,10 +76,10 @@ def create_app(test_config=None):
 
     from routes_rooms import bp_rooms
     import models_rooms              # Room
-    import models_roomleads          # RoomLead (para leads de búsqueda)  <-- NUEVO
+    import models_roomleads          # RoomLead (leads por ciudad)
 
-    from routes_uploads_rooms import bp_upload_rooms   # requiere Pillow (PIL)
-    import models_uploads           # Upload
+    from routes_uploads_rooms import bp_upload_rooms   # requiere Pillow (PIL) para redimensionar
+    import models_uploads           # Upload (registro de ficheros)
 
     # Upload genérico (owner/tenant/franchise_app)
     from routes_upload_generic import bp_upload_generic
@@ -86,8 +88,8 @@ def create_app(test_config=None):
     from routes_franchise import bp_franchise
     import models_franchise
 
-    # (Opcional) Admin franquicia
-    # from franquicia.routes import bp_franquicia; import franquicia.models
+    # KYC placeholder (selfie + doc) — para integrar proveedor (Onfido/Veriff)
+    from routes_kyc import bp_kyc
 
     # ======================= CREAR TABLAS =======================
     with app.app_context():
@@ -99,9 +101,13 @@ def create_app(test_config=None):
     app.register_blueprint(bp_contact)           # /api/contacto/*
     app.register_blueprint(bp_contracts)         # /api/contracts/*
     app.register_blueprint(bp_rooms)             # /api/rooms/*
-    app.register_blueprint(bp_upload_rooms)      # /api/rooms/upload_photos
+    app.register_blueprint(bp_upload_rooms)      # /api/rooms/upload_photos  y /api/rooms/upload_sheet
     app.register_blueprint(bp_upload_generic)    # /api/upload
     app.register_blueprint(bp_franchise)         # /api/franchise/*
+    app.register_blueprint(bp_kyc)               # /api/kyc/*
+
+    # (Opcional) Admin franquicia clásico:
+    # from franquicia.routes import bp_franquicia; import franquicia.models
     # app.register_blueprint(bp_franquicia, url_prefix="/api/admin/franquicia")
 
     # ===================== CORS GLOBAL (after_request) =================
@@ -109,7 +115,7 @@ def create_app(test_config=None):
         "http://localhost:5176",
         "http://127.0.0.1:5176",
         # añade tus dominios Vercel si los usas:
-        # "https://frontend-xxxxx.vercel.app",
+        # "https://tu-frontend.vercel.app",
     }
 
     @app.after_request
