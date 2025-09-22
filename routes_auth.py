@@ -1,130 +1,97 @@
 # routes_auth.py
-import os, re, hmac, hashlib, time, random, jwt
+import os, re
 from datetime import datetime, timedelta
-from flask import Blueprint, request, jsonify, current_app
-from app import db
-from models_auth import AuthUser, AuthOtp
+import jwt
+from flask import Blueprint, request, jsonify
+from extensions import db
+from models_auth import User, Otp  # <— nombres reales de tu modelo
 
 bp_auth = Blueprint("auth", __name__)
 
-JWT_SECRET  = os.getenv("JWT_SECRET", "sr-dev-jwt")
+JWT_SECRET  = os.getenv("JWT_SECRET", "sr-dev-secret")
 JWT_TTL_MIN = int(os.getenv("JWT_TTL_MIN", "720"))
-OTP_HASH_KEY= (os.getenv("OTP_HASH_KEY") or "sr-otp-key").encode("utf-8")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "ramon")
+PHONE_RE = re.compile(r"^\+?\d{9,15}$")
 
-def norm_phone(p: str) -> str:
-    p = re.sub(r"[^\d+]", "", p or "")
-    if p.startswith("+"): return p
-    if p.startswith("34"): return "+"+p
-    if re.fullmatch(r"\d{9,15}", p): return "+34"+p
-    return p
+def make_jwt(user: User):
+  payload = {
+    "sub": f"user:{user.id}", "uid": user.id,
+    "role": user.role, "name": user.name or "",
+    "phone": user.phone or "", "email": user.email or "",
+    "exp": datetime.utcnow() + timedelta(minutes=JWT_TTL_MIN),
+    "iat": datetime.utcnow(), "iss": "spainroom"
+  }
+  return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def hash_code(code: str) -> str:
-    return hmac.new(OTP_HASH_KEY, code.encode("utf-8"), hashlib.sha256).hexdigest()
+@bp_auth.post("/api/auth/create_user")
+def create_user():
+  if (request.headers.get("X-Admin-Key") or "") != ADMIN_API_KEY:
+    return jsonify(ok=False, error="forbidden"), 403
+  data = request.get_json(force=True)
+  role = (data.get("role") or "inquilino").strip()
+  phone = (data.get("phone") or "").strip()
+  email = (data.get("email") or "").strip().lower() or None
+  name  = (data.get("name") or "").strip() or None
+  if not phone and not email: return jsonify(ok=False, error="need_phone_or_email"), 400
+  if phone and not PHONE_RE.match(phone): return jsonify(ok=False, error="bad_phone"), 400
 
-def make_jwt(user: AuthUser) -> str:
-    payload = {
-        "sub": user.phone,
-        "role": user.role,
-        "iat": int(time.time()),
-        "exp": int(time.time() + JWT_TTL_MIN*60)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+  u = None
+  if phone: u = User.query.filter_by(phone=phone).first()
+  if not u and email: u = User.query.filter_by(email=email).first()
+  if not u:
+    u = User(phone=phone or None, email=email or None, role=role, name=name)
+    db.session.add(u); db.session.commit()
+  else:
+    u.role = role or u.role; u.name = name or u.name; db.session.commit()
+  return jsonify(ok=True, user=u.to_dict())
 
-def send_sms(phone: str, text: str) -> bool:
-    sid   = os.getenv("TWILIO_ACCOUNT_SID")
-    token = os.getenv("TWILIO_AUTH_TOKEN")
-    from_ = os.getenv("TWILIO_FROM")
-    if not (sid and token and from_):
-        print(f"[OTP] (SIMULADO) a {phone}: {text}")
-        return True
-    try:
-        from twilio.rest import Client
-        Client(sid, token).messages.create(body=text, from_=from_, to=phone)
-        return True
-    except Exception as e:
-        print("[OTP] Twilio error:", e)
-        return False
-
-# Rate limit básico (memoria)
-_rl = {}
-def rate_limit(key: str, per_sec: float) -> bool:
-    now = time.time()
-    last = _rl.get(key, 0)
-    if now - last < per_sec:
-        return False
-    _rl[key] = now
-    return True
-
-@bp_auth.post("/api/auth/request-otp")
+@bp_auth.post("/api/auth/request_otp")
 def request_otp():
-    data = request.get_json(silent=True) or {}
-    phone = norm_phone(data.get("phone",""))
-    if not re.fullmatch(r"\+\d{9,15}", phone):
-        return jsonify(ok=False, error="bad_phone"), 400
+  data = request.get_json(force=True)
+  phone = (data.get("phone") or "").strip()
+  email = (data.get("email") or "").strip().lower()
+  target = phone or email
+  if not target: return jsonify(ok=False, error="need_phone_or_email"), 400
+  if phone and not PHONE_RE.match(phone): return jsonify(ok=False, error="bad_phone"), 400
 
-    if not rate_limit(f"otp:{phone}", per_sec=5.0):
-        return jsonify(ok=False, error="rate_limited"), 429
+  if phone:
+    u = User.query.filter_by(phone=phone).first()
+    if not u: u = User(phone=phone, role="inquilino"); db.session.add(u); db.session.commit()
+  else:
+    u = User.query.filter_by(email=email).first()
+    if not u: u = User(email=email, role="inquilino"); db.session.add(u); db.session.commit()
 
-    code = f"{random.randint(0, 999999):06d}"
-    code_h = hash_code(code)
+  otp = Otp.new(target, ttl_sec=300)
+  db.session.add(otp); db.session.commit()
+  # Envío real de SMS/email: integrar proveedor. Aquí no devolvemos el code por seguridad.
+  return jsonify(ok=True, sent=True)
 
-    # Lock básico por demasiados intentos
-    otp = AuthOtp.query.filter_by(phone=phone).order_by(AuthOtp.id.desc()).first()
-    if otp and otp.locked_until and otp.locked_until > datetime.utcnow():
-        return jsonify(ok=False, error="locked"), 429
-
-    # Guarda OTP
-    record = AuthOtp(
-        phone=phone,
-        code_hash=code_h,
-        expires_at=datetime.utcnow() + timedelta(minutes=5),
-        attempts=0,
-        locked_until=None,
-    )
-    db.session.add(record); db.session.commit()
-
-    ok = send_sms(phone, f"Tu código SpainRoom: {code}")
-    if not ok:
-        return jsonify(ok=False, error="sms_failed"), 500
-
-    hint = f"***{phone[-2:]}" if len(phone) >= 2 else ""
-    return jsonify(ok=True, ttl=300, hint=hint)
-
-@bp_auth.post("/api/auth/verify-otp")
+@bp_auth.post("/api/auth/verify_otp")
 def verify_otp():
-    data = request.get_json(silent=True) or {}
-    phone = norm_phone(data.get("phone",""))
-    code  = str(data.get("code","")).strip()
-    if not re.fullmatch(r"\+\d{9,15}", phone) or not re.fullmatch(r"\d{4,8}", code):
-        return jsonify(ok=False, error="bad_input"), 400
+  data = request.get_json(force=True)
+  phone = (data.get("phone") or "").strip()
+  email = (data.get("email") or "").strip().lower()
+  code  = (data.get("code") or "").strip()
+  target= phone or email
+  if not target or not code: return jsonify(ok=False, error="missing_fields"), 400
 
-    otp = AuthOtp.query.filter_by(phone=phone).order_by(AuthOtp.id.desc()).first()
-    if not otp:
-        return jsonify(ok=False, error="no_code"), 400
+  otp = (Otp.query.filter_by(target=target, used=False).order_by(Otp.created_at.desc()).first())
+  if not otp: return jsonify(ok=False, error="otp_not_found"), 404
+  if datetime.utcnow() > otp.expires_at: return jsonify(ok=False, error="otp_expired"), 400
+  otp.tries += 1
+  if otp.code != code:
+    db.session.commit()
+    return jsonify(ok=False, error="otp_mismatch"), 400
 
-    now = datetime.utcnow()
-    if otp.locked_until and otp.locked_until > now:
-        return jsonify(ok=False, error="locked"), 429
-    if otp.expires_at < now:
-        return jsonify(ok=False, error="expired"), 400
+  otp.used = True; db.session.commit()
 
-    if otp.code_hash != hash_code(code):
-        otp.attempts += 1
-        if otp.attempts >= 5:
-            otp.locked_until = now + timedelta(minutes=10)
-        db.session.commit()
-        return jsonify(ok=False, error="invalid_code"), 400
+  if phone:
+    u = User.query.filter_by(phone=phone).first()
+  else:
+    u = User.query.filter_by(email=email).first()
+  if not u:
+    u = User(phone=phone or None, email=email or None, role="inquilino")
+    db.session.add(u); db.session.commit()
 
-    # OTP correcto -> emitir JWT y crear usuario si no existe
-    user = AuthUser.query.filter_by(phone=phone).first()
-    if not user:
-        user = AuthUser(phone=phone, role="user")
-        db.session.add(user); db.session.commit()
-
-    token = make_jwt(user)
-    return jsonify(ok=True, token=token, user={"phone": user.phone, "role": user.role})
-
-@bp_auth.get("/api/auth/me")
-def me():
-    # Demo: NO valida JWT aún; añade validación si quieres
-    return jsonify(ok=True, msg="Añade validación JWT aquí")
+  token = make_jwt(u)
+  return jsonify(ok=True, token=token, user=u.to_dict())
