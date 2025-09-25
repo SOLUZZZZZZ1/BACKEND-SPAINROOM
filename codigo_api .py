@@ -99,6 +99,7 @@ def create_app():
     _try_register(app, "routes_auth", "bp_auth", None)
     _try_register(app, "routes_franchise", "bp_franchise", None)
     _try_register(app, "routes_kyc", "bp_kyc", None)
+    _try_register(app, "routes_remesas", "bp_remesas", None)
     _try_register(app, "routes_reservas", "bp_reservas", None)
     _try_register(app, "routes_sms", "bp_sms", "/sms")  # opcional
 

@@ -1,7 +1,23 @@
+# render.yaml — SpainRoom API ONLY
 services:
   - type: web
-    name: spainroom-backend
+    name: spainroom-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn codigo_flask:app --host 0.0.0.0 --port $PORT --proxy-headers
+    startCommand: gunicorn -w 2 -t 60 -b 0.0.0.0:$PORT "codigo_api:create_app()"
+    healthCheckPath: /health
+    plan: free
     autoDeploy: true
+    envVars:
+      - key: SECRET_KEY
+        value: sr-prod-secret
+      - key: DATABASE_URL
+        sync: false          # set in Render dashboard (Postgres recommended in prod)
+      - key: RIA_WIDGET_BASE
+        sync: false
+      - key: RIA_PARTNER_ID
+        value: spainroom
+      - key: RIA_PARTNER_SECRET
+        sync: false
+      - key: RIA_WEBHOOK_SECRET
+        sync: false
