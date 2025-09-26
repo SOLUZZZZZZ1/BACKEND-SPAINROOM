@@ -88,7 +88,7 @@ def _authorize_franquiciado(contract: Contract, item: ContractItem, franq_header
         return False, "forbidden_franquiciado"
     return True, None
 
-# ---------- Endpoints ----------
+# ---------- FOTOS ----------
 @bp_upload_rooms.post("/api/rooms/upload_photos")
 def upload_room_photos():
     """
@@ -110,13 +110,12 @@ def upload_room_photos():
     rcode = (request.form.get("room_code") or "").strip()
     franq = (request.headers.get("X-Franquiciado") or "").strip()
 
-    # Entrada de ficheros
+    # Ficheros: soporta 'file', 'files[]' y múltiples 'file'
     files = []
     if "file" in request.files:
         files.append(request.files["file"])
     if "files[]" in request.files:
         files.extend(request.files.getlist("files[]"))
-    # soportar múltiples 'file' si el cliente los repite
     for k, fs in request.files.items(multi=True):
         if k not in ("file", "files[]"):
             files.append(fs)
@@ -189,6 +188,7 @@ def upload_room_photos():
                    room={"code": room.code, "published": room.published, "images": room.images_json},
                    uploaded=added)
 
+# ---------- FICHA ----------
 @bp_upload_rooms.post("/api/rooms/upload_sheet")
 def upload_room_sheet():
     """
@@ -199,4 +199,83 @@ def upload_room_sheet():
       - Guarda ruta en images_json.sheet (última) y en images_json.sheets (histórico)
       - NO publica por sí sola (publica la foto)
     form-data:
-     
+      sub_ref?   | ref? + room_code?
+      file       | files[]
+    headers:
+      X-Franquiciado (obligatorio si el contrato/línea tiene franchisee_id)
+    """
+    sub   = (request.form.get("sub_ref") or "").strip().upper()
+    ref   = (request.form.get("ref") or "").strip().upper()
+    rcode = (request.form.get("room_code") or "").strip()
+    franq = (request.headers.get("X-Franquiciado") or "").strip()
+
+    files = []
+    if "file" in request.files:
+        files.append(request.files["file"])
+    if "files[]" in request.files:
+        files.extend(request.files.getlist("files[]"))
+    for k, fs in request.files.items(multi=True):
+        if k not in ("file", "files[]"):
+            files.append(fs)
+
+    if not files:
+        return jsonify(ok=False, error="missing_files", message="Debes adjuntar al menos un fichero (PDF o JSON)."), 400
+
+    contract, item, room = _contract_item_by_ref(sub, ref, rcode)
+    if not (contract and item and room):
+        return jsonify(ok=False, error="contract_item_not_found", message="No se encontró el contrato/línea para esa habitación."), 404
+    if contract.status != "signed":
+        return jsonify(ok=False, error="contract_not_signed", message="El contrato no está firmado; no puedes subir fichas aún."), 403
+
+    ok_auth, auth_err = _authorize_franquiciado(contract, item, franq)
+    if not ok_auth:
+        msg = "Falta franquiciado en cabecera." if auth_err == "missing_franquiciado" else "No autorizado para esta habitación."
+        return jsonify(ok=False, error=auth_err, message=msg), 403
+
+    yyyymm = _yyyymm()
+    base_dir = os.path.join(current_app.instance_path, "uploads", "contracts", contract.ref, item.sub_ref, "sheets", yyyymm)
+    ensure_dir(base_dir)
+
+    saved = []
+    for fs in files:
+        try:
+            raw = fs.read()
+            if not raw:
+                saved.append("ERR:empty"); 
+                continue
+            hexname = sha256_bytes(raw)[:16]
+            ext = os.path.splitext(secure_filename(fs.filename or ""))[1].lower()
+            if not ext or len(ext) > 8:
+                ext = ".bin"
+            fname = f"sheet_{hexname}{ext}"
+            fpath = os.path.join(base_dir, fname)
+            with open(fpath, "wb") as f: f.write(raw)
+
+            rel = f"/instance/uploads/contracts/{contract.ref}/{item.sub_ref}/sheets/{yyyymm}/{fname}"
+
+            # Registrar upload
+            up = Upload(
+                role="room", subject_id=item.sub_ref, category="room_sheet",
+                path=f"uploads/contracts/{contract.ref}/{item.sub_ref}/sheets/{yyyymm}/{fname}",
+                mime=fs.mimetype, size_bytes=len(raw), sha256=hexname
+            )
+            db.session.add(up)
+
+            # Guardar en images_json.sheet / images_json.sheets
+            images = room.images_json or {}
+            sheets = images.get("sheets", [])
+            sheets.append({"url": rel, "sha": hexname, "ts": datetime.utcnow().isoformat()})
+            images["sheets"] = sheets
+            images["sheet"]  = sheets[-1]   # última como principal
+            room.images_json = images
+
+            saved.append(fname)
+        except Exception:
+            saved.append("ERR:save_fail")
+
+    db.session.commit()
+    return jsonify(ok=True,
+                   contract={"ref": contract.ref},
+                   item={"sub_ref": item.sub_ref, "status": item.status},
+                   room={"code": room.code, "published": room.published, "images": room.images_json},
+                   sheets=saved)
