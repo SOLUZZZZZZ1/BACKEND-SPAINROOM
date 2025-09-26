@@ -12,12 +12,4 @@ services:
       - key: SECRET_KEY
         value: sr-prod-secret
       - key: DATABASE_URL
-        sync: false          # set in Render dashboard (Postgres recommended in prod)
-      - key: RIA_WIDGET_BASE
-        sync: false
-      - key: RIA_PARTNER_ID
-        value: spainroom
-      - key: RIA_PARTNER_SECRET
-        sync: false
-      - key: RIA_WEBHOOK_SECRET
         sync: false

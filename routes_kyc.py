@@ -1,4 +1,4 @@
-# routes_kyc.py — DEMO estable
+# routes_kyc.py — DEMO estable: siempre JSON 200
 import os, secrets
 from flask import Blueprint, request, jsonify, make_response
 

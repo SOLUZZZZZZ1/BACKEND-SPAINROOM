@@ -1,6 +1,6 @@
-# models_uploads.py
+# models_uploads.py (fixed)
 from datetime import datetime
-from app import db
+from extensions import db  # FIX: use shared SQLAlchemy instance from extensions
 
 class Upload(db.Model):
     __tablename__ = "uploads"

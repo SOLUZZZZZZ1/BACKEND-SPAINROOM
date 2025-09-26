@@ -1,6 +1,6 @@
-# models_contact.py
+# models_contact.py (fixed)
 from datetime import datetime
-from app import db
+from extensions import db  # FIX: use shared SQLAlchemy instance from extensions
 
 class ContactMessage(db.Model):
     __tablename__ = "contact_messages"

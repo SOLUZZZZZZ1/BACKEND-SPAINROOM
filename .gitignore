@@ -1,31 +1,10 @@
-# --- Carpetas de uploads (no subir fotos procesadas) ---
-uploads/*
-!uploads/.gitkeep
-
-# --- Base de datos local ---
-rooms.db
-
-# --- Python ---
-__pycache__/
+﻿__pycache__/
 *.pyc
-*.pyo
-*.pyd
-*.pdb
-
-# --- Entornos virtuales ---
 .venv/
 venv/
 env/
-ENV/
-
-# --- Archivos de entorno y config local ---
-*.env
-.env.*
-*.local
-
-# --- Logs ---
+instance/
+*.db
+data/oficial/*.csv
+!data/oficial/.gitkeep
 *.log
-
-# --- macOS / Linux ---
-.DS_Store
-Thumbs.db
