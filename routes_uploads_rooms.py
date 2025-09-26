@@ -4,6 +4,8 @@ from datetime import datetime
 from io import BytesIO
 from PIL import Image
 from flask import Blueprint, request, jsonify, current_app
+from werkzeug.utils import secure_filename
+
 from extensions import db
 from models_contracts import Contract, ContractItem
 from models_rooms import Room
@@ -13,7 +15,10 @@ bp_upload_rooms = Blueprint("upload_rooms", __name__)
 
 # ---------- Helpers ----------
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
-def sha256_bytes(b: bytes) -> str: h=hashlib.sha256(); h.update(b); return h.hexdigest()
+def sha256_bytes(b: bytes) -> str: h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def _yyyymm():
+    return datetime.utcnow().strftime("%Y%m")
 
 def process_image(file_storage, max_w=1600, thumb_w=480):
     """
@@ -37,32 +42,51 @@ def process_image(file_storage, max_w=1600, thumb_w=480):
     bt = BytesIO(); im_thumb.save(bt, "JPEG", quality=82, optimize=True); thumb = bt.getvalue()
     return {"w": im_full.size[0], "h": im_full.size[1], "full": full, "thumb": thumb}
 
-def get_contract_item(sub_ref: str, ref: str, room_code: str):
+def _find_room(room_code):
+    return Room.query.filter_by(code=(room_code or "").strip()).first() if room_code else None
+
+def _contract_item_by_ref(sub_ref: str, ref: str, room_code: str):
     """
-    Localiza la línea del contrato (ContractItem) por:
-      - sub_ref (preferido)  o
+    Localiza Contract, ContractItem y Room por:
+      - sub_ref (preferido), o
       - ref + room_code
     Devuelve (contract, item, room) o (None, None, None)
     """
-    item = None
-    contract = None
-    room = None
+    sub_ref = (sub_ref or "").strip().upper()
+    ref     = (ref or "").strip().upper()
+    room    = None
+
     if sub_ref:
-        item = ContractItem.query.filter_by(sub_ref=sub_ref).first()
-        if item:
-            contract = item.contract
-            room = db.session.get(Room, item.room_id)
-            return contract, item, room
-        return None, None, None
-    # ref + room_code
+        it = ContractItem.query.filter_by(sub_ref=sub_ref).first()
+        if not it: return None, None, None
+        c = it.contract
+        room = db.session.get(Room, it.room_id)
+        return c, it, room
+
     if not ref or not room_code:
         return None, None, None
-    contract = Contract.query.filter_by(ref=ref).first()
-    if not contract: return None, None, None
-    room = Room.query.filter_by(code=room_code).first()
+
+    c = Contract.query.filter_by(ref=ref).first()
+    if not c: return None, None, None
+    room = _find_room(room_code)
     if not room: return None, None, None
-    item = ContractItem.query.filter_by(contract_id=contract.id, room_id=room.id).first()
-    return contract, item, room
+    it = ContractItem.query.filter_by(contract_id=c.id, room_id=room.id).first()
+    if not it: return None, None, None
+    return c, it, room
+
+def _authorize_franquiciado(contract: Contract, item: ContractItem, franq_header: str):
+    """
+    Si el contrato o la línea tienen franchisee_id definido,
+    exige cabecera X-Franquiciado y que coincida.
+    """
+    need = item.franchisee_id or contract.franchisee_id
+    if not need:
+        return True, None
+    if not franq_header:
+        return False, "missing_franquiciado"
+    if franq_header != need:
+        return False, "forbidden_franquiciado"
+    return True, None
 
 # ---------- Endpoints ----------
 @bp_upload_rooms.post("/api/rooms/upload_photos")
@@ -79,46 +103,56 @@ def upload_room_photos():
       sub_ref?   | ref? + room_code?
       file       | files[] múltiples
     headers:
-      X-Franquiciado (opcional validar con contract.franchisee_id)
+      X-Franquiciado (obligatorio si el contrato/línea tiene franchisee_id)
     """
-    sub  = (request.form.get("sub_ref") or "").strip().upper()
-    ref  = (request.form.get("ref") or "").strip().upper()
-    rcode= (request.form.get("room_code") or "").strip()
-    franq= (request.headers.get("X-Franquiciado") or "").strip()
+    sub   = (request.form.get("sub_ref") or "").strip().upper()
+    ref   = (request.form.get("ref") or "").strip().upper()
+    rcode = (request.form.get("room_code") or "").strip()
+    franq = (request.headers.get("X-Franquiciado") or "").strip()
 
-    # Archivos: soporta 'file' y 'files[]'
+    # Entrada de ficheros
     files = []
     if "file" in request.files:
         files.append(request.files["file"])
     if "files[]" in request.files:
-        # werkzeug agrupa múltiples bajo el mismo nombre con getlist
         files.extend(request.files.getlist("files[]"))
-    # también soporta múltiples 'file' si el cliente los repite
+    # soportar múltiples 'file' si el cliente los repite
     for k, fs in request.files.items(multi=True):
-        if k not in ("file", "files[]"):  # no duplicar los ya cogidos
+        if k not in ("file", "files[]"):
             files.append(fs)
 
     if not files:
-        return jsonify(ok=False, error="missing_files"), 400
+        return jsonify(ok=False, error="missing_files", message="Debes adjuntar una o más imágenes."), 400
 
-    contract, item, room = get_contract_item(sub, ref, rcode)
-    if not item or not contract or not room:
-        return jsonify(ok=False, error="contract_item_not_found"), 404
+    contract, item, room = _contract_item_by_ref(sub, ref, rcode)
+    if not (contract and item and room):
+        return jsonify(ok=False, error="contract_item_not_found", message="No se encontró el contrato/línea para esa habitación."), 404
     if contract.status != "signed":
-        return jsonify(ok=False, error="contract_not_signed"), 403
-    if contract.franchisee_id and franq and franq != contract.franchisee_id:
-        return jsonify(ok=False, error="forbidden_franquiciado"), 403
+        return jsonify(ok=False, error="contract_not_signed", message="El contrato no está firmado; no puedes subir fotos aún."), 403
 
-    yyyymm = datetime.utcnow().strftime("%Y%m")
+    ok_auth, auth_err = _authorize_franquiciado(contract, item, franq)
+    if not ok_auth:
+        msg = "Falta franquiciado en cabecera." if auth_err == "missing_franquiciado" else "No autorizado para esta habitación."
+        return jsonify(ok=False, error=auth_err, message=msg), 403
+
+    yyyymm = _yyyymm()
     base_dir = os.path.join(current_app.instance_path, "uploads", "contracts", contract.ref, item.sub_ref, yyyymm)
     ensure_dir(base_dir)
 
     added = []
+    any_ok = False
     for fs in files:
         try:
+            # Validar extensión
+            ext = os.path.splitext(secure_filename(fs.filename or ""))[1].lower()
+            if ext not in (".jpg", ".jpeg", ".png"):
+                added.append("ERR:bad_image_type")
+                continue
+
             im = process_image(fs)
             hexname = sha256_bytes(im["full"])[:16]
             full_name, thumb_name = f"{hexname}.jpg", f"{hexname}_t.jpg"
+
             with open(os.path.join(base_dir, full_name), "wb") as f: f.write(im["full"])
             with open(os.path.join(base_dir, thumb_name), "wb") as f: f.write(im["thumb"])
 
@@ -140,13 +174,12 @@ def upload_room_photos():
             })
             room.images_json = {"gallery": gallery, "cover": gallery[0] if gallery else None}
             room.published = True
-            added.append(full_name)
-        except Exception as e:
-            # continúa con las demás imágenes, y deja constancia en respuesta
-            added.append(f"ERR:{getattr(e,'message',str(e))}")
+            added.append(full_name); any_ok = True
+        except Exception:
+            added.append("ERR:invalid_image")
 
     # estado línea -> published si subimos al menos 1 foto válida
-    if any(not a.startswith("ERR:") for a in added) and item.status in ("draft", "ready"):
+    if any_ok and item.status in ("draft", "ready"):
         item.status = "published"
 
     db.session.commit()
@@ -166,79 +199,4 @@ def upload_room_sheet():
       - Guarda ruta en images_json.sheet (última) y en images_json.sheets (histórico)
       - NO publica por sí sola (publica la foto)
     form-data:
-      sub_ref?   | ref? + room_code?
-      file       | files[]
-    """
-    sub  = (request.form.get("sub_ref") or "").strip().upper()
-    ref  = (request.form.get("ref") or "").strip().upper()
-    rcode= (request.form.get("room_code") or "").strip()
-    franq= (request.headers.get("X-Franquiciado") or "").strip()
-
-    files = []
-    if "file" in request.files:
-        files.append(request.files["file"])
-    if "files[]" in request.files:
-        files.extend(request.files.getlist("files[]"))
-    for k, fs in request.files.items(multi=True):
-        if k not in ("file", "files[]"):
-            files.append(fs)
-
-    if not files:
-        return jsonify(ok=False, error="missing_files"), 400
-
-    contract, item, room = get_contract_item(sub, ref, rcode)
-    if not item or not contract or not room:
-        return jsonify(ok=False, error="contract_item_not_found"), 404
-    if contract.status != "signed":
-        return jsonify(ok=False, error="contract_not_signed"), 403
-    if contract.franchisee_id and franq and franq != contract.franchisee_id:
-        return jsonify(ok=False, error="forbidden_franquiciado"), 403
-
-    yyyymm = datetime.utcnow().strftime("%Y%m")
-    base_dir = os.path.join(current_app.instance_path, "uploads", "contracts", contract.ref, item.sub_ref, "sheets", yyyymm)
-    ensure_dir(base_dir)
-
-    saved = []
-    for fs in files:
-        try:
-            b = fs.read()
-            if not b: 
-                saved.append("ERR:empty"); 
-                continue
-            hexname = sha256_bytes(b)[:16]
-            ext = ".bin"
-            if fs.filename and "." in fs.filename:
-                ext = "." + fs.filename.rsplit(".",1)[-1].lower()
-                if len(ext) > 8: ext = ".bin"
-            fname = f"sheet_{hexname}{ext}"
-            fpath = os.path.join(base_dir, fname)
-            with open(fpath, "wb") as f: f.write(b)
-
-            rel = f"/instance/uploads/contracts/{contract.ref}/{item.sub_ref}/sheets/{yyyymm}/{fname}"
-
-            # Registrar upload
-            up = Upload(
-                role="room", subject_id=item.sub_ref, category="room_sheet",
-                path=f"uploads/contracts/{contract.ref}/{item.sub_ref}/sheets/{yyyymm}/{fname}",
-                mime=fs.mimetype, size_bytes=len(b), sha256=hexname
-            )
-            db.session.add(up)
-
-            # Guardar en images_json.sheet / images_json.sheets
-            images = room.images_json or {}
-            sheets = images.get("sheets", [])
-            sheets.append({"url": rel, "sha": hexname, "ts": datetime.utcnow().isoformat()})
-            images["sheets"] = sheets
-            images["sheet"]  = sheets[-1]   # última como principal
-            room.images_json = images
-
-            saved.append(fname)
-        except Exception as e:
-            saved.append(f"ERR:{getattr(e,'message',str(e))}")
-
-    db.session.commit()
-    return jsonify(ok=True,
-                   contract={"ref": contract.ref},
-                   item={"sub_ref": item.sub_ref, "status": item.status},
-                   room={"code": room.code, "published": room.published, "images": room.images_json},
-                   sheets=saved)
+     
