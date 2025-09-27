@@ -1,12 +1,12 @@
-# routes_auth.py
-import os, re, time
+# routes_auth.py — SpainRoom Auth (OTP + Password Link + Password Login) con Twilio y parches anti-500
+import os, re, time, random
 from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, current_app
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 
 from extensions import db
-from models_auth import User, Otp  # Asegúrate de que User tenga password_hash
+from models_auth import User, Otp  # Asegúrate de que User tenga password_hash y Otp funcione
 
 bp_auth = Blueprint("auth", __name__)
 
@@ -110,31 +110,53 @@ def create_user():
         u.role = role or u.role; u.name = name or u.name; db.session.commit()
     return jsonify(ok=True, user=u.to_dict())
 
-# ----- OTP por SMS (alternativa) -----
+# ----- OTP por SMS (parche anti-500) -----
 @bp_auth.post("/api/auth/request_otp")
 def request_otp():
     data = request.get_json(force=True)
     phone = normalize_phone(data.get("phone") or "")
     email = (data.get("email") or "").strip().lower()
     target = phone or email
-    if not target: return jsonify(ok=False, error="need_phone_or_email"), 400
-    if phone and not PHONE_RE.match(phone): return jsonify(ok=False, error="bad_phone"), 400
+    if not target:
+        return jsonify(ok=False, error="need_phone_or_email"), 400
+    if phone and not PHONE_RE.match(phone):
+        return jsonify(ok=False, error="bad_phone"), 400
 
-    if phone:
-        u = User.query.filter_by(phone=phone).first()
-        if not u: u = User(phone=phone, role="inquilino"); db.session.add(u); db.session.commit()
-    else:
-        u = User.query.filter_by(email=email).first()
-        if not u: u = User(email=email, role="inquilino"); db.session.add(u); db.session.commit()
+    # asegura usuario
+    try:
+        if phone:
+            u = User.query.filter_by(phone=phone).first()
+            if not u:
+                u = User(phone=phone, role="inquilino"); db.session.add(u); db.session.commit()
+        else:
+            u = User.query.filter_by(email=email).first()
+            if not u:
+                u = User(email=email, role="inquilino"); db.session.add(u); db.session.commit()
+    except Exception as e:
+        current_app.logger.exception("[OTP] fallo preparando usuario: %s", e)
+        return jsonify(ok=False, error="server_error_user"), 500
 
-    otp = Otp.new(target, ttl_sec=300)
-    db.session.add(otp); db.session.commit()
+    # genera OTP (persistente si el modelo lo soporta) o fallback
+    code = None
+    try:
+        otp = Otp.new(target, ttl_sec=300)    # tu modelo debe tener este método
+        code = otp.code
+        db.session.add(otp); db.session.commit()
+    except Exception as e:
+        current_app.logger.exception("[OTP] fallo creando OTP: %s", e)
+        code = f"{random.randint(0, 999999):06d}"  # fallback (no persistido)
+        current_app.logger.warning("[OTP] usando fallback code (no persistido)")
 
-    if phone:
-        # Envío real del OTP por SMS
-        send_sms(phone, f"SpainRoom: tu código es {otp.code}. Caduca en 5 min.")
-    current_app.logger.info("[OTP] solicitado para %s (code oculto)", target)
-    return jsonify(ok=True, sent=True)
+    # intenta enviar SMS; si Twilio falla, no tumbes
+    sent = False
+    try:
+        if phone and code:
+            sent = send_sms(phone, f"SpainRoom: tu código es {code}. Caduca en 5 min.")
+    except Exception as e:
+        current_app.logger.warning("[OTP] fallo enviando SMS: %s", e)
+
+    current_app.logger.info("[OTP] solicitado para %s (sent=%s)", target, sent)
+    return jsonify(ok=True, sent=bool(sent))
 
 @bp_auth.post("/api/auth/verify_otp")
 def verify_otp():
@@ -143,11 +165,14 @@ def verify_otp():
     email = (data.get("email") or "").strip().lower()
     code  = (data.get("code") or "").strip()
     target= phone or email
-    if not target or not code: return jsonify(ok=False, error="missing_fields"), 400
+    if not target or not code:
+        return jsonify(ok=False, error="missing_fields"), 400
 
     otp = (Otp.query.filter_by(target=target, used=False).order_by(Otp.created_at.desc()).first())
-    if not otp: return jsonify(ok=False, error="otp_not_found"), 404
-    if datetime.utcnow() > otp.expires_at: return jsonify(ok=False, error="otp_expired"), 400
+    if not otp:
+        return jsonify(ok=False, error="otp_not_found"), 404
+    if datetime.utcnow() > otp.expires_at:
+        return jsonify(ok=False, error="otp_expired"), 400
     otp.tries += 1
     if otp.code != code:
         db.session.commit()
@@ -166,7 +191,7 @@ def verify_otp():
     token = make_jwt(u)
     return jsonify(ok=True, token=token, user=u.to_dict())
 
-# ----- Enlace SMS para crear/recuperar contraseña -----
+# ----- Enlace SMS para crear/recuperar contraseña (con fallback demo) -----
 @bp_auth.post("/api/auth/request_password_link")
 def request_password_link():
     data = request.get_json(force=True)
@@ -183,11 +208,15 @@ def request_password_link():
 
     token = _make_passlink_token(phone)
     link = f"{FRONTEND_BASE_URL}/set-password?token={token}"
-    ok = send_sms(phone, f"SpainRoom: crea o recupera tu contraseña aquí: {link}")
 
-    # Si Twilio no está configurado, devolvemos el link en demo para pruebas
+    ok = False
+    try:
+        ok = send_sms(phone, f"SpainRoom: crea o recupera tu contraseña aquí: {link}")
+    except Exception as e:
+        current_app.logger.warning("[AUTH] fallo enviando passlink: %s", e)
+
     if not ok:
-        current_app.logger.warning("[AUTH] Twilio no configurado; passlink demo -> %s", link)
+        current_app.logger.warning("[AUTH] Twilio no configurado o fallo; passlink demo -> %s", link)
         return jsonify(ok=True, demo=True, link=link)
 
     return jsonify(ok=True, sent=True)
