@@ -1,8 +1,11 @@
-# codigo_api.py — SpainRoom API ONLY (Flask + SQLAlchemy)
+# codigo_api.py — SpainRoom API ONLY (Flask + SQLAlchemy) con autocreación de BD
 import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from extensions import db  # instancia SQLAlchemy compartida
+from extensions import db
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import OperationalError
+import psycopg2
 
 def env(k, default=""):
     return os.getenv(k, default)
@@ -20,74 +23,108 @@ def _allowed_origin(origin: str | None) -> bool:
     }
 
 def _try_register(app: Flask, module_name: str, attr: str, url_prefix: str | None = None):
-    """
-    Registra un blueprint si el módulo existe; si falla, no rompe el arranque.
-    """
     try:
         mod = __import__(module_name, fromlist=[attr])
         bp = getattr(mod, attr)
-        if url_prefix:
-            app.register_blueprint(bp, url_prefix=url_prefix)
-        else:
-            app.register_blueprint(bp)
+        app.register_blueprint(bp, url_prefix=url_prefix) if url_prefix else app.register_blueprint(bp)
         app.logger.info("BP OK: %s.%s -> %s", module_name, attr, url_prefix or "/")
     except Exception as e:
         app.logger.warning("BP SKIP: %s.%s (%s)", module_name, attr, e)
+
+def _import_models(app: Flask):
+    """Importa modelos ANTES de create_all()."""
+    for modname in [
+        "models_rooms", "models_auth", "models_contracts", "models_uploads",
+        "models_franchise", "models_reservas", "models_remesas", "models_leads"
+    ]:
+        try:
+            __import__(modname)
+        except Exception as e:
+            app.logger.warning("Model skip: %s (%s)", modname, e)
+
+def _create_database_if_missing(app: Flask, db_uri: str) -> str:
+    """
+    Si la BD no existe: se conecta a 'postgres' y la crea con el mismo owner.
+    Devuelve la URI final (la original).
+    """
+    url = make_url(db_uri)
+    if url.get_backend_name() != "postgresql":
+        # No Postgres → no hacemos nada especial
+        return db_uri
+
+    target_db = url.database
+    host = url.host
+    port = url.port or 5432
+    user = url.username
+    pwd  = url.password
+
+    # Conecta a la BD de mantenimiento 'postgres' y crea si falta
+    app.logger.warning('Intentando crear BD "%s" en %s:%s ...', target_db, host, port)
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            dbname="postgres", user=user, password=pwd, host=host, port=port, sslmode=url.query.get("sslmode","require")
+        )
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s;", (target_db,))
+            exists = cur.fetchone() is not None
+            if not exists:
+                owner = user or "spainroom_user"
+                cur.execute(f"CREATE DATABASE {target_db} WITH OWNER = {owner} ENCODING 'UTF8' TEMPLATE template1;")
+                app.logger.info('BD "%s" creada con OWNER "%s".', target_db, owner)
+            else:
+                app.logger.info('BD "%s" ya existía.', target_db)
+    except Exception as e:
+        app.logger.exception("No se pudo crear la BD automáticamente: %s", e)
+        # No relanzamos aquí: se reintentará el create_all más abajo y verás el error en logs
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+    return db_uri
 
 def create_app():
     app = Flask(__name__)
 
     # -------------------- Config --------------------
     app.config["SECRET_KEY"] = env("SECRET_KEY", "sr-dev-secret")
-    app.config["SQLALCHEMY_DATABASE_URI"] = env("DATABASE_URL", "sqlite:///spainroom.db")
+    db_uri = env("DATABASE_URL", "sqlite:///spainroom.db")
+    app.config["SQLALCHEMY_DATABASE_URI"] = db_uri
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-    # CORS (afinamos en after_request)
+    # CORS
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
     # -------------------- DB init --------------------
     db.init_app(app)
 
-    # IMPORTA MODELOS **ANTES** DE create_all()  (para asegurar tablas)
-    # Si un modelo no está, el import falla silenciosamente y no rompe.
-    try:
-        import models_rooms          # noqa: F401
-    except Exception as e:
-        app.logger.warning("Model skip: models_rooms (%s)", e)
-    try:
-        import models_auth           # noqa: F401
-    except Exception as e:
-        app.logger.warning("Model skip: models_auth (%s)", e)
-    try:
-        import models_contracts      # noqa: F401
-    except Exception as e:
-        app.logger.warning("Model skip: models_contracts (%s)", e)
-    try:
-        import models_uploads        # noqa: F401
-    except Exception as e:
-        app.logger.warning("Model skip: models_uploads (%s)", e)
-    try:
-        import models_franchise      # noqa: F401
-    except Exception as e:
-        app.logger.warning("Model skip: models_franchise (%s)", e)
-    try:
-        import models_reservas       # noqa: F401
-    except Exception as e:
-        app.logger.warning("Model skip: models_reservas (%s)", e)
-    try:
-        import models_remesas        # noqa: F401
-    except Exception as e:
-        app.logger.warning("Model skip: models_remesas (%s)", e)
-    try:
-        import models_leads          # ✅ necesario para crear la tabla 'leads'
-    except Exception as e:
-        app.logger.warning("Model skip: models_leads (%s)", e)
+    # 1) Importa modelos
+    _import_models(app)
 
-    # Crea tablas existentes en los modelos importados
+    # 2) Intenta create_all(); si falla por "database does not exist", crea BD y reintenta
     with app.app_context():
         try:
             db.create_all()
             app.logger.info("DB create_all() OK (uri=%s)", app.config.get("SQLALCHEMY_DATABASE_URI"))
+        except OperationalError as oe:
+            msg = str(oe).lower()
+            if "database" in msg and "does not exist" in msg:
+                app.logger.warning('La BD objetivo no existe. Intentando crearla automáticamente...')
+                # Crea BD y reintenta
+                final_uri = _create_database_if_missing(app, db_uri)
+                app.config["SQLALCHEMY_DATABASE_URI"] = final_uri
+                db.engine.dispose()
+                try:
+                    db.create_all()
+                    app.logger.info("DB create_all() OK tras crear BD (uri=%s)", final_uri)
+                except Exception as e2:
+                    app.logger.exception("DB create_all() failed tras crear BD: %s", e2)
+            else:
+                app.logger.exception("DB create_all() failed: %s", oe)
         except Exception as e:
             app.logger.exception("DB create_all() failed: %s", e)
 
@@ -104,7 +141,7 @@ def create_app():
             blueprints=list(app.blueprints.keys()),
         )
 
-    # CORS fino por respuesta
+    # CORS fino
     @app.after_request
     def add_cors_headers(resp):
         origin = request.headers.get("Origin")
@@ -128,9 +165,9 @@ def create_app():
     _try_register(app, "routes_leads",             "bp_leads",        None)
     _try_register(app, "routes_uploads_rooms",     "bp_upload_rooms", None)
     _try_register(app, "routes_upload_generic",    "bp_upload_generic", None)
-    _try_register(app, "routes_sms",               "bp_sms",          "/sms")  # opción A: prefijo /sms
+    _try_register(app, "routes_sms",               "bp_sms",          "/sms")
 
-    # (Opcional) endpoints de diagnóstico/desarrollo
+    # (opcionales de diagnóstico)
     _try_register(app, "routes_dev_twilio",        "bp_dev_twilio",   None)
     _try_register(app, "routes_dev_sms",           "bp_dev_sms",      None)
 
