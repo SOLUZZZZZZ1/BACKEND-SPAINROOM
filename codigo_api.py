@@ -81,7 +81,9 @@ def create_app():
     _try_register(app, "routes_reservas",   "bp_reservas",   None)
     _try_register(app, "routes_remesas",    "bp_remesas",    None)
     _try_register(app, "routes_leads",      "bp_leads",      None)
-    _try_register(app, "routes_sms",        "bp_sms",        "/sms")
+    _try_register(app, "routes_sms", "bp_sms", "/sms")
+    _try_register(app, "routes_dev_sms", "bp_dev_sms", None)
+
 
     return app
 
