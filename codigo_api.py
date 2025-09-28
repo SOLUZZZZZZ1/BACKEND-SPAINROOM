@@ -168,8 +168,7 @@ def create_app():
     _try_register(app, "routes_sms",               "bp_sms",          "/sms")
 
     # (opcionales de diagnóstico)
-    _try_register(app, "routes_dev_twilio",        "bp_dev_twilio",   None)
-    _try_register(app, "routes_dev_sms",           "bp_dev_sms",      None)
+    
 
     return app
 
