@@ -20,6 +20,9 @@ def _allowed_origin(origin: str | None) -> bool:
     }
 
 def _try_register(app: Flask, module_name: str, attr: str, url_prefix: str | None = None):
+    """
+    Registra un blueprint si el módulo existe; si falla, no rompe el arranque.
+    """
     try:
         mod = __import__(module_name, fromlist=[attr])
         bp = getattr(mod, attr)
@@ -34,20 +37,61 @@ def _try_register(app: Flask, module_name: str, attr: str, url_prefix: str | Non
 def create_app():
     app = Flask(__name__)
 
+    # -------------------- Config --------------------
     app.config["SECRET_KEY"] = env("SECRET_KEY", "sr-dev-secret")
     app.config["SQLALCHEMY_DATABASE_URI"] = env("DATABASE_URL", "sqlite:///spainroom.db")
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+    # CORS (afinamos en after_request)
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
+    # -------------------- DB init --------------------
     db.init_app(app)
+
+    # IMPORTA MODELOS **ANTES** DE create_all()  (para asegurar tablas)
+    # Si un modelo no está, el import falla silenciosamente y no rompe.
+    try:
+        import models_rooms          # noqa: F401
+    except Exception as e:
+        app.logger.warning("Model skip: models_rooms (%s)", e)
+    try:
+        import models_auth           # noqa: F401
+    except Exception as e:
+        app.logger.warning("Model skip: models_auth (%s)", e)
+    try:
+        import models_contracts      # noqa: F401
+    except Exception as e:
+        app.logger.warning("Model skip: models_contracts (%s)", e)
+    try:
+        import models_uploads        # noqa: F401
+    except Exception as e:
+        app.logger.warning("Model skip: models_uploads (%s)", e)
+    try:
+        import models_franchise      # noqa: F401
+    except Exception as e:
+        app.logger.warning("Model skip: models_franchise (%s)", e)
+    try:
+        import models_reservas       # noqa: F401
+    except Exception as e:
+        app.logger.warning("Model skip: models_reservas (%s)", e)
+    try:
+        import models_remesas        # noqa: F401
+    except Exception as e:
+        app.logger.warning("Model skip: models_remesas (%s)", e)
+    try:
+        import models_leads          # ✅ necesario para crear la tabla 'leads'
+    except Exception as e:
+        app.logger.warning("Model skip: models_leads (%s)", e)
+
+    # Crea tablas existentes en los modelos importados
     with app.app_context():
         try:
             db.create_all()
-            app.logger.info("DB create_all() OK")
+            app.logger.info("DB create_all() OK (uri=%s)", app.config.get("SQLALCHEMY_DATABASE_URI"))
         except Exception as e:
             app.logger.exception("DB create_all() failed: %s", e)
 
+    # -------------------- Salud/Diag --------------------
     @app.get("/health")
     def health():
         return jsonify(ok=True, service="spainroom-api")
@@ -56,10 +100,11 @@ def create_app():
     def diag():
         return jsonify(
             ok=True,
-            db_uri=app.config.get("SQLALCHEMY_DATABASE_URI","sqlite"),
-            blueprints=list(app.blueprints.keys())
+            db_uri=app.config.get("SQLALCHEMY_DATABASE_URI", "sqlite"),
+            blueprints=list(app.blueprints.keys()),
         )
 
+    # CORS fino por respuesta
     @app.after_request
     def add_cors_headers(resp):
         origin = request.headers.get("Origin")
@@ -71,19 +116,23 @@ def create_app():
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp
 
-    # Blueprints (tolerantes)
-    _try_register(app, "routes_rooms",      "bp_rooms",      None)
-    _try_register(app, "routes_contracts",  "bp_contracts",  None)
-    _try_register(app, "routes_contact",    "bp_contact",    None)
-    _try_register(app, "routes_auth",       "bp_auth",       None)
-    _try_register(app, "routes_franchise",  "bp_franchise",  None)
-    _try_register(app, "routes_kyc",        "bp_kyc",        None)
-    _try_register(app, "routes_reservas",   "bp_reservas",   None)
-    _try_register(app, "routes_remesas",    "bp_remesas",    None)
-    _try_register(app, "routes_leads",      "bp_leads",      None)
-    _try_register(app, "routes_sms", "bp_sms", "/sms")
-    _try_register(app, "routes_dev_sms", "bp_dev_sms", None)
+    # -------------------- Blueprints (sin pagos aquí) --------------------
+    _try_register(app, "routes_rooms",             "bp_rooms",        None)
+    _try_register(app, "routes_contracts",         "bp_contracts",    None)
+    _try_register(app, "routes_contact",           "bp_contact",      None)
+    _try_register(app, "routes_auth",              "bp_auth",         None)
+    _try_register(app, "routes_franchise",         "bp_franchise",    None)
+    _try_register(app, "routes_kyc",               "bp_kyc",          None)
+    _try_register(app, "routes_reservas",          "bp_reservas",     None)
+    _try_register(app, "routes_remesas",           "bp_remesas",      None)
+    _try_register(app, "routes_leads",             "bp_leads",        None)
+    _try_register(app, "routes_uploads_rooms",     "bp_upload_rooms", None)
+    _try_register(app, "routes_upload_generic",    "bp_upload_generic", None)
+    _try_register(app, "routes_sms",               "bp_sms",          "/sms")  # opción A: prefijo /sms
 
+    # (Opcional) endpoints de diagnóstico/desarrollo
+    _try_register(app, "routes_dev_twilio",        "bp_dev_twilio",   None)
+    _try_register(app, "routes_dev_sms",           "bp_dev_sms",      None)
 
     return app
 
