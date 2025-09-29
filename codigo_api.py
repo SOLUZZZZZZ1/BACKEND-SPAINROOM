@@ -1,4 +1,4 @@
-# codigo_api.py — SpainRoom API ONLY (Flask + SQLAlchemy) con autocreación de BD
+# codigo_api.py — SpainRoom API ONLY (Flask + SQLAlchemy) con autocreación de BD y ruta /
 import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -26,7 +26,10 @@ def _try_register(app: Flask, module_name: str, attr: str, url_prefix: str | Non
     try:
         mod = __import__(module_name, fromlist=[attr])
         bp = getattr(mod, attr)
-        app.register_blueprint(bp, url_prefix=url_prefix) if url_prefix else app.register_blueprint(bp)
+        if url_prefix:
+            app.register_blueprint(bp, url_prefix=url_prefix)
+        else:
+            app.register_blueprint(bp)
         app.logger.info("BP OK: %s.%s -> %s", module_name, attr, url_prefix or "/")
     except Exception as e:
         app.logger.warning("BP SKIP: %s.%s (%s)", module_name, attr, e)
@@ -49,7 +52,6 @@ def _create_database_if_missing(app: Flask, db_uri: str) -> str:
     """
     url = make_url(db_uri)
     if url.get_backend_name() != "postgresql":
-        # No Postgres → no hacemos nada especial
         return db_uri
 
     target_db = url.database
@@ -57,13 +59,13 @@ def _create_database_if_missing(app: Flask, db_uri: str) -> str:
     port = url.port or 5432
     user = url.username
     pwd  = url.password
+    sslmode = url.query.get("sslmode", "require")
 
-    # Conecta a la BD de mantenimiento 'postgres' y crea si falta
     app.logger.warning('Intentando crear BD "%s" en %s:%s ...', target_db, host, port)
     conn = None
     try:
         conn = psycopg2.connect(
-            dbname="postgres", user=user, password=pwd, host=host, port=port, sslmode=url.query.get("sslmode","require")
+            dbname="postgres", user=user, password=pwd, host=host, port=port, sslmode=sslmode
         )
         conn.autocommit = True
         with conn.cursor() as cur:
@@ -77,7 +79,6 @@ def _create_database_if_missing(app: Flask, db_uri: str) -> str:
                 app.logger.info('BD "%s" ya existía.', target_db)
     except Exception as e:
         app.logger.exception("No se pudo crear la BD automáticamente: %s", e)
-        # No relanzamos aquí: se reintentará el create_all más abajo y verás el error en logs
     finally:
         try:
             if conn:
@@ -114,7 +115,6 @@ def create_app():
             msg = str(oe).lower()
             if "database" in msg and "does not exist" in msg:
                 app.logger.warning('La BD objetivo no existe. Intentando crearla automáticamente...')
-                # Crea BD y reintenta
                 final_uri = _create_database_if_missing(app, db_uri)
                 app.config["SQLALCHEMY_DATABASE_URI"] = final_uri
                 db.engine.dispose()
@@ -128,14 +128,10 @@ def create_app():
         except Exception as e:
             app.logger.exception("DB create_all() failed: %s", e)
 
-    # -------------------- Salud/Diag --------------------
+    # -------------------- Rutas de salud/diag y raíz --------------------
     @app.get("/health")
     def health():
         return jsonify(ok=True, service="spainroom-api")
-    @app.get("/")
-    def root():
-    return jsonify(ok=True, service="spainroom-api", hint="use /health, /diag, /api/* or POST /sms/inbound")
-
 
     @app.get("/diag")
     def diag():
@@ -144,6 +140,11 @@ def create_app():
             db_uri=app.config.get("SQLALCHEMY_DATABASE_URI", "sqlite"),
             blueprints=list(app.blueprints.keys()),
         )
+
+    @app.get("/")
+    def root():
+        return jsonify(ok=True, service="spainroom-api",
+                       hint="use /health, /diag, /api/* or POST /sms/inbound")
 
     # CORS fino
     @app.after_request
@@ -157,7 +158,7 @@ def create_app():
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp
 
-    # -------------------- Blueprints (sin pagos aquí) --------------------
+    # -------------------- Blueprints --------------------
     _try_register(app, "routes_rooms",             "bp_rooms",        None)
     _try_register(app, "routes_contracts",         "bp_contracts",    None)
     _try_register(app, "routes_contact",           "bp_contact",      None)
@@ -171,8 +172,9 @@ def create_app():
     _try_register(app, "routes_upload_generic",    "bp_upload_generic", None)
     _try_register(app, "routes_sms",               "bp_sms",          "/sms")
 
-    # (opcionales de diagnóstico)
-    
+    # (Quito dev opcionales para evitar warnings)
+    # _try_register(app, "routes_dev_twilio",        "bp_dev_twilio",   None)
+    # _try_register(app, "routes_dev_sms",           "bp_dev_sms",      None)
 
     return app
 
