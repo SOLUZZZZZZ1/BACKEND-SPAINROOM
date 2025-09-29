@@ -1,10 +1,24 @@
-# routes_sms.py — Webhook SMS (modo seguro sin BD)
+# routes_sms.py — Webhook de SMS entrantes (Twilio) + creación automática de Lead (autocrea tabla)
 import os, re
 from flask import Blueprint, request, jsonify, current_app
+from sqlalchemy import exc as sa_exc
 
-bp_sms = Blueprint("sms", __name__)
+from extensions import db
 
-# Validación firma opcional
+# Modelos
+try:
+    from models_leads import Lead
+except Exception:
+    Lead = None
+
+# Enrutado a franquiciado opcional
+try:
+    from services_owner import route_franchisee as guess_franquiciado
+except Exception:
+    def guess_franquiciado(provincia, municipio):
+        return None
+
+# Firma Twilio opcional
 VALIDATE_SIGNATURE = (os.getenv("VALIDATE_TWILIO_SIGNATURE", "off").lower() == "on")
 if VALIDATE_SIGNATURE:
     try:
@@ -12,6 +26,7 @@ if VALIDATE_SIGNATURE:
     except Exception:
         VALIDATE_SIGNATURE = False
 
+bp_sms = Blueprint("sms", __name__)
 PHONE_RE = re.compile(r"^\+?\d{9,15}$")
 
 def _normalize_phone(v: str | None) -> str:
@@ -43,27 +58,69 @@ def _validate_twilio_signature() -> bool:
         current_app.logger.warning("[SMS IN] Error validando firma: %s", e)
         return False
 
+def _ensure_leads_table():
+    if Lead is None:
+        return
+    try:
+        Lead.__table__.create(bind=db.engine, checkfirst=True)
+    except sa_exc.SQLAlchemyError as e:
+        current_app.logger.warning("[SMS IN] No se pudo asegurar tabla leads: %s", e)
+
+def _infer_kind(text: str) -> str:
+    t = (text or "").lower()
+    if any(w in t for w in ("franquicia", "franquiciado", "franchise")): return "franchise"
+    if any(w in t for w in ("propietario", "dueño", "dueno", "propiedad", "mi piso")): return "owner"
+    if any(w in t for w in ("inquilino", "alquiler", "alquilar", "habitación", "habitacion", "room", "hab")): return "tenant"
+    return "tenant"
+
 @bp_sms.post("/inbound")
 def sms_inbound():
     # 1) Firma (si está activada)
     if not _validate_twilio_signature():
         return jsonify(ok=False, error="invalid_signature"), 403
 
-    # 2) Parse y LOG — sin tocar BD
+    # 2) Parse seguro
     try:
         frm = _normalize_phone(request.form.get("From", ""))
         to  = _normalize_phone(request.form.get("To", ""))
-        body= (request.form.get("Body", "") or "").strip()
-        sid = request.form.get("MessageSid", "")
+        body = (request.form.get("Body", "") or "").strip()
+        sid  = request.form.get("MessageSid", "")
         num_media = int(request.form.get("NumMedia", "0") or 0)
-        current_app.logger.info("[SMS IN][NO-DB] from=%s to=%s sid=%s media=%s body=%s", frm, to, sid, num_media, body[:200])
+        current_app.logger.info("[SMS IN] from=%s to=%s sid=%s media=%s body=%s",
+                                frm, to, sid, num_media, body[:200])
     except Exception as e:
         current_app.logger.warning("[SMS IN] Excepción parseando payload: %s", e)
-        return jsonify(ok=True, mode="no-db")
+        return jsonify(ok=True)  # no reintentos
 
-    # 3) Validación básica
     if not frm or not PHONE_RE.fullmatch(frm):
-        return jsonify(ok=True, mode="no-db")
+        return jsonify(ok=True)
 
-    # 4) Siempre 200 (Twilio no reintenta)
-    return jsonify(ok=True, mode="no-db")
+    # 3) Autocrear tabla y persistir lead (nunca 500)
+    try:
+        if Lead is not None:
+            _ensure_leads_table()
+            kind = _infer_kind(body)
+            provincia = None
+            municipio = None
+            assigned_to = guess_franquiciado(provincia, municipio)
+            lead = Lead(
+                kind=kind, source="sms",
+                provincia=provincia, municipio=municipio,
+                nombre=None, telefono=frm, email=None,
+                assigned_to=assigned_to, status="assigned" if assigned_to else "new",
+                notes=body or None,
+                meta_json={"twilio": {"to": to, "sid": sid, "num_media": num_media}},
+            )
+            db.session.add(lead)
+            db.session.commit()
+            return jsonify(ok=True, lead={
+                "id": lead.id, "kind": lead.kind, "telefono": lead.telefono,
+                "assigned_to": lead.assigned_to, "status": lead.status
+            })
+    except Exception as e:
+        try: db.session.rollback()
+        except Exception: pass
+        current_app.logger.warning("[SMS IN] No se pudo crear Lead: %s", e)
+
+    # 4) Siempre 200 para Twilio
+    return jsonify(ok=True)
