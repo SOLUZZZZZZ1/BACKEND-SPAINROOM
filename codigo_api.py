@@ -132,6 +132,10 @@ def create_app():
     @app.get("/health")
     def health():
         return jsonify(ok=True, service="spainroom-api")
+    @app.get("/")
+    def root():
+    return jsonify(ok=True, service="spainroom-api", hint="use /health, /diag, /api/* or POST /sms/inbound")
+
 
     @app.get("/diag")
     def diag():
