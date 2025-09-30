@@ -1,7 +1,8 @@
-# routes_admin_franchise.py — Admin: ingest padrón, listar plazas, ocupar/liberar, export Excel (parche robusto)
+# routes_admin_franchise.py — Admin: ingest padrón, listar plazas, ocupar/liberar, export Excel (robusto)
 import io
 import math
 import os
+import pathlib
 
 import pandas as pd
 from flask import Blueprint, jsonify, request, send_file
@@ -22,10 +23,10 @@ def _auth():
 
 def _slots_rule(municipio: str, provincia: str, poblacion: int) -> int:
     """Cálculo de plazas:
-    - Madrid/Barcelona (municipio y provincia coinciden): 1 por cada 20.000 (mín. 1)
-    - Resto: 1 por cada 10.000 (mín. 1)
+    - Madrid/Barcelona (municipio y provincia coinciden): 1/20.000 (mín. 1)
+    - Resto: 1/10.000 (mín. 1)
     """
-    if poblacion is None or poblacion <= 0:
+    if not poblacion or poblacion <= 0:
         return 0
     m = (municipio or "").strip().lower()
     p = (provincia or "").strip().lower()
@@ -34,14 +35,46 @@ def _slots_rule(municipio: str, provincia: str, poblacion: int) -> int:
     return max(1, math.ceil(poblacion / 10000))
 
 
+def _read_dataframe(fs) -> pd.DataFrame:
+    """
+    Lee el FileStorage como CSV o Excel con heurística:
+    - CSV: autodetecta separador (coma/;), UTF-8 con/ sin BOM.
+    - XLSX: openpyxl; XLS: xlrd.
+    """
+    name = (getattr(fs, "filename", "") or "").lower()
+    mimetype = (getattr(fs, "mimetype", "") or "").lower()
+
+    # Lee a bytes una sola vez
+    raw = fs.read()
+    if not raw:
+        raise ValueError("empty_file")
+
+    # Excel por extensión o mimetype
+    is_excel = name.endswith((".xlsx", ".xls")) or ("excel" in mimetype) or name.endswith(".xlsm") or name.endswith(".xlsb")
+
+    if is_excel:
+        bio = io.BytesIO(raw)
+        # Preferimos openpyxl; para .xls, xlrd (debes tener xlrd instalado)
+        engine = "openpyxl" if name.endswith(".xlsx") else None
+        try:
+            return pd.read_excel(bio, sheet_name=0, engine=engine)
+        except Exception as e:
+            # Fallback genérico
+            bio.seek(0)
+            return pd.read_excel(bio, sheet_name=0)
+
+    # CSV: autodetección separador con engine=python
+    try:
+        text = raw.decode("utf-8-sig", errors="ignore")
+        return pd.read_csv(io.StringIO(text), sep=None, engine="python")
+    except Exception:
+        # Fallback a coma estricta
+        return pd.read_csv(io.StringIO(text), sep=",", engine="python")
+
+
 @bp_admin_franq.post("/api/admin/franquicia/ingest")
 def ingest_csv():
-    """Sube CSV/Excel con columnas: provincia, municipio, poblacion.
-    Parche robusto:
-      - upsert case-insensitive por (provincia, municipio)
-      - captura de duplicados con flush() y fallback a update
-      - no tumba en filas conflictivas (cuenta errors/skip)
-    """
+    """Sube CSV/Excel con columnas: provincia, municipio, poblacion (robusto)."""
     if not _auth():
         return jsonify(ok=False, error="forbidden"), 403
 
@@ -49,32 +82,30 @@ def ingest_csv():
     if not fs:
         return jsonify(ok=False, error="missing_file"), 400
 
-    # ---- Cargar dataframe (CSV primero; si falla, Excel) --------------------
+    # ---- Cargar dataframe seguro -------------------------------------------
     try:
-        df = pd.read_csv(fs)
-    except Exception:
-        fs.seek(0)
-        try:
-            df = pd.read_excel(fs)
-        except Exception:
-            return jsonify(ok=False, error="bad_file"), 400
+        fs.stream.seek(0)
+        df = _read_dataframe(fs)
+    except Exception as e:
+        return jsonify(ok=False, error="read_failed", error_detail=str(e)), 400
 
     if df is None or df.empty:
         return jsonify(ok=False, error="empty_file"), 400
 
-    # ---- Normalizar cabeceras y detectar columnas ---------------------------
-    cols_lower = {str(c).strip().lower(): c for c in df.columns}
-    # búsqueda flexible
+    # ---- Normalizar cabeceras / localizar columnas -------------------------
+    orig_cols = list(df.columns)
+    cols_lower = {str(c).strip().lower(): c for c in orig_cols}
+
     def _find_col(*keys):
         for k in keys:
             if k in cols_lower:
                 return cols_lower[k]
         # heurística por inclusión
-        lc = [str(c).strip().lower() for c in df.columns]
+        lc = [str(c).strip().lower() for c in orig_cols]
         for key in keys:
             for i, name in enumerate(lc):
                 if key in name:
-                    return df.columns[i]
+                    return orig_cols[i]
         return None
 
     col_p = _find_col("provincia", "prov.")
@@ -82,11 +113,14 @@ def ingest_csv():
     col_h = _find_col("poblacion", "población", "habit", "pob.", "total")
 
     if not (col_p and col_m and col_h):
-        return jsonify(ok=False, error="missing_columns",
-                       got=[str(c) for c in df.columns],
-                       need=["provincia", "municipio", "poblacion"]), 400
+        return jsonify(
+            ok=False,
+            error="missing_columns",
+            got=[str(c) for c in orig_cols],
+            need=["provincia", "municipio", "poblacion"],
+        ), 400
 
-    # ---- Quedarnos con lo necesario y limpiar tipos -------------------------
+    # ---- Selección y limpieza ----------------------------------------------
     df = df[[col_p, col_m, col_h]].copy()
     df.columns = ["provincia", "municipio", "poblacion"]
 
@@ -94,16 +128,13 @@ def ingest_csv():
     df["municipio"] = df["municipio"].astype(str).str.strip()
     df["poblacion"] = pd.to_numeric(df["poblacion"], errors="coerce").fillna(0).astype(int)
 
-    # Filtramos filas vacías o población <= 0
+    # Filtra vacíos / población <=0
     df = df[(df["provincia"] != "") & (df["municipio"] != "") & (df["poblacion"] > 0)]
     if df.empty:
         return jsonify(ok=False, error="no_valid_rows"), 400
 
-    # ---- Ingest robusto (por fila) -----------------------------------------
-    inserted = 0
-    updated = 0
-    skipped = 0
-    errors = 0
+    # ---- Ingest robusto: upsert case-insensitive + captura duplicados ------
+    inserted = updated = skipped = errors = 0
 
     for _, r in df.iterrows():
         try:
@@ -112,14 +143,17 @@ def ingest_csv():
             pop = int(r["poblacion"] or 0)
             plazas = _slots_rule(mun, prov, pop)
 
-            # Case-insensitive lookup
-            row = (db.session.query(FranchiseSlot)
-                   .filter(func.lower(FranchiseSlot.provincia) == prov.lower(),
-                           func.lower(FranchiseSlot.municipio) == mun.lower())
-                   .first())
+            # Lookup case-insensitive
+            row = (
+                db.session.query(FranchiseSlot)
+                .filter(
+                    func.lower(FranchiseSlot.provincia) == prov.lower(),
+                    func.lower(FranchiseSlot.municipio) == mun.lower(),
+                )
+                .first()
+            )
 
             if not row:
-                # INSERT
                 row = FranchiseSlot(
                     provincia=prov,
                     municipio=mun,
@@ -132,16 +166,18 @@ def ingest_csv():
                 )
                 db.session.add(row)
                 try:
-                    # flush aquí detecta un posible duplicado por la UniqueConstraint
-                    db.session.flush()
+                    db.session.flush()  # detecta unique conflict aquí
                     inserted += 1
                 except IntegrityError:
-                    # Fallback a UPDATE si otro hilo/registro similar ya existe
                     db.session.rollback()
-                    row = (db.session.query(FranchiseSlot)
-                           .filter(func.lower(FranchiseSlot.provincia) == prov.lower(),
-                                   func.lower(FranchiseSlot.municipio) == mun.lower())
-                           .first())
+                    row = (
+                        db.session.query(FranchiseSlot)
+                        .filter(
+                            func.lower(FranchiseSlot.provincia) == prov.lower(),
+                            func.lower(FranchiseSlot.municipio) == mun.lower(),
+                        )
+                        .first()
+                    )
                     if not row:
                         skipped += 1
                         continue
@@ -151,7 +187,6 @@ def ingest_csv():
                     row.status = "full" if row.libres == 0 else ("free" if (row.ocupadas or 0) == 0 else "partial")
                     updated += 1
             else:
-                # UPDATE
                 row.poblacion = pop
                 row.plazas = plazas
                 row.libres = max(0, int(row.plazas or 0) - int(row.ocupadas or 0))
@@ -159,17 +194,14 @@ def ingest_csv():
                 updated += 1
 
         except Exception:
-            # no paramos toda la carga por una fila mala
             db.session.rollback()
             errors += 1
             continue
 
-    # Commit final (si hay algo que guardar)
     try:
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
-        # si algo residual falló, no tumbar
         errors += 1
 
     total = int(db.session.query(FranchiseSlot).count())
@@ -217,10 +249,7 @@ def list_slots():
     if assigned:
         q = q.filter(FranchiseSlot.assigned_to == assigned)
 
-    rows = [
-        r.to_dict()
-        for r in q.order_by(FranchiseSlot.provincia, FranchiseSlot.municipio).limit(5000).all()
-    ]
+    rows = [r.to_dict() for r in q.order_by(FranchiseSlot.provincia, FranchiseSlot.municipio).limit(5000).all()]
     return jsonify(ok=True, count=len(rows), results=rows)
 
 
@@ -266,9 +295,7 @@ def export_xlsx():
     if not _auth():
         return jsonify(ok=False, error="forbidden"), 403
 
-    rows = db.session.query(FranchiseSlot).order_by(
-        FranchiseSlot.provincia, FranchiseSlot.municipio
-    ).all()
+    rows = db.session.query(FranchiseSlot).order_by(FranchiseSlot.provincia, FranchiseSlot.municipio).all()
     if not rows:
         return jsonify(ok=False, error="no_data"), 400
 
@@ -291,7 +318,8 @@ def export_xlsx():
     }
 
     bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
+    # Usamos openpyxl para escribir xlsx (no requiere xlsxwriter)
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
         df.to_excel(xw, index=False, sheet_name="Municipios")
         g.to_excel(xw, index=False, sheet_name="Provincias")
         pd.DataFrame([tot]).to_excel(xw, index=False, sheet_name="Totales")
