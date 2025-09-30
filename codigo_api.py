@@ -171,6 +171,7 @@ def create_app():
     _try_register(app, "routes_uploads_rooms",     "bp_upload_rooms", None)
     _try_register(app, "routes_upload_generic",    "bp_upload_generic", None)
     _try_register(app, "routes_sms",               "bp_sms",          "/sms")
+    _try_register(app, "routes_admin_franchise", "bp_admin_franq", None)
 
     # (Quito dev opcionales para evitar warnings)
     # _try_register(app, "routes_dev_twilio",        "bp_dev_twilio",   None)
