@@ -1,0 +1,16 @@
+Flask==3.1.2
+Flask-Cors==6.0.1
+Flask-SQLAlchemy==3.1.1
+gunicorn==23.0.0
+psycopg2-binary==2.9.9
+PyJWT==2.10.1
+Pillow==10.4.0
+
+# Añadidos recomendados
+alembic==1.13.2
+pandas==2.2.2
+openpyxl==3.1.5
+
+# Opcionales según tus rutas
+twilio==9.2.3
+stripe==10.4.0

@@ -1,6 +1,5 @@
-# models_owner.py
 from datetime import datetime
-from app import db
+from extensions import db  # FIX: usar la instancia compartida
 
 class OwnerCheck(db.Model):
     __tablename__ = "owner_checks"
