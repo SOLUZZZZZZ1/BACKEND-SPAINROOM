@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>SpainRoom — Admin Franquicia (Lite)</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px}
+h1{margin:0 0 12px 0}
+.card{border:1px solid #ddd;border-radius:10px;padding:12px;margin-bottom:12px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:8px 0}
+input,button,select{padding:8px 10px;font-size:14px}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+th,td{border:1px solid #ddd;padding:8px}
+th{background:#f6f6f6;text-align:left}
+.badge{padding:2px 8px;border-radius:10px;font-size:12px}
+.free{background:#eaf7ff}.partial{background:#fff4cc}.full{background:#ffe8e8}
+.small{font-size:12px;color:#666}
+</style>
+</head>
+<body>
+<h1>SpainRoom — Admin Franquicia (Lite)</h1>
+
+<div class="card">
+  <div class="row">
+    <label>API:</label>
+    <input id="api" style="min-width:400px" value="https://backend-spainroom.onrender.com"/>
+    <label>Admin Key:</label>
+    <input id="key" value="ramon" />
+    <button onclick="ping()">Probar</button>
+    <span id="ping" class="small"></span>
+  </div>
+  <div class="row">
+    <input id="prov" placeholder="Provincia"/>
+    <input id="mun" placeholder="Municipio"/>
+    <select id="status">
+      <option value="">Estado (todos)</option>
+      <option value="free">Libre</option>
+      <option value="partial">Parcial</option>
+      <option value="full">Ocupado</option>
+    </select>
+    <input id="assigned" placeholder="assigned_to (filtro)"/>
+    <button onclick="buscar()">Buscar</button>
+    <button onclick="exportXLS()">Export XLSX</button>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Importar CSV (provincia,municipio,poblacion)</h3>
+  <div class="row">
+    <input type="file" id="csvfile" accept=".csv"/>
+    <button onclick="importar()">Subir</button>
+    <span id="impmsg" class="small"></span>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Acciones por fila</h3>
+  <div class="row">
+    <input id="slotId" type="number" placeholder="id"/>
+    <input id="assTo" placeholder="assigned_to"/>
+    <button onclick="ocupar(1)">Ocupar +1</button>
+    <button onclick="liberar(1)">Liberar -1</button>
+    <span id="opmsg" class="small"></span>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Bulk ocupación por nombres</h3>
+  <div class="row">
+    <textarea id="bulkNames" rows="5" style="width:100%" placeholder="provincia,municipio,assigned_to,inc&#10;Granada,Granada,franq-granada,1&#10;Sevilla,Sevilla,franq-sevilla,1"></textarea>
+    <button onclick="ocuparPorNombres()">Ejecutar bulk</button>
+    <span id="bulkmsg" class="small"></span>
+  </div>
+</div>
+
+<table>
+  <thead><tr>
+    <th>ID</th><th>Provincia</th><th>Municipio</th><th>Población</th>
+    <th>Plazas</th><th>Ocupadas</th><th>Libres</th><th>Estado</th><th>assigned_to</th><th>Acción</th>
+  </tr></thead>
+  <tbody id="tbody"></tbody>
+</table>
+
+<script>
+function val(id){return document.getElementById(id).value.trim();}
+function set(id,v){document.getElementById(id).value=v;}
+function msg(id,t){document.getElementById(id).textContent=t;}
+function api(){return val('api')}
+function key(){return val('key')}
+
+async function ping(){
+  try{
+    const r=await fetch(api()+"/health");
+    msg("ping", r.ok? "OK ✅":"Error");
+  }catch(e){msg("ping","Error");}
+}
+
+async function buscar(){
+  const qs=new URLSearchParams();
+  if(val('prov')) qs.append('provincia', val('prov'));
+  if(val('mun')) qs.append('municipio', val('mun'));
+  if(val('status')) qs.append('status', val('status'));
+  if(val('assigned')) qs.append('assigned_to', val('assigned'));
+  const r=await fetch(api()+"/api/admin/franquicia/slots?"+qs.toString(), {headers:{"X-Admin-Key":key()}});
+  const j=await r.json().catch(()=>({ok:false}));
+  if(!j.ok){alert("Error buscando"); return;}
+  render(j.results||[]);
+}
+
+function render(items){
+  const tb=document.getElementById('tbody'); tb.innerHTML="";
+  for(const s of items){
+    const tr=document.createElement('tr');
+    tr.innerHTML=`
+      <td>${s.id}</td>
+      <td>${s.provincia}</td>
+      <td>${s.municipio}</td>
+      <td>${s.poblacion}</td>
+      <td>${s.plazas}</td>
+      <td>${s.ocupadas}</td>
+      <td>${s.libres}</td>
+      <td><span class="badge ${s.status}">${s.status}</span></td>
+      <td>${s.assigned_to||""}</td>
+      <td>
+        <button onclick="sel(${s.id}, '${s.assigned_to||""}')">Elegir</button>
+      </td>`;
+    tb.appendChild(tr);
+  }
+}
+
+function sel(id,ass){ set('slotId', id); set('assTo', ass||""); window.scrollTo({top:0,behavior:'smooth'}); }
+
+async function ocupar(inc){
+  const id=parseInt(val('slotId')||"0"); const assign=val('assTo');
+  if(!id){alert("Indica id"); return;}
+  const r=await fetch(api()+"/api/admin/franquicia/slots/ocupar",{
+    method:"POST", headers:{"X-Admin-Key":key(),"Content-Type":"application/json"},
+    body:JSON.stringify({id,assigned_to:assign||undefined,inc:inc||1})
+  });
+  const j=await r.json().catch(()=>({ok:false}));
+  msg("opmsg", j.ok? "OK":"Error"); buscar();
+}
+
+async function liberar(dec){
+  const id=parseInt(val('slotId')||"0");
+  if(!id){alert("Indica id"); return;}
+  const r=await fetch(api()+"/api/admin/franquicia/slots/liberar",{
+    method:"POST", headers:{"X-Admin-Key":key(),"Content-Type":"application/json"},
+    body:JSON.stringify({id,dec:dec||1})
+  });
+  const j=await r.json().catch(()=>({ok:false}));
+  msg("opmsg", j.ok? "OK":"Error"); buscar();
+}
+
+async function importar(){
+  const f=document.getElementById('csvfile').files[0];
+  if(!f){alert("Selecciona CSV"); return;}
+  const fd=new FormData(); fd.append("file",f);
+  const r=await fetch(api()+"/api/admin/franquicia/ingest",{method:"POST",headers:{"X-Admin-Key":key()}, body:fd});
+  const j=await r.json().catch(()=>({ok:false}));
+  msg("impmsg", j.ok? `OK: ins:${j.inserted||0} upd:${j.updated||0} err:${j.errors||0}` : "Error");
+  buscar();
+}
+
+async function exportXLS(){
+  const u=api()+"/api/admin/franquicia/export.xlsx";
+  const a=document.createElement('a'); a.href=u; a.download="plazas_franquicia.xlsx"; a.click();
+}
+
+async function ocuparPorNombres(){
+  const txt=val('bulkNames'); if(!txt){return;}
+  const lines=txt.split(/\r?\n/).filter(x=>x.trim());
+  let ok=0, bad=0;
+  for(const ln of lines){
+    const [prov,mun,assigned,incStr]=ln.split(",").map(x=>x.trim());
+    if(!prov||!mun||!assigned){bad++; continue;}
+    const qs=new URLSearchParams({provincia:prov, municipio:mun});
+    const r1=await fetch(api()+"/api/admin/franquicia/slots?"+qs.toString(),{headers:{"X-Admin-Key":key()}});
+    const j1=await r1.json().catch(()=>({ok:false,results:[]}));
+    if(!j1.ok || !j1.results || j1.results.length===0){bad++; continue;}
+    const id=j1.results[0].id;
+    const inc=parseInt(incStr||"1");
+    const r2=await fetch(api()+"/api/admin/franquicia/slots/ocupar",{
+      method:"POST",headers:{"X-Admin-Key":key(),"Content-Type":"application/json"},
+      body:JSON.stringify({id,assigned_to:assigned,inc})
+    });
+    const j2=await r2.json().catch(()=>({ok:false}));
+    if(j2.ok) ok++; else bad++;
+  }
+  msg("bulkmsg", `Bulk: OK ${ok} / Fallos ${bad}`);
+}
+</script>
+</body>
+</html>
