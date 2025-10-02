@@ -33,8 +33,14 @@ th,td{font-size:13px;border-bottom:1px solid #eee;padding:8px;text-align:left}
   <div class="card">
     <h3>Conexión</h3>
     <div class="row">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="connDot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#cbd5e1"></span>
+        <small id="connText" class="mono">Desconectado</small>
+      </div>
       <label>API Base</label>
       <input id="apiBase" type="url" placeholder="https://backend-spainroom.onrender.com" />
+       <button class="ghost" onclick="probarConexion()">Probar conexión</button>
+      <button class="ghost" onclick="probarClave()">Probar clave admin</button>
       <label>Admin Key</label>
       <input id="adminKey" type="password" placeholder="********" />
     </div>
@@ -60,6 +66,27 @@ th,td{font-size:13px;border-bottom:1px solid #eee;padding:8px;text-align:left}
   </div>
 
   <div class="card">
+    <h3>Progreso</h3>
+    <div class="row">
+      <div style="flex:1;min-width:260px">
+        <div style="height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden">
+          <div id="bar" style="height:100%;width:0%;background:#0b5fff;transition:width .2s ease"></div>
+        </div>
+        <div class="row" style="justify-content:space-between;margin-top:6px">
+          <small id="pct">0%</small>
+          <small id="counter">0 / 0</small>
+        </div>
+      </div>
+      <div style="min-width:200px">
+        <small><strong>Totales sesión:</strong></small><br/>
+        <small>Insertados: <span id="tIns" class="mono">0</span></small><br/>
+        <small>Actualizados: <span id="tUpd" class="mono">0</span></small><br/>
+        <small>Errores: <span id="tErr" class="mono">0</span></small>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
     <h3>Resultado</h3>
     <table>
       <thead>
@@ -71,6 +98,88 @@ th,td{font-size:13px;border-bottom:1px solid #eee;padding:8px;text-align:left}
 </main>
 
 <script>
+
+function _setConn(state, text){
+  const dot = document.getElementById('connDot');
+  const t = document.getElementById('connText');
+  if(state==='ok'){ dot.style.background = '#0a8f3c'; t.textContent = text || 'Conectado'; }
+  else if(state==='warn'){ dot.style.background = '#f59e0b'; t.textContent = text || 'Parcial'; }
+  else{ dot.style.background = '#c62828'; t.textContent = text || 'Error de conexión'; }
+}
+async function _tryGet(url){
+  try{
+    const r = await fetch(url, { method:'GET', cache:'no-store' });
+    if(!r.ok) return {ok:false, status:r.status, text:await r.text()};
+    let j=null; const tx = await r.text(); try{ j=JSON.parse(tx) }catch(e){}
+    return {ok:true, status:r.status, json:j, text:tx};
+  }catch(e){ return {ok:false, status:0, text:String(e)}; }
+}
+async function probarConexion(){
+  const base = api();
+  if(!base){ alert('Escribe la API Base'); return; }
+  // Probar varias rutas habituales
+  const candidates = ['/api/admin/health','/api/health','/health','/version','/'];
+  let anyOk = null, details=[];
+  for(const p of candidates){
+    const url = base + p;
+    const res = await _tryGet(url);
+    details.push({p, ok:res.ok, status:res.status});
+    if(res.ok){ anyOk = res; break; }
+  }
+  if(anyOk){
+    _setConn('ok','Conectado (público)');
+  }else{
+    _setConn('err','Sin conexión');
+  }
+  console.log('Ping público:', details);
+}
+async function probarClave(){
+  const base = api(); const k = key();
+  if(!base){ alert('Escribe la API Base'); return; }
+  if(!k){ alert('Escribe la Admin Key'); return; }
+  // Endpoint admin típico (ajusta si hace falta)
+  const url = base + '/api/admin/ping';
+  try{
+    const r = await fetch(url, { method:'GET', headers:{'X-Admin-Key': k}, cache:'no-store' });
+    const tx = await r.text(); let j=null; try{ j=JSON.parse(tx) }catch(e){}
+    if(r.ok){
+      _setConn('ok','Conectado (admin)');
+    }else if(r.status===401 || r.status===403){
+      _setConn('warn','Clave inválida');
+    }else{
+      _setConn('err','Admin ping error ' + r.status);
+    }
+    console.log('Ping admin:', r.status, j||tx);
+  }catch(e){
+    _setConn('err','Error de red');
+  }
+}
+
+
+let _TOTAL_PARTS = 0, _DONE_PARTS = 0;
+let _T_INS = 0, _T_UPD = 0, _T_ERR = 0;
+function _setProgress(done, total){
+  _DONE_PARTS = done; _TOTAL_PARTS = total;
+  const pct = total>0 ? Math.round(done*100/total) : 0;
+  const bar = document.getElementById('bar');
+  const pctEl = document.getElementById('pct');
+  const cntEl = document.getElementById('counter');
+  if(bar){ bar.style.width = pct + '%'; }
+  if(pctEl){ pctEl.textContent = pct + '%'; }
+  if(cntEl){ cntEl.textContent = done + ' / ' + total; }
+}
+function _accTotals(res){
+  _T_INS += (res.inserted||0);
+  _T_UPD += (res.updated||0);
+  _T_ERR += (res.errors||0);
+  const tIns = document.getElementById('tIns');
+  const tUpd = document.getElementById('tUpd');
+  const tErr = document.getElementById('tErr');
+  if(tIns) tIns.textContent = _T_INS;
+  if(tUpd) tUpd.textContent = _T_UPD;
+  if(tErr) tErr.textContent = _T_ERR;
+}
+
 function val(id){return document.getElementById(id).value}
 function api(){return (val('apiBase')||'').replace(/\\/$/,'')}
 function key(){return val('adminKey')}
@@ -107,10 +216,14 @@ async function postCSV(blob){
 }
 
 async function subirDirecto(){
+  _T_INS=0;_T_UPD=0;_T_ERR=0;_setProgress(0,0);
   const f=document.getElementById('csvfile').files[0];
   if(!f){ alert('Selecciona un CSV'); return; }
+  _setProgress(0,1);
   const res=await postCSV(f);
   appendRow('ALL', res);
+  _accTotals(res);
+  _setProgress(1,1);
 }
 
 let LAST_HEADER=null, LAST_ROWS=[], LAST_CHUNK=500, FALLIDAS=new Set();
@@ -128,6 +241,7 @@ function makeBlob(header, rows, idx){
 }
 
 async function subirEnPartes(){
+  _T_INS=0;_T_UPD=0;_T_ERR=0;_setProgress(0,0);
   const f=document.getElementById('csvfile').files[0];
   if(!f){ alert('Selecciona un CSV'); return; }
   const t = await f.text();
@@ -140,11 +254,15 @@ async function subirEnPartes(){
 
   const throttle = parseInt(document.getElementById('throttleMs').value)||0;
   let part=1;
+  const totalParts = Math.ceil(rows.length / chunk);
+  _setProgress(0, totalParts);
   for(let i=0; i<rows.length; i+=chunk){
     const slice = rows.slice(i, i+chunk);
     const blob = makeBlob(header, slice, part);
     const res = await postCSV(blob);
     appendRow(part, res);
+    _accTotals(res);
+    _setProgress(part, totalParts);
     if(!res.ok) FALLIDAS.add(part);
     part++;
     if(throttle>0) await new Promise(r=>setTimeout(r, throttle));
@@ -157,13 +275,20 @@ async function subirEnPartes(){
 }
 
 async function reintentarUno(idx){
+  const totalParts = _TOTAL_PARTS || 0;
   if(!LAST_HEADER || LAST_ROWS.length===0){ alert('Primero usa "Subir en partes"'); return; }
   const start = (idx-1)*LAST_CHUNK;
   const slice = LAST_ROWS.slice(start, start+LAST_CHUNK);
   const blob = makeBlob(LAST_HEADER, slice, idx);
   const res = await postCSV(blob);
   appendRow(idx, res);
+  _accTotals(res);
   if(res.ok) FALLIDAS.delete(idx); else FALLIDAS.add(idx);
+  if(totalParts>0){
+    // Recompute done as total - fallidas.size, since table may have been partially OK
+    const done = totalParts - FALLIDAS.size;
+    _setProgress(done, totalParts);
+  }
 }
 
 async function reintentarFallidas(){
