@@ -1,9 +1,9 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Admin Lite Plus — Importación por Partes</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Lite — FIX</title>
 <style>
 :root{--b:#0b5fff;--ok:#0a8f3c;--err:#c62828;--bg:#fafbff;--card:#fff}
 *{box-sizing:border-box}
@@ -16,7 +16,6 @@ main{max-width:1100px;margin:20px auto;padding:0 16px}
 input[type="text"],input[type="number"],input[type="password"],input[type="url"]{padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;min-width:180px}
 input[type="file"]{padding:6px 0}
 button{border:0;border-radius:10px;padding:10px 14px;background:var(--b);color:#fff;font-weight:600;cursor:pointer}
-button.secondary{background:#e5e7eb;color:#111}
 button.ghost{background:transparent;border:1px solid #d1d5db;color:#333}
 button:disabled{opacity:.5;cursor:not-allowed}
 table{width:100%;border-collapse:collapse}
@@ -25,10 +24,11 @@ th,td{font-size:13px;border-bottom:1px solid #eee;padding:8px;text-align:left}
 .badge.ok{background:#e8f5e9;color:var(--ok)}
 .badge.err{background:#ffebee;color:var(--err)}
 .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
+#bar{height:100%;width:0%;background:#0b5fff;transition:width .2s ease}
 </style>
 </head>
 <body>
-<header><h1>Admin Lite Plus · Importación por Partes</h1></header>
+<header><h1>Admin Lite — FIX</h1></header>
 <main>
   <div class="card">
     <h3>Conexión</h3>
@@ -37,12 +37,17 @@ th,td{font-size:13px;border-bottom:1px solid #eee;padding:8px;text-align:left}
         <span id="connDot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#cbd5e1"></span>
         <small id="connText" class="mono">Desconectado</small>
       </div>
+    </div>
+    <div class="row">
       <label>API Base</label>
       <input id="apiBase" type="url" placeholder="https://backend-spainroom.onrender.com" />
-       <button class="ghost" onclick="probarConexion()">Probar conexión</button>
-      <button class="ghost" onclick="probarClave()">Probar clave admin</button>
+      <button class="ghost" id="btnPing">Probar conexión</button>
+      <button class="ghost" id="btnPingAdmin">Probar clave admin</button>
       <label>Admin Key</label>
       <input id="adminKey" type="password" placeholder="********" />
+    </div>
+    <div class="row">
+      <small><strong>Diagnóstico:</strong> <span id="connDiag" class="mono" style="color:#555">—</span></small>
     </div>
   </div>
 
@@ -56,12 +61,9 @@ th,td{font-size:13px;border-bottom:1px solid #eee;padding:8px;text-align:left}
       <input type="number" id="throttleMs" value="300" min="0" step="50" />
     </div>
     <div class="row">
-      <button onclick="subirDirecto()">Subir directo</button>
-      <button onclick="subirEnPartes()">Subir en partes</button>
-      <button class="ghost" onclick="reintentarFallidas()">Reintentar fallidas</button>
-    </div>
-    <div class="row">
-      <small>Consejo: usa partes de 500. Si un trozo falla, aparecerá en la tabla y podrás reintentarlo de forma individual.</small>
+      <button id="btnDirecto">Subir directo</button>
+      <button id="btnPartes">Subir en partes</button>
+      <button class="ghost" id="btnRetry">Reintentar fallidas</button>
     </div>
   </div>
 
@@ -70,7 +72,7 @@ th,td{font-size:13px;border-bottom:1px solid #eee;padding:8px;text-align:left}
     <div class="row">
       <div style="flex:1;min-width:260px">
         <div style="height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden">
-          <div id="bar" style="height:100%;width:0%;background:#0b5fff;transition:width .2s ease"></div>
+          <div id="bar"></div>
         </div>
         <div class="row" style="justify-content:space-between;margin-top:6px">
           <small id="pct">0%</small>
@@ -95,10 +97,29 @@ th,td{font-size:13px;border-bottom:1px solid #eee;padding:8px;text-align:left}
       <tbody id="tbody"></tbody>
     </table>
   </div>
+
+  <div class="card">
+    <h3>Consola</h3>
+    <div id="log" class="mono" style="white-space:pre-wrap;max-height:200px;overflow:auto;background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px">Listo</div>
+    <div class="row">
+      <button class="ghost" id="btnClear">Limpiar consola</button>
+      <button class="ghost" id="btnDemo">Demo</button>
+    </div>
+  </div>
 </main>
 
 <script>
-
+// ===== util =====
+function logln(...args){
+  const el = document.getElementById('log');
+  if(!el) return;
+  const line = args.map(x=> (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
+  el.textContent += "\\n" + line;
+  el.scrollTop = el.scrollHeight;
+}
+function val(id){ const el=document.getElementById(id); return el?el.value:''; }
+function api(){ return (val('apiBase')||'').replace(/\\/+$/,''); }
+function key(){ return val('adminKey'); }
 function _setConn(state, text){
   const dot = document.getElementById('connDot');
   const t = document.getElementById('connText');
@@ -106,84 +127,24 @@ function _setConn(state, text){
   else if(state==='warn'){ dot.style.background = '#f59e0b'; t.textContent = text || 'Parcial'; }
   else{ dot.style.background = '#c62828'; t.textContent = text || 'Error de conexión'; }
 }
-async function _tryGet(url){
-  try{
-    const r = await fetch(url, { method:'GET', cache:'no-store' });
-    if(!r.ok) return {ok:false, status:r.status, text:await r.text()};
-    let j=null; const tx = await r.text(); try{ j=JSON.parse(tx) }catch(e){}
-    return {ok:true, status:r.status, json:j, text:tx};
-  }catch(e){ return {ok:false, status:0, text:String(e)}; }
-}
-async function probarConexion(){
-  const base = api();
-  if(!base){ alert('Escribe la API Base'); return; }
-  // Probar varias rutas habituales
-  const candidates = ['/api/admin/health','/api/health','/health','/version','/'];
-  let anyOk = null, details=[];
-  for(const p of candidates){
-    const url = base + p;
-    const res = await _tryGet(url);
-    details.push({p, ok:res.ok, status:res.status});
-    if(res.ok){ anyOk = res; break; }
-  }
-  if(anyOk){
-    _setConn('ok','Conectado (público)');
-  }else{
-    _setConn('err','Sin conexión');
-  }
-  console.log('Ping público:', details);
-}
-async function probarClave(){
-  const base = api(); const k = key();
-  if(!base){ alert('Escribe la API Base'); return; }
-  if(!k){ alert('Escribe la Admin Key'); return; }
-  // Endpoint admin típico (ajusta si hace falta)
-  const url = base + '/api/admin/ping';
-  try{
-    const r = await fetch(url, { method:'GET', headers:{'X-Admin-Key': k}, cache:'no-store' });
-    const tx = await r.text(); let j=null; try{ j=JSON.parse(tx) }catch(e){}
-    if(r.ok){
-      _setConn('ok','Conectado (admin)');
-    }else if(r.status===401 || r.status===403){
-      _setConn('warn','Clave inválida');
-    }else{
-      _setConn('err','Admin ping error ' + r.status);
-    }
-    console.log('Ping admin:', r.status, j||tx);
-  }catch(e){
-    _setConn('err','Error de red');
-  }
-}
-
-
-let _TOTAL_PARTS = 0, _DONE_PARTS = 0;
-let _T_INS = 0, _T_UPD = 0, _T_ERR = 0;
-function _setProgress(done, total){
-  _DONE_PARTS = done; _TOTAL_PARTS = total;
+function _setDiag(text){ const d=document.getElementById('connDiag'); if(d) d.textContent = text; }
+function _setProgress(done,total){
   const pct = total>0 ? Math.round(done*100/total) : 0;
   const bar = document.getElementById('bar');
   const pctEl = document.getElementById('pct');
   const cntEl = document.getElementById('counter');
-  if(bar){ bar.style.width = pct + '%'; }
-  if(pctEl){ pctEl.textContent = pct + '%'; }
-  if(cntEl){ cntEl.textContent = done + ' / ' + total; }
+  if(bar) bar.style.width = pct + '%';
+  if(pctEl) pctEl.textContent = pct + '%';
+  if(cntEl) cntEl.textContent = done + ' / ' + total;
 }
 function _accTotals(res){
-  _T_INS += (res.inserted||0);
-  _T_UPD += (res.updated||0);
-  _T_ERR += (res.errors||0);
   const tIns = document.getElementById('tIns');
   const tUpd = document.getElementById('tUpd');
   const tErr = document.getElementById('tErr');
-  if(tIns) tIns.textContent = _T_INS;
-  if(tUpd) tUpd.textContent = _T_UPD;
-  if(tErr) tErr.textContent = _T_ERR;
+  if(tIns) tIns.textContent = (parseInt(tIns.textContent||'0') + (res.inserted||0));
+  if(tUpd) tUpd.textContent = (parseInt(tUpd.textContent||'0') + (res.updated||0));
+  if(tErr) tErr.textContent = (parseInt(tErr.textContent||'0') + (res.errors||0));
 }
-
-function val(id){return document.getElementById(id).value}
-function api(){return (val('apiBase')||'').replace(/\\/$/,'')}
-function key(){return val('adminKey')}
-
 function appendRow(idx, data){
   const tb=document.getElementById('tbody');
   let tr=document.querySelector('tr[data-idx="'+idx+'"]');
@@ -196,8 +157,9 @@ function appendRow(idx, data){
       +'<td class="mono upd"></td>'
       +'<td class="mono errs"></td>'
       +'<td class="mono msg"></td>'
-      +'<td><button class="ghost mono" onclick="reintentarUno('+idx+')">Reintentar</button></td>';
+      +'<td><button class="ghost mono">Reintentar</button></td>';
     tb.appendChild(tr);
+    tr.querySelector('button').addEventListener('click', ()=> reintentarUno(idx));
   }
   tr.querySelector('.status').innerHTML = data.ok ? '<span class="badge ok">OK</span>' : '<span class="badge err">FALLO</span>';
   tr.querySelector('.ins').textContent = data.inserted ?? '';
@@ -206,24 +168,59 @@ function appendRow(idx, data){
   tr.querySelector('.msg').textContent = (data.message||'').slice(0,160);
 }
 
-async function postCSV(blob){
+// ===== network =====
+async function get(url, headers={}){
+  const r = await fetch(url, {method:'GET', headers, cache:'no-store'});
+  const tx = await r.text(); let j=null; try{ j=JSON.parse(tx); }catch(_){}
+  return {ok:r.ok, status:r.status, text:tx, json:j};
+}
+async function postCSV(url, blob, headers={}){
   const fd=new FormData(); fd.append('file', blob, 'municipios.csv');
-  const r=await fetch(api()+'/api/admin/franquicia/ingest', { method:'POST', headers:{'X-Admin-Key': key()}, body: fd });
-  const text = await r.text();
-  let j=null; try{ j=JSON.parse(text) }catch(e){}
+  const r=await fetch(url, { method:'POST', headers, body:fd });
+  const tx = await r.text(); let j=null; try{ j=JSON.parse(tx) }catch(_){}
   if(r.ok && j && (j.ok===true || j.ok==="true")) return {ok:true, inserted:j.inserted||0, updated:j.updated||0, errors:j.errors||0, message:""};
-  return {ok:false, inserted:j?.inserted||0, updated:j?.updated||0, errors:j?.errors||0, message:(j?.error || text)};
+  return {ok:false, inserted:j?.inserted||0, updated:j?.updated||0, errors:j?.errors||0, message:(j?.error || tx)};
 }
 
-async function subirDirecto(){
-  _T_INS=0;_T_UPD=0;_T_ERR=0;_setProgress(0,0);
-  const f=document.getElementById('csvfile').files[0];
-  if(!f){ alert('Selecciona un CSV'); return; }
-  _setProgress(0,1);
-  const res=await postCSV(f);
-  appendRow('ALL', res);
-  _accTotals(res);
-  _setProgress(1,1);
+// ===== features =====
+async function probarConexion(){
+  const base = api();
+  if(!base){ alert('Escribe la API Base'); return; }
+  _setDiag('Comprobando...');
+  // Probar varias rutas
+  const paths = ['/api/health','/health','/version','/'];
+  for(const p of paths){
+    const res = await get(base + p);
+    if(res.ok){
+      _setConn('ok','Conectado (público)');
+      _setDiag('OK en '+p+' ['+res.status+']');
+      logln('Conexión OK en', p, 'status', res.status);
+      return;
+    }
+  }
+  _setConn('warn','Servidor responde (404)');
+  _setDiag('Respuesta sin health conocido (usa /api/health en backend para verde)');
+  logln('Servidor responde pero sin health conocido.');
+}
+async function probarClave(){
+  const base = api(); const k = key();
+  if(!base){ alert('Escribe la API Base'); return; }
+  if(!k){ alert('Escribe la Admin Key'); return; }
+  _setDiag('Probando clave...');
+  const res = await get(base + '/api/admin/ping', {'X-Admin-Key': k});
+  if(res.ok){
+    _setConn('ok','Conectado (admin)');
+    _setDiag('Admin ping OK ['+res.status+']');
+    logln('Admin OK');
+  }else if(res.status===401 || res.status===403){
+    _setConn('warn','Clave inválida');
+    _setDiag('El servidor respondió '+res.status);
+    logln('Clave inválida');
+  }else{
+    _setConn('err','Admin ping error '+res.status);
+    _setDiag('Revisa el endpoint /api/admin/ping');
+    logln('Admin ping error', res.status);
+  }
 }
 
 let LAST_HEADER=null, LAST_ROWS=[], LAST_CHUNK=500, FALLIDAS=new Set();
@@ -234,14 +231,21 @@ function csvParse(text){
   const rows=lines.filter(x=>x.trim()!=="");
   return [header, rows];
 }
-
-function makeBlob(header, rows, idx){
+function makeBlob(header, rows){
   const csv = [header, ...rows].join('\\n');
   return new Blob([csv], {type:'text/csv'});
 }
-
+async function subirDirecto(){
+  const f=document.getElementById('csvfile').files[0];
+  if(!f){ alert('Selecciona un CSV'); return; }
+  const base = api(); const k = key();
+  _setProgress(0,1);
+  const res=await postCSV(base + '/api/admin/franquicia/ingest', f, {'X-Admin-Key': k});
+  appendRow('ALL', res);
+  _accTotals(res);
+  _setProgress(1,1);
+}
 async function subirEnPartes(){
-  _T_INS=0;_T_UPD=0;_T_ERR=0;_setProgress(0,0);
   const f=document.getElementById('csvfile').files[0];
   if(!f){ alert('Selecciona un CSV'); return; }
   const t = await f.text();
@@ -253,13 +257,14 @@ async function subirEnPartes(){
   document.getElementById('tbody').innerHTML='';
 
   const throttle = parseInt(document.getElementById('throttleMs').value)||0;
-  let part=1;
+  const base = api(); const k = key();
   const totalParts = Math.ceil(rows.length / chunk);
   _setProgress(0, totalParts);
+  let part=1;
   for(let i=0; i<rows.length; i+=chunk){
     const slice = rows.slice(i, i+chunk);
-    const blob = makeBlob(header, slice, part);
-    const res = await postCSV(blob);
+    const blob = makeBlob(header, slice);
+    const res = await postCSV(base + '/api/admin/franquicia/ingest', blob, {'X-Admin-Key': k});
     appendRow(part, res);
     _accTotals(res);
     _setProgress(part, totalParts);
@@ -273,30 +278,34 @@ async function subirEnPartes(){
     alert('Todas las partes OK');
   }
 }
-
 async function reintentarUno(idx){
-  const totalParts = _TOTAL_PARTS || 0;
   if(!LAST_HEADER || LAST_ROWS.length===0){ alert('Primero usa "Subir en partes"'); return; }
   const start = (idx-1)*LAST_CHUNK;
   const slice = LAST_ROWS.slice(start, start+LAST_CHUNK);
-  const blob = makeBlob(LAST_HEADER, slice, idx);
-  const res = await postCSV(blob);
+  const blob = makeBlob(LAST_HEADER, slice);
+  const base = api(); const k = key();
+  const res = await postCSV(base + '/api/admin/franquicia/ingest', blob, {'X-Admin-Key': k});
   appendRow(idx, res);
   _accTotals(res);
   if(res.ok) FALLIDAS.delete(idx); else FALLIDAS.add(idx);
-  if(totalParts>0){
-    // Recompute done as total - fallidas.size, since table may have been partially OK
-    const done = totalParts - FALLIDAS.size;
-    _setProgress(done, totalParts);
-  }
 }
-
 async function reintentarFallidas(){
   if(FALLIDAS.size===0){ alert('No hay partes fallidas'); return; }
   for(const idx of Array.from(FALLIDAS)){
     await reintentarUno(idx);
   }
 }
+
+// ===== wire events (no inline onclick to avoid scope issues) =====
+window.addEventListener('DOMContentLoaded', ()=>{
+  document.getElementById('btnPing').addEventListener('click', probarConexion);
+  document.getElementById('btnPingAdmin').addEventListener('click', probarClave);
+  document.getElementById('btnDirecto').addEventListener('click', subirDirecto);
+  document.getElementById('btnPartes').addEventListener('click', subirEnPartes);
+  document.getElementById('btnRetry').addEventListener('click', reintentarFallidas);
+  document.getElementById('btnClear').addEventListener('click', ()=>{document.getElementById('log').textContent='';});
+  document.getElementById('btnDemo').addEventListener('click', ()=>{logln('✅ Botones OK. Escribe API Base y Admin Key.');});
+});
 </script>
 </body>
 </html>
