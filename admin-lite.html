@@ -1,255 +1,176 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="es">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>SpainRoom — Admin Franquicia (Lite)</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Admin Lite Plus — Importación por Partes</title>
 <style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px}
-h1{margin:0 0 12px 0}
-.card{border:1px solid #ddd;border-radius:10px;padding:12px;margin-bottom:12px}
-.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:8px 0}
-input,button,select,textarea{padding:8px 10px;font-size:14px}
-input[type="number"]{width:120px}
-table{width:100%;border-collapse:collapse;margin-top:10px}
-th,td{border:1px solid #ddd;padding:8px}
-th{background:#f6f6f6;text-align:left}
-.badge{padding:2px 8px;border-radius:10px;font-size:12px}
-.free{background:#eaf7ff}.partial{background:#fff4cc}.full{background:#ffe8e8}
-.small{font-size:12px;color:#666}
-.pbwrap{flex:1;background:#eee;border-radius:8px;overflow:hidden;height:12px}
-.pb{height:12px;width:0;background:#0a84ff;transition:width .2s}
-.mono{font-family:ui-monospace,Consolas,monospace}
+:root{--b:#0b5fff;--ok:#0a8f3c;--err:#c62828;--bg:#fafbff;--card:#fff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;color:#222}
+header{background:var(--b);color:#fff;padding:14px 18px;display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:18px;margin:0}
+main{max-width:1100px;margin:20px auto;padding:0 16px}
+.card{background:var(--card);border-radius:12px;box-shadow:0 8px 28px rgba(11,30,80,.08);padding:16px;margin-bottom:16px}
+.row{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:8px 0}
+input[type="text"],input[type="number"],input[type="password"],input[type="url"]{padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;min-width:180px}
+input[type="file"]{padding:6px 0}
+button{border:0;border-radius:10px;padding:10px 14px;background:var(--b);color:#fff;font-weight:600;cursor:pointer}
+button.secondary{background:#e5e7eb;color:#111}
+button.ghost{background:transparent;border:1px solid #d1d5db;color:#333}
+button:disabled{opacity:.5;cursor:not-allowed}
+table{width:100%;border-collapse:collapse}
+th,td{font-size:13px;border-bottom:1px solid #eee;padding:8px;text-align:left}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;font-size:11px}
+.badge.ok{background:#e8f5e9;color:var(--ok)}
+.badge.err{background:#ffebee;color:var(--err)}
+.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
 </style>
 </head>
 <body>
-<h1>SpainRoom — Admin Franquicia (Lite)</h1>
+<header><h1>Admin Lite Plus · Importación por Partes</h1></header>
+<main>
+  <div class="card">
+    <h3>Conexión</h3>
+    <div class="row">
+      <label>API Base</label>
+      <input id="apiBase" type="url" placeholder="https://backend-spainroom.onrender.com" />
+      <label>Admin Key</label>
+      <input id="adminKey" type="password" placeholder="********" />
+    </div>
+  </div>
 
-<!-- CONFIG -->
-<div class="card">
-  <div class="row">
-    <label>API:</label>
-    <input id="api" style="min-width:420px" value="https://backend-spainroom.onrender.com">
-    <label>Admin Key:</label>
-    <input id="key" value="ramon">
-    <button onclick="ping()">Probar</button>
-    <span id="ping" class="small mono"></span>
+  <div class="card">
+    <h3>Archivo CSV</h3>
+    <div class="row">
+      <input type="file" id="csvfile" accept=".csv" />
+      <label>Tamaño de parte</label>
+      <input type="number" id="chunkSize" value="500" min="100" step="100" />
+      <label>Espera entre partes (ms)</label>
+      <input type="number" id="throttleMs" value="300" min="0" step="50" />
+    </div>
+    <div class="row">
+      <button onclick="subirDirecto()">Subir directo</button>
+      <button onclick="subirEnPartes()">Subir en partes</button>
+      <button class="ghost" onclick="reintentarFallidas()">Reintentar fallidas</button>
+    </div>
+    <div class="row">
+      <small>Consejo: usa partes de 500. Si un trozo falla, aparecerá en la tabla y podrás reintentarlo de forma individual.</small>
+    </div>
   </div>
-  <div class="row">
-    <input id="prov" placeholder="Provincia">
-    <input id="mun" placeholder="Municipio">
-    <select id="status">
-      <option value="">Estado (todos)</option>
-      <option value="free">Libre</option>
-      <option value="partial">Parcial</option>
-      <option value="full">Ocupado</option>
-    </select>
-    <input id="assigned" placeholder="assigned_to (filtro)">
-    <button onclick="buscar()">Buscar</button>
-    <button onclick="exportXLS()">Export XLSX</button>
-  </div>
-</div>
 
-<!-- IMPORT -->
-<div class="card">
-  <h3>Importar CSV (provincia,municipio,poblacion)</h3>
-  <div class="row">
-    <input type="file" id="csvfile" accept=".csv">
-    <button onclick="importar()">Subir directo</button>
-    <button onclick="importarPartes()">Subir en partes (1000)</button>
+  <div class="card">
+    <h3>Resultado</h3>
+    <table>
+      <thead>
+        <tr><th>#</th><th>Estado</th><th>Insert.</th><th>Actual.</th><th>Errores</th><th>Mensaje</th><th>Acción</th></tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
   </div>
-  <div class="row" style="align-items:center">
-    <div class="pbwrap"><div id="pb" class="pb"></div></div>
-    <span id="impmsg" class="small mono" style="min-width:260px;text-align:right"></span>
-  </div>
-</div>
-
-<!-- ROW ACTIONS -->
-<div class="card">
-  <h3>Acciones por fila</h3>
-  <div class="row">
-    <input id="slotId" type="number" placeholder="id">
-    <input id="assTo" placeholder="assigned_to">
-    <button onclick="ocupar(1)">Ocupar +1</button>
-    <button onclick="liberar(1)">Liberar -1</button>
-    <button onclick="liberarTodo()">Liberar TODO</button>
-  </div>
-  <div class="row"><span id="opmsg" class="small mono"></span></div>
-</div>
-
-<!-- BULK -->
-<div class="card">
-  <h3>Bulk por nombres</h3>
-  <div class="row">
-    <textarea id="bulkNames" rows="6" style="width:100%" class="mono"
-      placeholder="provincia,municipio,assigned_to,inc&#10;Granada,Granada,franq-granada,1&#10;Sevilla,Sevilla,franq-sevilla,1"></textarea>
-  </div>
-  <div class="row">
-    <button onclick="ocuparPorNombres()">Ejecutar bulk</button>
-    <span id="bulkmsg" class="small mono"></span>
-  </div>
-</div>
-
-<!-- TABLE -->
-<table>
-  <thead><tr>
-    <th>ID</th><th>Provincia</th><th>Municipio</th><th>Población</th>
-    <th>Plazas</th><th>Ocupadas</th><th>Libres</th><th>Estado</th><th>assigned_to</th><th>Acción</th>
-  </tr></thead>
-  <tbody id="tbody"></tbody>
-</table>
+</main>
 
 <script>
-function val(id){return document.getElementById(id).value.trim();}
-function setv(id,v){document.getElementById(id).value=v;}
-function msg(id,t){document.getElementById(id).textContent=t;}
-function api(){return val('api')}
-function key(){return val('key')}
-function setPB(p){ document.getElementById('pb').style.width=(p||0)+'%'; }
+function val(id){return document.getElementById(id).value}
+function api(){return (val('apiBase')||'').replace(/\\/$/,'')}
+function key(){return val('adminKey')}
 
-async function ping(){
-  try{
-    const r=await fetch(api()+"/health");
-    msg("ping", r.ok? "OK ✅":"Error");
-  }catch(e){ msg("ping","Error"); }
-}
-
-async function buscar(page=1,size=5000){
-  const qs=new URLSearchParams({page,size});
-  if(val('prov')) qs.append('provincia',val('prov'));
-  if(val('mun')) qs.append('municipio',val('mun'));
-  if(val('status')) qs.append('status',val('status'));
-  if(val('assigned')) qs.append('assigned_to',val('assigned'));
-  const r=await fetch(api()+"/api/admin/franquicia/slots?"+qs.toString(),{headers:{"X-Admin-Key":key()}});
-  const j=await r.json().catch(()=>({ok:false}));
-  if(!j.ok){ alert("Error buscando"); return; }
-  render(j.results||[]);
-}
-
-function render(items){
-  const tb=document.getElementById('tbody'); tb.innerHTML="";
-  for(const s of items){
-    const tr=document.createElement('tr');
-    tr.innerHTML=`
-      <td>${s.id}</td>
-      <td>${s.provincia}</td>
-      <td>${s.municipio}</td>
-      <td>${s.poblacion}</td>
-      <td>${s.plazas}</td>
-      <td>${s.ocupadas}</td>
-      <td>${s.libres}</td>
-      <td><span class="badge ${s.status}">${s.status}</span></td>
-      <td>${s.assigned_to||""}</td>
-      <td><button onclick="sel(${s.id}, '${(s.assigned_to||"").replace(/"/g,'&quot;')}')">Elegir</button></td>`;
+function appendRow(idx, data){
+  const tb=document.getElementById('tbody');
+  let tr=document.querySelector('tr[data-idx="'+idx+'"]');
+  if(!tr){
+    tr=document.createElement('tr');
+    tr.dataset.idx=idx;
+    tr.innerHTML='<td class="mono">'+idx+'</td>'
+      +'<td class="mono status"></td>'
+      +'<td class="mono ins"></td>'
+      +'<td class="mono upd"></td>'
+      +'<td class="mono errs"></td>'
+      +'<td class="mono msg"></td>'
+      +'<td><button class="ghost mono" onclick="reintentarUno('+idx+')">Reintentar</button></td>';
     tb.appendChild(tr);
   }
+  tr.querySelector('.status').innerHTML = data.ok ? '<span class="badge ok">OK</span>' : '<span class="badge err">FALLO</span>';
+  tr.querySelector('.ins').textContent = data.inserted ?? '';
+  tr.querySelector('.upd').textContent = data.updated ?? '';
+  tr.querySelector('.errs').textContent = data.errors ?? '';
+  tr.querySelector('.msg').textContent = (data.message||'').slice(0,160);
 }
 
-function sel(id,ass){ setv('slotId',id); setv('assTo',ass||""); window.scrollTo({top:0,behavior:'smooth'}); }
-
-async function ocupar(inc){
-  const id=parseInt(val('slotId')||"0"); const assign=val('assTo');
-  if(!id){ alert("Indica id"); return; }
-  const r=await fetch(api()+"/api/admin/franquicia/slots/ocupar",{
-    method:"POST",
-    headers:{"X-Admin-Key":key(),"Content-Type":"application/json"},
-    body:JSON.stringify({id,assigned_to:assign||undefined,inc:inc||1})
-  });
-  const j=await r.json().catch(()=>({ok:false}));
-  msg("opmsg", j.ok? "OK":"Error"); await buscar();
+async function postCSV(blob){
+  const fd=new FormData(); fd.append('file', blob, 'municipios.csv');
+  const r=await fetch(api()+'/api/admin/franquicia/ingest', { method:'POST', headers:{'X-Admin-Key': key()}, body: fd });
+  const text = await r.text();
+  let j=null; try{ j=JSON.parse(text) }catch(e){}
+  if(r.ok && j && (j.ok===true || j.ok==="true")) return {ok:true, inserted:j.inserted||0, updated:j.updated||0, errors:j.errors||0, message:""};
+  return {ok:false, inserted:j?.inserted||0, updated:j?.updated||0, errors:j?.errors||0, message:(j?.error || text)};
 }
 
-async function liberar(dec){
-  const id=parseInt(val('slotId')||"0");
-  if(!id){ alert("Indica id"); return; }
-  const r=await fetch(api()+"/api/admin/franquicia/slots/liberar",{
-    method:"POST",
-    headers:{"X-Admin-Key":key(),"Content-Type":"application/json"},
-    body:JSON.stringify({id,dec:dec||1})
-  });
-  const j=await r.json().catch(()=>({ok:false}));
-  msg("opmsg", j.ok? "OK":"Error"); await buscar();
-}
-
-async function liberarTodo(){
-  msg("opmsg","Liberando…");
-  const r=await fetch(api()+"/api/admin/franquicia/slots",{headers:{"X-Admin-Key":key()}});
-  const j=await r.json().catch(()=>({ok:false,results:[]}));
-  if(!j.ok){ msg("opmsg","Error listando"); return; }
-  let done=0, todo=0;
-  for(const s of j.results||[]){
-    if((s.ocupadas||0)>0){ todo++; }
-  }
-  for(const s of j.results||[]){
-    if((s.ocupadas||0)>0){
-      const body=JSON.stringify({id:s.id,dec:s.ocupadas});
-      try{
-        const r2=await fetch(api()+"/api/admin/franquicia/slots/liberar",{
-          method:"POST", headers:{"X-Admin-Key":key(),"Content-Type":"application/json"}, body
-        });
-        const j2=await r2.json().catch(()=>({ok:false}));
-        if(j2.ok) done++;
-      }catch(_){}
-      msg("opmsg",`Liberando… ${done}/${todo}`);
-    }
-  }
-  msg("opmsg","Liberado todo."); await buscar();
-}
-
-/* Subida directa de 1 archivo (muestra texto aunque haya HTML 500) */
-async function importar(){
+async function subirDirecto(){
   const f=document.getElementById('csvfile').files[0];
-  if(!f){ alert('Selecciona CSV'); return; }
-  msg('impmsg','Subiendo…'); setPB(20);
-  const fd=new FormData(); fd.append('file',f);
-  try{
-    const r=await fetch(api()+"/api/admin/franquicia/ingest",{method:'POST',headers:{'X-Admin-Key':key()}, body:fd});
-    const text=await r.text(); setPB(60);
-    let j; try{ j=JSON.parse(text); }catch(_){ j=null; }
-    if(r.ok && j && j.ok){
-      msg('impmsg', `OK: ins:${j.inserted||0} upd:${j.updated||0} err:${j.errors||0}`); setPB(100);
-    }else{
-      msg('impmsg', 'Error: ' + (j?.error || text.slice(0,160))); setPB(0);
-      alert("Import error:\n"+text);
-    }
-  }catch(e){ msg('impmsg','Error de red'); setPB(0); alert(e); }
-  await buscar();
+  if(!f){ alert('Selecciona un CSV'); return; }
+  const res=await postCSV(f);
+  appendRow('ALL', res);
 }
 
-/* Cliente divide y sube por partes de 1000 filas con progreso */
-async function importarPartes(){
+let LAST_HEADER=null, LAST_ROWS=[], LAST_CHUNK=500, FALLIDAS=new Set();
+
+function csvParse(text){
+  const lines=text.split(/\\r?\\n/);
+  const header=lines.shift();
+  const rows=lines.filter(x=>x.trim()!=="");
+  return [header, rows];
+}
+
+function makeBlob(header, rows, idx){
+  const csv = [header, ...rows].join('\\n');
+  return new Blob([csv], {type:'text/csv'});
+}
+
+async function subirEnPartes(){
   const f=document.getElementById('csvfile').files[0];
-  if(!f){ alert('Selecciona CSV'); return; }
-  const text=await f.text(); // 223 KB no es nada
-  const all=text.split(/\r?\n/);
-  const header=all.shift();
-  const rows=all.filter(x=>x.trim()!=="");
-  if(!/^provincia,?municipio,?poblacion/i.test(header.replace(/\s+/g,""))){
-    if(!confirm("Cabecera no parece 'provincia,municipio,poblacion'. ¿Continuar?")) return;
+  if(!f){ alert('Selecciona un CSV'); return; }
+  const t = await f.text();
+  const [header, rows] = csvParse(t);
+  LAST_HEADER = header; LAST_ROWS = rows;
+  const chunk = parseInt(document.getElementById('chunkSize').value)||500;
+  LAST_CHUNK = chunk;
+  FALLIDAS.clear();
+  document.getElementById('tbody').innerHTML='';
+
+  const throttle = parseInt(document.getElementById('throttleMs').value)||0;
+  let part=1;
+  for(let i=0; i<rows.length; i+=chunk){
+    const slice = rows.slice(i, i+chunk);
+    const blob = makeBlob(header, slice, part);
+    const res = await postCSV(blob);
+    appendRow(part, res);
+    if(!res.ok) FALLIDAS.add(part);
+    part++;
+    if(throttle>0) await new Promise(r=>setTimeout(r, throttle));
   }
-  const chunk=1000;
-  let ok=0, err=0;
-  for(let i=0;i<rows.length;i+=chunk){
-    const part=[header, ...rows.slice(i,i+chunk)].join("\n");
-    const blob=new Blob([part],{type:'text/csv'});
-    const fd=new FormData(); fd.append('file', blob, `part_${(i/chunk)|0}.csv`);
-    setPB(Math.round(100*(i/rows.length)));
-    msg('impmsg',`Subiendo parte ${(i/chunk)|0}…`);
-    try{
-      const r=await fetch(api()+"/api/admin/franquicia/ingest",{method:'POST',headers:{'X-Admin-Key':key()}, body:fd});
-      const text=await r.text();
-      let j; try{ j=JSON.parse(text); }catch(_){ j=null; }
-      if(r.ok && j && j.ok){ ok++; } else { err++; console.warn('Parte error:', text); }
-    }catch(e){ err++; console.warn(e); }
+  if(FALLIDAS.size>0){
+    alert('Partes fallidas: '+Array.from(FALLIDAS).join(', '));
+  }else{
+    alert('Todas las partes OK');
   }
-  setPB(100);
-  msg('impmsg',`Partes OK ${ok}  Fallos ${err}`);
-  await buscar();
 }
 
-async function exportXLS(){
-  const u=api()+"/api/admin/franquicia/export.xlsx";
-  const a=document.createElement('a'); a.href=u; a.download="plazas_franquicia.xlsx"; a.click();
+async function reintentarUno(idx){
+  if(!LAST_HEADER || LAST_ROWS.length===0){ alert('Primero usa "Subir en partes"'); return; }
+  const start = (idx-1)*LAST_CHUNK;
+  const slice = LAST_ROWS.slice(start, start+LAST_CHUNK);
+  const blob = makeBlob(LAST_HEADER, slice, idx);
+  const res = await postCSV(blob);
+  appendRow(idx, res);
+  if(res.ok) FALLIDAS.delete(idx); else FALLIDAS.add(idx);
+}
+
+async function reintentarFallidas(){
+  if(FALLIDAS.size===0){ alert('No hay partes fallidas'); return; }
+  for(const idx of Array.from(FALLIDAS)){
+    await reintentarUno(idx);
+  }
 }
 </script>
 </body>
