@@ -1,6 +1,6 @@
 # codigo_api.py — SpainRoom API ONLY (Flask + SQLAlchemy)
 import os
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 from extensions import db
 from sqlalchemy.engine.url import make_url
@@ -49,11 +49,10 @@ def _import_models(app: Flask):
         "models_reservas",
         "models_remesas",
         "models_leads",
-        # añadidos para cobertura completa:
         "models_contact",
         "models_roomleads",
         "models_kyc",
-        "models_franchise_slots",   # <- IMPRESCINDIBLE para franchise_slots
+        "models_franchise_slots",
     ]:
         try:
             __import__(modname)
@@ -111,17 +110,16 @@ def create_app():
     db_uri = env("DATABASE_URL", "sqlite:///spainroom.db")
     app.config["SQLALCHEMY_DATABASE_URI"] = db_uri
 
-    # ✅ AÑADIDO: opciones del engine para conexiones estables (evita SSL/conn stale)
+    # Engine options
     app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-        "pool_pre_ping": True,   # valida la conexión antes de usarla
-        "pool_recycle": 300,     # recicla conexiones cada 5 min
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
         "pool_size": 5,
         "max_overflow": 10,
     }
-
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-    # CORS
+    # CORS (abierto; afinamos en after_request)
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
     # -------------------- DB init --------------------
@@ -130,10 +128,9 @@ def create_app():
     # 1) Importa modelos
     _import_models(app)
 
-    # 2) Intenta create_all() si se solicita; si falla por "database does not exist", crea BD y reintenta
+    # 2) create_all opcional
     with app.app_context():
         try:
-            # Solo si activas explícitamente la variable (no en prod por defecto)
             CREATE_ALL = os.getenv("SPAINROOM_CREATE_ALL", "false").lower() in {"1", "true", "yes"}
             if CREATE_ALL:
                 try:
@@ -174,7 +171,7 @@ def create_app():
         return jsonify(ok=True, service="spainroom-api",
                        hint="use /health, /diag, /api/* or POST /sms/inbound")
 
-    # CORS fino
+    # CORS fino por respuesta
     @app.after_request
     def add_cors_headers(resp):
         origin = request.headers.get("Origin")
@@ -200,6 +197,8 @@ def create_app():
     _try_register(app, "routes_upload_generic",    "bp_upload_generic", None)
     _try_register(app, "routes_sms",               "bp_sms",          "/sms")
     _try_register(app, "routes_admin_franchise",   "bp_admin_franq",  None)  # /api/admin/franquicia/*
+    # ✅ Pagos: /create-checkout-session (nuevo)
+    _try_register(app, "routes_payments_api",      "bp_pay",          None)
 
     return app
 

@@ -26,7 +26,7 @@ def _abs_url(origin: str, path: str) -> str:
 
 @bp_pay.route("/create-checkout-session", methods=["POST", "OPTIONS"])
 def create_checkout_session():
-    # ─── Preflight CORS ───────────────────────────────────────────
+    # ── Preflight CORS ─────────────────────────────────────────
     if request.method == "OPTIONS":
         resp = make_response("", 204)
         origin = request.headers.get("Origin", "")
@@ -38,7 +38,7 @@ def create_checkout_session():
             resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
 
-    # ─── Petición real ────────────────────────────────────────────
+    # ── Petición real ──────────────────────────────────────────
     data   = request.get_json(silent=True) or {}
     origin = request.headers.get("Origin") or "http://localhost:5176"
 
@@ -53,7 +53,7 @@ def create_checkout_session():
 
     # Sin clave → DEMO (redirige al OK)
     if not secret:
-        current_app.logger.info("Stripe demo: redirigiendo a %s", success_url)
+        current_app.logger.info("Stripe demo: %s", success_url)
         return jsonify(ok=True, demo=True, url=success_url)
 
     # Stripe real
@@ -80,5 +80,5 @@ def create_checkout_session():
         return jsonify(ok=True, url=session.url)
     except Exception as e:
         current_app.logger.exception("Stripe error: %s", e)
-        # Fallback demo para no bloquear
+        # Fallback demo
         return jsonify(ok=True, demo=True, url=success_url, error=str(e))
