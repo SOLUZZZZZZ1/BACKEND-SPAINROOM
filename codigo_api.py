@@ -60,10 +60,6 @@ def _import_models(app: Flask):
             app.logger.warning("Model skip: %s (%s)", modname, e)
 
 def _create_database_if_missing(app: Flask, db_uri: str) -> str:
-    """
-    Si la BD no existe: se conecta a 'postgres' y la crea con el mismo owner.
-    Devuelve la URI final (la original).
-    """
     url = make_url(db_uri)
     if url.get_backend_name() != "postgresql":
         return db_uri
@@ -109,8 +105,6 @@ def create_app():
     app.config["SECRET_KEY"] = env("SECRET_KEY", "sr-dev-secret")
     db_uri = env("DATABASE_URL", "sqlite:///spainroom.db")
     app.config["SQLALCHEMY_DATABASE_URI"] = db_uri
-
-    # Engine options
     app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
         "pool_pre_ping": True,
         "pool_recycle": 300,
@@ -119,7 +113,7 @@ def create_app():
     }
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-    # CORS (abierto; afinamos en after_request)
+    # CORS (abierto; afinamos por respuesta)
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
     # -------------------- DB init --------------------
@@ -188,7 +182,7 @@ def create_app():
     _try_register(app, "routes_contracts",         "bp_contracts",    None)
     _try_register(app, "routes_contact",           "bp_contact",      None)
     _try_register(app, "routes_auth",              "bp_auth",         None)
-    _try_register(app, "routes_franchise",         "bp_franchise",    None)  # /api/franchise/*
+    _try_register(app, "routes_franchise",         "bp_franchise",    None)
     _try_register(app, "routes_kyc",               "bp_kyc",          None)
     _try_register(app, "routes_reservas",          "bp_reservas",     None)
     _try_register(app, "routes_remesas",           "bp_remesas",      None)
@@ -196,13 +190,12 @@ def create_app():
     _try_register(app, "routes_uploads_rooms",     "bp_upload_rooms", None)
     _try_register(app, "routes_upload_generic",    "bp_upload_generic", None)
     _try_register(app, "routes_sms",               "bp_sms",          "/sms")
-    _try_register(app, "routes_admin_franchise",   "bp_admin_franq",  None)  # /api/admin/franquicia/*
-    # ✅ Pagos: /create-checkout-session (nuevo)
+    _try_register(app, "routes_admin_franchise",   "bp_admin_franq",  None)
+    # ✅ Pagos: /create-checkout-session
     _try_register(app, "routes_payments_api",      "bp_pay",          None)
 
     return app
 
 if __name__ == "__main__":
     app = create_app()
-    # En local: por defecto 127.0.0.1:5000
     app.run(host="127.0.0.1", port=int(os.getenv("PORT", "5000")), debug=True)

@@ -80,5 +80,5 @@ def create_checkout_session():
         return jsonify(ok=True, url=session.url)
     except Exception as e:
         current_app.logger.exception("Stripe error: %s", e)
-        # Fallback demo
+        # Fallback demo (no bloquea al usuario)
         return jsonify(ok=True, demo=True, url=success_url, error=str(e))
