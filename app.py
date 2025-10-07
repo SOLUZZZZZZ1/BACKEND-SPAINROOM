@@ -67,6 +67,8 @@ def create_app(test_config=None):
     from routes_kyc import bp_kyc
     from routes_sms import bp_sms
     from payments import bp_payments  # << pagos/Stripe
+    from routes_uploads_rooms_autofit import bp_upload_rooms_autofit
+    from routes_owner_cedula import bp_owner
 
     # create_all
     with app.app_context():
@@ -88,6 +90,8 @@ def create_app(test_config=None):
     app.register_blueprint(bp_kyc)
     app.register_blueprint(bp_payments, url_prefix="/api/payments")
     app.register_blueprint(bp_sms)
+    app.register_blueprint(bp_upload_rooms_autofit)
+    app.register_blueprint(bp_owner) 
 
     # CORS global
     ALLOWED_ORIGINS = {
