@@ -14,7 +14,6 @@ Blueprints:
   /api/kyc/*         -> routes_kyc.bp_kyc
   /api/payments/*    -> payments.bp_payments
   /sms/*             -> routes_sms.bp_sms
-  /api/owner/* -> routes_owner.bp_owner
 """
 import os, sys, types, logging
 from logging.handlers import RotatingFileHandler
@@ -115,6 +114,49 @@ def create_app(test_config=None):
     # Salud y errores
     @app.get("/health")
     def health(): return jsonify(ok=True, service="spainroom-backend")
+# ====== OWNER: rutas mínimas para desbloquear preflight y POST ======
+from flask import jsonify, request
+
+@app.route("/api/owner/check", methods=["POST", "OPTIONS"])
+def __owner_check_min():
+    # Preflight CORS
+    if request.method == "OPTIONS":
+        return ("", 204)
+    # Registro “dummy” (el front sólo necesita un ID y ok=True)
+    return jsonify(ok=True, id="SRV-TEST-" + __import__("uuid").uuid4().hex[:8])
+
+@app.route("/api/owner/cedula/verify/numero", methods=["POST", "OPTIONS"])
+def __owner_verify_num_min():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    numero = (body.get("numero") or "").strip()
+    status = "valida" if numero.endswith(("OK", "ok")) else "no_encontrada"
+    return jsonify(ok=True, status=status, data={"numero": numero})
+
+@app.route("/api/owner/cedula/verify/catastro", methods=["POST", "OPTIONS"])
+def __owner_verify_cat_min():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    refcat = (body.get("refcat") or "").strip()
+    # demo: par => valida; impar => no_encontrada
+    s = "valida" if (refcat[-1:].isdigit() and int(refcat[-1]) % 2 == 0) else "no_encontrada"
+    return jsonify(ok=True, status=s, data={"refcat": refcat})
+
+@app.route("/api/owner/cedula/verify/direccion", methods=["POST", "OPTIONS"])
+def __owner_verify_dir_min():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    provincia = (body.get("provincia") or "").lower()
+    oblig = {"barcelona","girona","lleida","tarragona","valencia","alicante","castellon","castellón","illes balears","islas baleares","balears"}
+    s = "depende" if provincia in oblig else "no_encontrada"
+    return jsonify(ok=True, status=s, data={
+        "direccion": body.get("direccion"), "municipio": body.get("municipio"), "provincia": body.get("provincia")
+    })
+# ================================================================
+
 
     @app.get("/")
     def index(): return jsonify(ok=True, msg="SpainRoom API")
