@@ -14,6 +14,7 @@ Blueprints:
   /api/kyc/*         -> routes_kyc.bp_kyc
   /api/payments/*    -> payments.bp_payments
   /sms/*             -> routes_sms.bp_sms
+  /api/owner/* -> routes_owner.bp_owner
 """
 import os, sys, types, logging
 from logging.handlers import RotatingFileHandler
