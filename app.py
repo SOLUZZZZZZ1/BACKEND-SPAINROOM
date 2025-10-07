@@ -21,7 +21,9 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-# DB robusto
+# ─────────────────────────────────────────────────────────────
+# DB robusto (fallback si no existe extensions.py)
+# ─────────────────────────────────────────────────────────────
 try:
     from extensions import db
 except Exception:
@@ -56,7 +58,9 @@ def create_app(test_config=None):
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     _init_logging(app)
 
+    # ─────────────────────────────────────────────────────────
     # Importar modelos y rutas ANTES de create_all
+    # ─────────────────────────────────────────────────────────
     from routes_auth import bp_auth; import models_auth
     from routes_contact import bp_contact; import models_contact
     from routes_contracts import bp_contracts; import models_contracts
@@ -66,20 +70,24 @@ def create_app(test_config=None):
     from routes_franchise import bp_franchise; import models_franchise
     from routes_kyc import bp_kyc
     from routes_sms import bp_sms
-    from payments import bp_payments  # << pagos/Stripe
+    from payments import bp_payments  # pagos/Stripe
     from routes_uploads_rooms_autofit import bp_upload_rooms_autofit
-    from routes_owner_cedula import bp_owner
+    from routes_owner_cedula import bp_owner  # Propietarios (cédula)
 
-    # create_all
+    # ─────────────────────────────────────────────────────────
+    # Crear tablas si faltan
+    # ─────────────────────────────────────────────────────────
     with app.app_context():
         try:
-            import models_kyc  # si existe, crea tabla; si no, sigue
+            import models_kyc  # si existe
         except Exception:
             pass
         db.create_all()
         app.logger.info("DB create_all() OK")
 
+    # ─────────────────────────────────────────────────────────
     # Registrar blueprints
+    # ─────────────────────────────────────────────────────────
     app.register_blueprint(bp_auth, url_prefix="/api/auth")
     app.register_blueprint(bp_contact)
     app.register_blueprint(bp_contracts)
@@ -91,13 +99,15 @@ def create_app(test_config=None):
     app.register_blueprint(bp_payments, url_prefix="/api/payments")
     app.register_blueprint(bp_sms)
     app.register_blueprint(bp_upload_rooms_autofit)
-    app.register_blueprint(bp_owner) 
+    app.register_blueprint(bp_owner)  # /api/owner/*
 
-    # CORS global
+    # ─────────────────────────────────────────────────────────
+    # CORS fino (preflight + orígenes permitidos)
+    # ─────────────────────────────────────────────────────────
     ALLOWED_ORIGINS = {
         "http://localhost:5176",
         "http://127.0.0.1:5176",
-        # añade Vercel si lo usas:
+        # añade tu front público si lo tienes:
         # "https://tu-frontend.vercel.app",
     }
     @app.after_request
@@ -111,62 +121,88 @@ def create_app(test_config=None):
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp
 
-    # Salud y errores
+    # ─────────────────────────────────────────────────────────
+    # Salud
+    # ─────────────────────────────────────────────────────────
     @app.get("/health")
-    def health(): return jsonify(ok=True, service="spainroom-backend")
-# ====== OWNER: rutas mínimas para desbloquear preflight y POST ======
-from flask import jsonify, request
+    def health():
+        return jsonify(ok=True, service="spainroom-backend")
 
-@app.route("/api/owner/check", methods=["POST", "OPTIONS"])
-def __owner_check_min():
-    # Preflight CORS
-    if request.method == "OPTIONS":
-        return ("", 204)
-    # Registro “dummy” (el front sólo necesita un ID y ok=True)
-    return jsonify(ok=True, id="SRV-TEST-" + __import__("uuid").uuid4().hex[:8])
+    # ─────────────────────────────────────────────────────────
+    # Fallback de rutas OWNER (por si el blueprint no cargase)
+    # Evitan 404 en preflight y devuelven 200 mínimamente.
+    # Sólo se montan si no existen ya en url_map.
+    # ─────────────────────────────────────────────────────────
+    def _mount_owner_fallbacks_if_needed():
+        existing = {rule.rule for rule in app.url_map.iter_rules()}
+        if "/api/owner/check" in existing:
+            return  # el blueprint ya está sirviendo rutas
 
-@app.route("/api/owner/cedula/verify/numero", methods=["POST", "OPTIONS"])
-def __owner_verify_num_min():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    body = request.get_json(silent=True) or {}
-    numero = (body.get("numero") or "").strip()
-    status = "valida" if numero.endswith(("OK", "ok")) else "no_encontrada"
-    return jsonify(ok=True, status=status, data={"numero": numero})
+        app.logger.warning("Montando fallbacks OWNER /api/owner/* (blueprint ausente)")
+        import uuid
 
-@app.route("/api/owner/cedula/verify/catastro", methods=["POST", "OPTIONS"])
-def __owner_verify_cat_min():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    body = request.get_json(silent=True) or {}
-    refcat = (body.get("refcat") or "").strip()
-    # demo: par => valida; impar => no_encontrada
-    s = "valida" if (refcat[-1:].isdigit() and int(refcat[-1]) % 2 == 0) else "no_encontrada"
-    return jsonify(ok=True, status=s, data={"refcat": refcat})
+        @app.route("/api/owner/check", methods=["POST", "OPTIONS"])
+        def owner_check_fallback():
+            if request.method == "OPTIONS":
+                return ("", 204)
+            return jsonify(ok=True, id="SRV-TEST-" + uuid.uuid4().hex[:8].upper())
 
-@app.route("/api/owner/cedula/verify/direccion", methods=["POST", "OPTIONS"])
-def __owner_verify_dir_min():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    body = request.get_json(silent=True) or {}
-    provincia = (body.get("provincia") or "").lower()
-    oblig = {"barcelona","girona","lleida","tarragona","valencia","alicante","castellon","castellón","illes balears","islas baleares","balears"}
-    s = "depende" if provincia in oblig else "no_encontrada"
-    return jsonify(ok=True, status=s, data={
-        "direccion": body.get("direccion"), "municipio": body.get("municipio"), "provincia": body.get("provincia")
-    })
-# ================================================================
+        @app.route("/api/owner/cedula/verify/numero", methods=["POST", "OPTIONS"])
+        def owner_verify_num_fallback():
+            if request.method == "OPTIONS":
+                return ("", 204)
+            body = request.get_json(silent=True) or {}
+            numero = (body.get("numero") or "").strip()
+            status = "valida" if numero.endswith(("OK", "ok")) else "no_encontrada"
+            return jsonify(ok=True, status=status, data={"numero": numero})
 
+        @app.route("/api/owner/cedula/verify/catastro", methods=["POST", "OPTIONS"])
+        def owner_verify_cat_fallback():
+            if request.method == "OPTIONS":
+                return ("", 204)
+            body = request.get_json(silent=True) or {}
+            refcat = (body.get("refcat") or "").strip()
+            s = "valida" if (refcat[-1:].isdigit() and int(refcat[-1]) % 2 == 0) else "no_encontrada"
+            return jsonify(ok=True, status=s, data={"refcat": refcat})
 
+        @app.route("/api/owner/cedula/verify/direccion", methods=["POST", "OPTIONS"])
+        def owner_verify_dir_fallback():
+            if request.method == "OPTIONS":
+                return ("", 204)
+            body = request.get_json(silent=True) or {}
+            provincia = (body.get("provincia") or "").lower()
+            oblig = {"barcelona","girona","lleida","tarragona","valencia","alicante","castellon","castellón","illes balears","islas baleares","balears"}
+            s = "depende" if provincia in oblig else "no_encontrada"
+            return jsonify(ok=True, status=s, data={
+                "direccion": body.get("direccion"),
+                "municipio": body.get("municipio"),
+                "provincia": body.get("provincia")
+            })
+
+    _mount_owner_fallbacks_if_needed()
+
+    # ─────────────────────────────────────────────────────────
+    # Depuración (opcional): listar rutas cargadas
+    # ─────────────────────────────────────────────────────────
+    @app.get("/__routes")
+    def __routes():
+        return jsonify(sorted([str(r) for r in app.url_map.iter_rules()]))
+
+    # ─────────────────────────────────────────────────────────
+    # Index y errores
+    # ─────────────────────────────────────────────────────────
     @app.get("/")
-    def index(): return jsonify(ok=True, msg="SpainRoom API")
+    def index():
+        return jsonify(ok=True, msg="SpainRoom API")
 
     @app.errorhandler(404)
-    def nf(e): return jsonify(ok=False, error="not_found", message="No encontrado"), 404
+    def nf(e):
+        return jsonify(ok=False, error="not_found", message="No encontrado"), 404
 
     @app.errorhandler(500)
     def se(e):
-        app.logger.exception("500"); return jsonify(ok=False, error="server_error"), 500
+        app.logger.exception("500")
+        return jsonify(ok=False, error="server_error"), 500
 
     return app
 
