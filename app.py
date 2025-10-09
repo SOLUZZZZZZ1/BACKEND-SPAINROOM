@@ -1,11 +1,25 @@
-# app.py — SpainRoom BACKEND (cédula-first, estricto y veraz)
-# - Conexión Postgres robusta (Render) con SSL y pool sano
-# - Endpoints con OPTIONS (preflight) → 204
-# - /api/legal/requirement lee de legal_requirements (municipio→provincia→default)
-# - /api/legal/cedula/check devuelve has_doc/status desde owner_cedulas (sin inventar)
-# - Catastro estricto (503 si no disponible; no se inventan datos)
-# - Owner: check + upload
-# Nota: /api/rooms/* lo gestiona vuestro blueprint (si lo registras). Aquí nos centramos en cédula.
+# app.py — SpainRoom BACKEND (API) — completo con registros de blueprints
+"""
+Flask + SQLAlchemy + CORS + logging + health.
+
+Blueprints esperados:
+  /api/auth/*        -> routes_auth.bp_auth
+  /api/contacto/*    -> routes_contact.bp_contact
+  /api/contracts/*   -> routes_contracts.bp_contracts
+  /api/rooms/*       -> routes_rooms.bp_rooms
+  /api/rooms/*       -> routes_uploads_rooms.bp_upload_rooms
+  /api/upload        -> routes_upload_generic.bp_upload_generic
+  /api/franchise/*   -> routes_franchise.bp_franchise
+  /api/kyc/*         -> routes_kyc.bp_kyc
+  /api/payments/*    -> payments.bp_payments
+  /sms/*             -> routes_sms.bp_sms
+  /api/owner/*       -> routes_owner_cedula.bp_owner
+  /api/catastro/*    -> routes_catastro.bp_catastro   (si ENABLE_BP_CATASTRO=1)
+Además: endpoints internos:
+  /api/legal/requirement
+  /api/legal/cedula/check
+  /api/admin/cedula/upsert
+"""
 
 import os, sys, types, logging
 from logging.handlers import RotatingFileHandler
@@ -17,7 +31,7 @@ from sqlalchemy import text
 
 # ---------- DB bootstrap ----------
 try:
-    from extensions import db  # si existe módulo; si no, creamos uno dinámico
+    from extensions import db
 except Exception:
     from flask_sqlalchemy import SQLAlchemy
     db = SQLAlchemy()
@@ -26,24 +40,26 @@ except Exception:
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = f"sqlite:///{(BASE_DIR / 'spainroom.db').as_posix()}"
 
+# Normalización robusta de URL para Postgres (Render) + SSL
 SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", DEFAULT_DB)
-_raw = os.environ.get("DATABASE_URL")
-if _raw:
-    if _raw.startswith("postgres://"):
-        _raw = _raw.replace("postgres://", "postgresql+psycopg2://", 1)
-    elif _raw.startswith("postgresql://"):
-        _raw = _raw.replace("postgresql://", "postgresql+psycopg2://", 1)
-    # fuerza SSL en Render
-    if "sslmode=" not in _raw and "+psycopg2://" in _raw:
-        _raw += ("&" if "?" in _raw else "?") + "sslmode=require"
-    SQLALCHEMY_DATABASE_URI = _raw
+_raw_db = os.environ.get("DATABASE_URL")
+if _raw_db:
+    if _raw_db.startswith("postgres://"):
+        _raw_db = _raw_db.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif _raw_db.startswith("postgresql://"):
+        _raw_db = _raw_db.replace("postgresql://", "postgresql+psycopg2://", 1)
+    if "sslmode=" not in _raw_db and "+psycopg2://" in _raw_db:
+        _raw_db += ("&" if "?" in _raw_db else "?") + "sslmode=require"
+    SQLALCHEMY_DATABASE_URI = _raw_db
 
 ENGINE_OPTIONS = {
-    "pool_pre_ping": True,   # revalida conexiones del pool
-    "pool_recycle": 300,     # recicla cada 5 min
+    "pool_pre_ping": True,
+    "pool_recycle": 300,
 }
 
-# ---------- App factory ----------
+JWT_SECRET  = os.environ.get("JWT_SECRET", os.environ.get("SECRET_KEY", "sr-dev-secret"))
+JWT_TTL_MIN = int(os.environ.get("JWT_TTL_MIN", "720"))
+
 def create_app(test_config=None):
     app = Flask(__name__, static_folder="public", static_url_path="/")
     try:
@@ -56,7 +72,9 @@ def create_app(test_config=None):
         SQLALCHEMY_DATABASE_URI=SQLALCHEMY_DATABASE_URI,
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SQLALCHEMY_ENGINE_OPTIONS=ENGINE_OPTIONS,
-        MAX_CONTENT_LENGTH=20 * 1024 * 1024,  # 20MB uploads
+        JWT_SECRET=JWT_SECRET,
+        JWT_TTL_MIN=JWT_TTL_MIN,
+        MAX_CONTENT_LENGTH=20 * 1024 * 1024,
     )
     if test_config:
         app.config.update(test_config)
@@ -65,17 +83,65 @@ def create_app(test_config=None):
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     _init_logging(app)
 
-    # --------- (Opcional) registra tus blueprints si existen ---------
-    try:
-        from routes_rooms import bp_rooms
-        app.register_blueprint(bp_rooms)
-    except Exception:
-        pass
+    # --------- Importar modelos/rutas ANTES de create_all ----------
+    # (cada import va en try para no romper si falta un módulo)
+    def _try_import(msg, fn):
+        try:
+            return fn()
+        except Exception as e:
+            app.logger.info(f"{msg} no disponible: {e}")
+            return None
 
-    # --------- CORS global extra (respeta preflight) ---------
+    bp_auth            = _try_import("auth",            lambda: __import__("routes_auth", fromlist=["bp_auth"]).bp_auth)
+    bp_contact         = _try_import("contact",         lambda: __import__("routes_contact", fromlist=["bp_contact"]).bp_contact)
+    bp_contracts       = _try_import("contracts",       lambda: __import__("routes_contracts", fromlist=["bp_contracts"]).bp_contracts)
+    bp_rooms           = _try_import("rooms",           lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)
+    bp_upload_rooms    = _try_import("upload_rooms",    lambda: __import__("routes_uploads_rooms", fromlist=["bp_upload_rooms"]).bp_upload_rooms)
+    bp_upload_generic  = _try_import("upload_generic",  lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
+    bp_franchise       = _try_import("franchise",       lambda: __import__("routes_franchise", fromlist=["bp_franchise"]).bp_franchise)
+    bp_kyc             = _try_import("kyc",             lambda: __import__("routes_kyc", fromlist=["bp_kyc"]).bp_kyc)
+    bp_sms             = _try_import("sms",             lambda: __import__("routes_sms", fromlist=["bp_sms"]).bp_sms)
+    bp_payments        = _try_import("payments",        lambda: __import__("payments", fromlist=["bp_payments"]).bp_payments)
+    bp_owner           = _try_import("owner",           lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
+    bp_upload_autofit  = _try_import("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
+
+    # Catastro sólo si lo activas por ENV
+    bp_catastro = None
+    if os.environ.get("ENABLE_BP_CATASTRO") in {"1","true","True"}:
+        bp_catastro = _try_import("catastro", lambda: __import__("routes_catastro", fromlist=["bp_catastro"]).bp_catastro)
+
+    # create_all
+    with app.app_context():
+        try:
+            # Si tienes modelos independientes, impórtalos aquí para que creen tablas
+            __import__("models_auth"), __import__("models_contact"), __import__("models_contracts")
+            __import__("models_rooms"), __import__("models_roomleads"), __import__("models_uploads")
+            # __import__("models_kyc")  # si existe
+        except Exception:
+            pass
+        db.create_all()
+        app.logger.info("DB create_all() OK")
+
+    # --------- Registrar blueprints con sus prefijos ---------
+    if bp_auth:           app.register_blueprint(bp_auth,          url_prefix="/api/auth")
+    if bp_contact:        app.register_blueprint(bp_contact,       url_prefix="/api/contacto")
+    if bp_contracts:      app.register_blueprint(bp_contracts,     url_prefix="/api/contracts")
+    if bp_rooms:          app.register_blueprint(bp_rooms,         url_prefix="/api/rooms")
+    if bp_upload_rooms:   app.register_blueprint(bp_upload_rooms,  url_prefix="/api/rooms")
+    if bp_upload_generic: app.register_blueprint(bp_upload_generic)  # define sus propias rutas
+    if bp_franchise:      app.register_blueprint(bp_franchise,     url_prefix="/api/franchise")
+    if bp_kyc:            app.register_blueprint(bp_kyc,           url_prefix="/api/kyc")
+    if bp_payments:       app.register_blueprint(bp_payments,      url_prefix="/api/payments")
+    if bp_sms:            app.register_blueprint(bp_sms,           url_prefix="/sms")
+    if bp_owner:          app.register_blueprint(bp_owner,         url_prefix="/api/owner")
+    if bp_upload_autofit: app.register_blueprint(bp_upload_autofit)  # si ya expone /api/rooms/*
+    if bp_catastro:       app.register_blueprint(bp_catastro,      url_prefix="/api/catastro")
+
+    # --------- CORS global (preflight friendly) ---------
     ALLOWED_ORIGINS = {
-        "http://localhost:5176", "http://127.0.0.1:5176"
-        # añade tu vercel si aplica: "https://tu-frontend.vercel.app",
+        "http://localhost:5176",
+        "http://127.0.0.1:5176",
+        # "https://tu-frontend.vercel.app",  # añade tu dominio si procede
     }
     @app.after_request
     def add_cors_headers(resp):
@@ -84,31 +150,25 @@ def create_app(test_config=None):
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Vary"] = "Origin"
             resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key, X-Franquiciado"
+            resp.headers["Access-Control-Allow-Headers"] = (
+                "Content-Type, Authorization, X-Admin-Key, X-Franquiciado, Stripe-Signature"
+            )
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp
 
-    # --------- Health ----------
-    @app.get("/health")
-    def health():
-        return jsonify(ok=True, service="spainroom-backend")
-
-    # --------- OWNER mínimos ----------
+    # --------- Endpoints internos (LEG/Owner mínimos) ---------
     @app.route("/api/owner/check", methods=["POST", "OPTIONS"])
     def owner_check():
-        if request.method == "OPTIONS":
-            return ("", 204)
+        if request.method == "OPTIONS": return ("", 204)
         body = request.get_json(silent=True) or {}
         import uuid
         return jsonify(ok=True, id="SRV-CHK-" + uuid.uuid4().hex[:8], echo=body)
 
     @app.route("/api/owner/cedula/upload", methods=["POST", "OPTIONS"])
     def cedula_upload():
-        if request.method == "OPTIONS":
-            return ("", 204)
+        if request.method == "OPTIONS": return ("", 204)
         f = request.files.get("file")
-        if not f:
-            return jsonify(ok=False, error="no_file"), 400
+        if not f: return jsonify(ok=False, error="no_file"), 400
         filename = secure_filename(f.filename or "file")
         up = Path(current_app.instance_path) / "uploads"
         up.mkdir(parents=True, exist_ok=True)
@@ -116,33 +176,10 @@ def create_app(test_config=None):
         f.save(tgt)
         return jsonify(ok=True, filename=filename, size=tgt.stat().st_size)
 
-    # --------- CATASTRO estricto (no mock) ----------
-    @app.route("/api/catastro/resolve_direccion", methods=["POST", "OPTIONS"])
-    def resolve_direccion():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        body = request.get_json(silent=True) or {}
-        if not all((body.get("direccion"), body.get("municipio"), body.get("provincia"))):
-            return jsonify(ok=False, error="bad_request", message="Faltan direccion/municipio/provincia"), 400
-        # Sin integración SOAP: no inventamos
-        return jsonify(ok=False, error="catastro_unavailable", message="Servicio Catastro no disponible"), 503
-
-    @app.route("/api/catastro/consulta_refcat", methods=["POST", "OPTIONS"])
-    def consulta_refcat():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        body = request.get_json(silent=True) or {}
-        refcat = (body.get("refcat") or "").strip()
-        if len(refcat) != 20 or not refcat.isalnum():
-            return jsonify(ok=False, error="bad_refcat", message="La referencia catastral debe tener 20 caracteres alfanuméricos."), 400
-        # Sin integración SOAP: no inventamos
-        return jsonify(ok=False, error="catastro_unavailable", message="Servicio Catastro no disponible"), 503
-
-    # --------- LEGAL: requisito por zona (DB real) ----------
+    # Requisito legal por zona (lee legal_requirements)
     @app.route("/api/legal/requirement", methods=["POST", "OPTIONS"])
     def legal_requirement():
-        if request.method == "OPTIONS":
-            return ("", 204)
+        if request.method == "OPTIONS": return ("", 204)
         b = request.get_json(silent=True) or {}
         municipio = (b.get("municipio") or "").strip()
         provincia = (b.get("provincia") or "").strip()
@@ -174,11 +211,10 @@ def create_app(test_config=None):
 
         return jsonify(ok=True, requirement=row)
 
-    # --------- LEGAL: ¿TIENE cédula en vigor? (DB owner_cedulas) ----------
+    # ¿TIENE cédula en vigor? (lee v_owner_cedulas_last)
     @app.route("/api/legal/cedula/check", methods=["POST", "OPTIONS"])
     def cedula_check():
-        if request.method == "OPTIONS":
-            return ("", 204)
+        if request.method == "OPTIONS": return ("", 204)
         b = request.get_json(silent=True) or {}
         refcat = (b.get("refcat") or "").strip()
         cedula_num = (b.get("cedula_numero") or "").strip()
@@ -199,85 +235,4 @@ def create_app(test_config=None):
                 r = c.execute(sql, {"num": cedula_num or None, "ref": refcat or None}).mappings().first()
                 if r: row = dict(r)
         except Exception as e:
-            current_app.logger.warning("cedula_check DB error: %s", e)
-
-        if not row:
-            return jsonify(ok=True, has_doc=False, status="no_consta",
-                           detail="Sin registro interno. Aporta cédula o espera verificación oficial."), 200
-
-        estado = (row.get("estado") or "no_consta").lower()
-        has_doc = (estado == "vigente")
-        return jsonify(ok=True, has_doc=has_doc, status=estado, data=row), 200
-
-    # --------- Admin: registrar/actualizar estado documental ----------
-    @app.route("/api/admin/cedula/upsert", methods=["POST", "OPTIONS"])
-    def admin_cedula_upsert():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        b = request.get_json(silent=True) or {}
-        refcat = (b.get("refcat") or "").strip() or None
-        cedula_num = (b.get("cedula_numero") or "").strip() or None
-        estado = (b.get("estado") or "pendiente").strip().lower()
-        expires_at = (b.get("expires_at") or None)
-        source = (b.get("source") or "manual").strip().lower()
-        notes = b.get("notes")
-
-        if estado not in ("vigente", "caducada", "no_consta", "pendiente"):
-            return jsonify(ok=False, error="bad_request", message="estado inválido"), 400
-        if not (refcat or cedula_num):
-            return jsonify(ok=False, error="bad_request", message="refcat o cedula_numero requerido"), 400
-
-        sql = text("""
-            INSERT INTO owner_cedulas (refcat, cedula_numero, estado, expires_at, verified_at, source, notes)
-            VALUES (:refcat, :cedula_numero, :estado, :expires_at, NOW(), :source, :notes)
-        """)
-        try:
-            with db.engine.begin() as c:
-                c.execute(sql, {
-                    "refcat": refcat, "cedula_numero": cedula_num,
-                    "estado": estado, "expires_at": expires_at,
-                    "source": source, "notes": notes
-                })
-        except Exception as e:
-            current_app.logger.warning("admin_cedula_upsert error: %s", e)
-            return jsonify(ok=False, error="server_error"), 500
-
-        return jsonify(ok=True)
-
-    # --------- Raíz y errores ----------
-    @app.get("/")
-    def index():
-        return jsonify(ok=True, msg="SpainRoom API (cédula)")
-
-    @app.errorhandler(404)
-    def nf(e):
-        return jsonify(ok=False, error="not_found", message="No encontrado"), 404
-
-    @app.errorhandler(500)
-    def se(e):
-        app.logger.exception("500")
-        return jsonify(ok=False, error="server_error"), 500
-
-    return app
-
-# ---------- Logging ----------
-def _init_logging(app):
-    app.logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
-    app.logger.addHandler(sh)
-    logs_dir = BASE_DIR / "logs"; logs_dir.mkdir(exist_ok=True)
-    fh = RotatingFileHandler(logs_dir / "backend.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt); fh.setLevel(logging.INFO); app.logger.addHandler(fh)
-    app.logger.info("Logging listo")
-
-# ---------- Dev runner ----------
-def run_dev():
-    app = create_app()
-    debug = os.environ.get("FLASK_DEBUG", "1") in ("1","true","True")
-    port = int(os.environ.get("PORT", "5000"))
-    app.logger.info("Dev http://127.0.0.1:%s (debug=%s)", port, debug)
-    app.run(host="0.0.0.0", port=port, debug=debug)
-
-if __name__ == "__main__":
-    run_dev()
+            current_app.logger.warning("
