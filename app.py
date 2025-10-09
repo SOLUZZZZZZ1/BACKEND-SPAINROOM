@@ -1,3 +1,4 @@
+
 # app.py
 """
 SpainRoom BACKEND (API)
@@ -15,11 +16,12 @@ Blueprints:
   /api/payments/*    -> payments.bp_payments
   /sms/*             -> routes_sms.bp_sms
 """
-import os, sys, types, logging
+import os, sys, types, logging, secrets
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, current_app
 from flask_cors import CORS
+from werkzeug.utils import secure_filename
 
 # DB robusto
 try:
@@ -74,6 +76,7 @@ def create_app(test_config=None):
         SQLALCHEMY_ENGINE_OPTIONS=ENGINE_OPTIONS,  # <--- parche clave
         JWT_SECRET=JWT_SECRET,
         JWT_TTL_MIN=JWT_TTL_MIN,
+        MAX_CONTENT_LENGTH=20 * 1024 * 1024,  # límite 20MB para uploads
     )
     if test_config:
         app.config.update(test_config)
@@ -139,20 +142,20 @@ def create_app(test_config=None):
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp
 
-    # Salud y errores
+    # Salud
     @app.get("/health")
-    def health(): 
+    def health():
         return jsonify(ok=True, service="spainroom-backend")
 
     # ====== OWNER: rutas mínimas para desbloquear preflight y POST ======
     @app.route("/api/owner/check", methods=["POST", "OPTIONS"])
     def __owner_check_min():
-        # Preflight CORS
         if request.method == "OPTIONS":
             return ("", 204)
+        body = request.get_json(silent=True) or {}
         # Registro “dummy” (el front sólo necesita un ID y ok=True)
         import uuid
-        return jsonify(ok=True, id="SRV-TEST-" + uuid.uuid4().hex[:8])
+        return jsonify(ok=True, id="SRV-TEST-" + uuid.uuid4().hex[:8], echo=body)
 
     @app.route("/api/owner/cedula/verify/numero", methods=["POST", "OPTIONS"])
     def __owner_verify_num_min():
@@ -186,12 +189,75 @@ def create_app(test_config=None):
         })
     # ================================================================
 
+    # ====== ENDPOINTS EXTRA PARA COMPATIBILIDAD CON VerificacionCedula.jsx ======
+    @app.route("/api/catastro/resolve_direccion", methods=["POST", "OPTIONS"])
+    def resolve_direccion():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        body = request.get_json(silent=True) or {}
+        direccion = (body.get("direccion") or "").strip()
+        municipio = (body.get("municipio") or "").strip()
+        provincia = (body.get("provincia") or "").strip()
+        cp = (body.get("cp") or "").strip()
+
+        # DEMO: genera una ref catastral "válida" (20 alfanuméricos) a partir de los datos
+        base = (municipio + provincia).upper().replace(" ", "")[:10]
+        rand = secrets.token_hex(10)[:10].upper()
+        refcat = (base + rand)[:20].ljust(20, "X")
+        return jsonify(ok=True, refcat=refcat)
+
+    @app.route("/api/catastro/consulta_refcat", methods=["POST", "OPTIONS"])
+    def consulta_refcat():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        body = request.get_json(silent=True) or {}
+        refcat = (body.get("refcat") or "").strip()
+        if not refcat or len(refcat) != 20:
+            return jsonify(ok=False, error="bad_refcat", message="La referencia catastral debe tener 20 caracteres."), 400
+        # DEMO: datos ficticios informativos
+        uso = "Residencial"
+        superficie_m2 = 80 + (hash(refcat) % 41)  # 80..120
+        antiguedad = str(1995 + (hash(refcat[::-1]) % 25))  # 1995..2019
+        return jsonify(ok=True, uso=uso, superficie_m2=superficie_m2, antiguedad=antiguedad)
+
+    @app.route("/api/legal/requirement", methods=["POST", "OPTIONS"])
+    def legal_requirement():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        body = request.get_json(silent=True) or {}
+        provincia = (body.get("provincia") or "").strip().lower()
+        municipio = (body.get("municipio") or "").strip().lower()
+
+        oblig = {"barcelona","girona","lleida","tarragona","valencia","alicante","castellon","castellón","illes balears","islas baleares","balears"}
+        if provincia in oblig:
+            req = {"cat": "si", "doc": "Cédula de habitabilidad", "org": "Generalitat / CCAA", "vig": "10 años", "notas": "Obligatoria para alquilar"}
+        else:
+            req = {"cat": "no", "doc": "—", "org": "—", "vig": "—", "notas": "No se exige en esta provincia"}
+
+        return jsonify(ok=True, requirement=req)
+
+    @app.route("/api/owner/cedula/upload", methods=["POST", "OPTIONS"])
+    def cedula_upload():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        f = request.files.get("file")
+        if not f:
+            return jsonify(ok=False, error="no_file"), 400
+        filename = secure_filename(f.filename or "file")
+        # Carpeta de subidas en instance/uploads
+        up_dir = Path(current_app.instance_path) / "uploads"
+        up_dir.mkdir(parents=True, exist_ok=True)
+        target = up_dir / filename
+        f.save(target)
+        return jsonify(ok=True, filename=filename, size=target.stat().st_size)
+    # ==========================================================================
+
     @app.get("/")
-    def index(): 
+    def index():
         return jsonify(ok=True, msg="SpainRoom API")
 
     @app.errorhandler(404)
-    def nf(e): 
+    def nf(e):
         return jsonify(ok=False, error="not_found", message="No encontrado"), 404
 
     @app.errorhandler(500)
