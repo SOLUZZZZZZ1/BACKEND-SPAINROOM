@@ -1,183 +1,75 @@
-# routes_catastro.py — Resolución por Dirección/Ref. Catastral (modo SOAP/DEMO) + helpers DB
-import os, json, hashlib, unicodedata, datetime
+# routes_catastro.py
+# Integración Catastro (SOAP) usando variables de entorno de Render
+# Endpoints:
+#  - POST /api/catastro/resolve_direccion  -> { ok, refcat }  (desde dirección)
+#  - POST /api/catastro/consulta_refcat    -> { ok, uso, superficie_m2, antiguedad } (si el SOAP lo devuelve)
+#
+# Variables de entorno esperadas (Render → Environment):
+#  CATASTRO_RESOLVE_URL           (p.ej. https://ovc.catastro.meh.es/ovcservweb/OVCSWLocalizacionRC/OVCCallejero.asmx)
+#  CATASTRO_RESOLVE_SOAP_ACTION   (p.ej. http://tempuri.org/Consulta_DNPRC)
+#  CATASTRO_CONSULTA_URL          (p.ej. https://ovc.catastro.meh.es/ovcservweb/OVCSWRC/OVCBusquedaRC.asmx)
+#  CATASTRO_CONSULTA_SOAP_ACTION  (acción SOAP de consulta por RC, según método que uses)
+#  CATASTRO_TIMEOUT               (opcional, por defecto 8.0)
+
 from flask import Blueprint, request, jsonify, current_app
+import os, re, requests
+import xml.etree.ElementTree as ET
 
-bp_catastro = Blueprint("catastro", __name__)
+bp_catastro = Blueprint("bp_catastro", __name__)
 
-def _ok(**kw): return jsonify({"ok": True, **kw})
+# --- Config desde entorno ---
+RESOLVE_URL   = os.getenv("CATASTRO_RESOLVE_URL", "").strip()
+RESOLVE_ACT   = os.getenv("CATASTRO_RESOLVE_SOAP_ACTION", "").strip()
+CONSULTA_URL  = os.getenv("CATASTRO_CONSULTA_URL", "").strip()
+CONSULTA_ACT  = os.getenv("CATASTRO_CONSULTA_SOAP_ACTION", "").strip()
+TIMEOUT       = float(os.getenv("CATASTRO_TIMEOUT", "8.0"))
 
-def _norm(s: str) -> str:
-    s = (s or "").strip()
-    s = unicodedata.normalize("NFD", s)
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+# Utilidad: busca una refcat de 20 alfanuméricos en un texto
+REFCAT_RE = re.compile(r"\b([A-Za-z0-9]{20})\b")
 
-# ===================== Integración Catastro (dos modos) =====================
-# MODO = 'soap' → llamar SOAP (si configuras URL/ACTION); 'demo' por defecto.
-CATASTRO_MODE = os.getenv("CATASTRO_MODE", "demo").lower()
-SOAP_URL_RESOLVE = os.getenv("CATASTRO_SOAP_URL_RESOLVE", "")   # ej: https://ovc.catastro.meh.es/ovcservweb/OVCSWLocalizacionRC/OVCCallejero.asmx
-SOAP_ACTION_RESOLVE = os.getenv("CATASTRO_SOAP_ACTION_RESOLVE", "")  # ej: "http://tempuri.org/Consulta_DNPLOC"
-SOAP_URL_REF = os.getenv("CATASTRO_SOAP_URL_REF", "")          # ej: https://ovc.catastro.meh.es/ovcservweb/OVCSWRC/OVCCallejero.asmx
-SOAP_ACTION_REF = os.getenv("CATASTRO_SOAP_ACTION_REF", "")    # ej: "http://tempuri.org/Consulta_DNPRC"
-HTTP_TIMEOUT = float(os.getenv("CATASTRO_TIMEOUT", "8"))
+def _first_text_by_suffix(root: ET.Element, suffixes=("rc1","refcat","rc")):
+    for el in root.iter():
+        tag = el.tag.split("}")[-1]  # quita namespace
+        if tag.lower() in {s.lower() for s in suffixes} and (el.text or "").strip():
+            return el.text.strip()
+    # si no encontramos, probamos por regex sobre todo el XML
+    xml_text = ET.tostring(root, encoding="unicode", method="xml")
+    m = REFCAT_RE.search(xml_text or "")
+    return m.group(1) if m else None
 
-def _soap_call(url: str, action: str, envelope: str):
-    """Llamada SOAP genérica (si configuras endpoints)."""
-    import requests
-    headers = {
-        "Content-Type": "text/xml; charset=utf-8",
-        "SOAPAction": action
-    }
-    r = requests.post(url, data=envelope.encode("utf-8"), headers=headers, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    return r.text
-
-def _fake_refcat_from(direccion: str, municipio: str, provincia: str) -> str:
-    base = (direccion or "") + "|" + (municipio or "") + "|" + (provincia or "")
-    h = hashlib.sha1(base.encode("utf-8")).hexdigest().upper()
-    # 20 alfanuméricos "estilo" refcat (demo)
-    return (h[:12] + h[20:28])[:20]
-
-# ===================== BBDD: legal_requirements =====================
-def _pg_conn():
-    url = os.getenv("DATABASE_URL", "")
-    if not url: return None
-    try:
-        import psycopg2
-    except ImportError:
-        os.system(f"{__import__('sys').executable} -m pip install -q psycopg2-binary")
-        import psycopg2
-    if "sslmode" not in url:
-        url += ("&" if "?" in url else "?") + "sslmode=require"
-    return psycopg2.connect(url)
-
-def _query_requirement(municipio: str|None, provincia: str|None):
-    """Devuelve la fila más específica (municipio+provincia) o sólo provincia, o None."""
-    con = _pg_conn()
-    if not con: return None
-    try:
-        with con, con.cursor() as cur:
-            if municipio and provincia:
-                cur.execute("""
-                  SELECT municipality, province, cat, doc, org, vig, notas, link
-                  FROM legal_requirements
-                  WHERE lower(municipality)=lower(%s) AND lower(province)=lower(%s)
-                  ORDER BY updated_at DESC
-                  LIMIT 1
-                """, (municipio, provincia))
-                row = cur.fetchone()
-                if row:
-                    keys = ["municipality","province","cat","doc","org","vig","notas","link"]
-                    return dict(zip(keys, row))
-            if provincia:
-                cur.execute("""
-                  SELECT municipality, province, cat, doc, org, vig, notas, link
-                  FROM legal_requirements
-                  WHERE municipality IS NULL AND lower(province)=lower(%s)
-                  ORDER BY updated_at DESC
-                  LIMIT 1
-                """, (provincia,))
-                row = cur.fetchone()
-                if row:
-                    keys = ["municipality","province","cat","doc","org","vig","notas","link"]
-                    return dict(zip(keys, row))
-    except Exception as e:
-        current_app.logger.warning("legal_requirements query failed: %s", e)
-    finally:
-        try: con.close()
-        except Exception: pass
-    return None
-
-# ===================== ENDPOINTS =====================
-
-@bp_catastro.route("/api/catastro/resolve_direccion", methods=["POST","OPTIONS"])
+@bp_catastro.route("/api/catastro/resolve_direccion", methods=["POST", "OPTIONS"])
 def resolve_direccion():
-    """Entrada: { direccion, municipio, provincia, cp? } → { refcat?, direccion_normalizada, municipio, provincia }"""
-    if request.method == "OPTIONS": return ("", 204)
-    body = request.get_json(silent=True) or {}
-    direccion = body.get("direccion") or ""
-    municipio = body.get("municipio") or ""
-    provincia = body.get("provincia") or ""
-    cp        = (body.get("cp") or "").strip()
+    if request.method == "OPTIONS":
+        return ("", 204)
 
+    if not RESOLVE_URL or not RESOLVE_ACT:
+        return jsonify(ok=False, error="config_error",
+                       message="Faltan variables CATASTRO_RESOLVE_URL / CATASTRO_RESOLVE_SOAP_ACTION"), 500
+
+    body = request.get_json(silent=True) or {}
+    direccion = (body.get("direccion") or "").strip()
+    municipio = (body.get("municipio") or "").strip()
+    provincia = (body.get("provincia") or "").strip()
+    numero    = (body.get("numero") or "").strip()  # opcional
     if not (direccion and municipio and provincia):
-        return jsonify(ok=False, error="missing_fields", needed="direccion, municipio, provincia"), 400
+        return jsonify(ok=False, error="bad_request",
+                       message="Faltan direccion/municipio/provincia"), 400
 
-    if CATASTRO_MODE == "soap" and SOAP_URL_RESOLVE and SOAP_ACTION_RESOLVE:
-        # TODO: arma el envelope correcto para el servicio SOAP que uses (Consulta_DNPLOC / etc.)
-        # Ejemplo de patrón (ajústalo a la doc oficial):
-        envelope = f"""<?xml version="1.0" encoding="utf-8"?>
-          <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                         xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-                         xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-            <soap:Body>
-              <Consulta_DNPLOC xmlns="http://tempuri.org/">
-                <Provincia>{provincia}</Provincia>
-                <Municipio>{municipio}</Municipio>
-                <Direccion>{direccion}</Direccion>
-                <CP>{cp}</CP>
-              </Consulta_DNPLOC>
-            </soap:Body>
-          </soap:Envelope>"""
-        try:
-            xml_text = _soap_call(SOAP_URL_RESOLVE, SOAP_ACTION_RESOLVE, envelope)
-            # TODO: parsea xml_text para extraer refcat y dirección normalizada.
-            # Devolvemos por ahora sin refcat (hasta que conectes la respuesta).
-            return _ok(direccion_normalizada=_norm(direccion), municipio=municipio, provincia=provincia, refcat=None, raw="soap_ok")
-        except Exception as e:
-            current_app.logger.warning("SOAP resolve_direccion failed: %s", e)
+    # Envelope típico para "Consulta_DNPRC" (puede variar según tu método/documentación que tengas en Render)
+    envelope = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <Consulta_DNPRC xmlns="http://tempuri.org/">
+      <Provincia>{provincia}</Provincia>
+      <Municipio>{municipio}</Municipio>
+      <TipoVia></TipoVia>
+      <NomVia>{direccion}</NomVia>
+      <Numero>{numero}</Numero>
+    </Consulta_DNPRC>
+  </soap:Body>
+</soap:Envelope>"""
 
-    # DEMO: si no SOAP, fabricamos una refcat sintética para poder continuar
-    refcat = _fake_refcat_from(direccion, municipio, provincia)
-    return _ok(direccion_normalizada=_norm(direccion), municipio=municipio, provincia=provincia, refcat=refcat, raw="demo")
-
-@bp_catastro.route("/api/catastro/consulta_refcat", methods=["POST","OPTIONS"])
-def consulta_refcat():
-    """Entrada: { refcat } → { uso, superficie_m2, antiguedad, … } (real si SOAP, demo si no)"""
-    if request.method == "OPTIONS": return ("", 204)
-    body = request.get_json(silent=True) or {}
-    refcat = (body.get("refcat") or "").strip()
-    if not refcat:
-        return jsonify(ok=False, error="missing_refcat"), 400
-
-    if CATASTRO_MODE == "soap" and SOAP_URL_REF and SOAP_ACTION_REF:
-        # TODO: envelope correcto para Consulta_DNPRC / etc.
-        envelope = f"""<?xml version="1.0" encoding="utf-8"?>
-          <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                         xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-                         xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-            <soap:Body>
-              <Consulta_DNPRC xmlns="http://tempuri.org/">
-                <RefCat>{refcat}</RefCat>
-              </Consulta_DNPRC>
-            </soap:Body>
-          </soap:Envelope>"""
-        try:
-            xml_text = _soap_call(SOAP_URL_REF, SOAP_ACTION_REF, envelope)
-            # TODO: parse xml_text y devolver campos reales
-            return _ok(refcat=refcat, uso="Residencial", superficie_m2=None, antiguedad=None, raw="soap_ok")
-        except Exception as e:
-            current_app.logger.warning("SOAP consulta_refcat failed: %s", e)
-
-    # DEMO
-    h = int(hashlib.sha1(refcat.encode("utf-8")).hexdigest(), 16)
-    return _ok(refcat=refcat,
-               uso="Residencial" if h % 2 == 0 else "Mixto",
-               superficie_m2=60 + (h % 80),
-               antiguedad=1990 + (h % 25),
-               raw="demo")
-
-@bp_catastro.route("/api/legal/requirement", methods=["POST","OPTIONS"])
-def legal_requirement():
-    """Busca en tabla legal_requirements por municipio+provincia (o sólo provincia)."""
-    if request.method == "OPTIONS": return ("", 204)
-    body = request.get_json(silent=True) or {}
-    municipio = body.get("municipio")
-    provincia = body.get("provincia")
-    row = _query_requirement(municipio, provincia)
-    if row:
-        return _ok(requirement={
-            "cat": row["cat"], "doc": row["doc"], "org": row["org"],
-            "vig": row["vig"], "notas": row["notas"], "link": row["link"],
-            "municipio": row["municipality"], "provincia": row["province"]
-        })
-    return jsonify(ok=False, error="not_found"), 404
+    headers = {
+        "Content-Type":
