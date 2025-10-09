@@ -1,8 +1,8 @@
+
 """
-SpainRoom BACKEND (API) — solución PROXY de pagos (Stripe) + blueprints completos
-- Front NO cambia: sigue llamando a /api/payments/create-checkout-session en este backend.
-- Este backend reenvía (proxy) al backend secundario que SÍ tiene la clave Stripe.
-- Registros de blueprints (rooms sin doble prefijo, owner, catastro opcional, etc.).
+SpainRoom BACKEND (API) — PROXY pagos Stripe + blueprints ajustados
+- El front llama a /api/payments/create-checkout-session en este backend.
+- Este backend reenvía al backend con la clave Stripe (PAY_PROXY_BASE).
 """
 
 import os, sys, types, logging, requests
@@ -58,7 +58,7 @@ def create_app(test_config=None):
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     _init_logging(app)
 
-    # ---------- Import blueprints ----------
+    # ---------- Import blueprints opcionales ----------
     def _try(name, fn):
         try:
             return fn()
@@ -66,41 +66,22 @@ def create_app(test_config=None):
             app.logger.info(f"{name} no disponible: {e}")
             return None
 
-    # Rooms: tus rutas YA son /api/rooms/... en el decorador -> NO usar url_prefix
-    bp_rooms        = _try("rooms",           lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)
-    bp_upload_rooms = _try("upload_rooms",    lambda: __import__("routes_uploads_rooms", fromlist=["bp_upload_rooms"]).bp_upload_rooms)
-    bp_upload_auto  = _try("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
+    # Rooms: decoradores ya incluyen /api/rooms/... => SIN url_prefix
+    bp_rooms = _try("rooms", lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)
 
-    bp_contact      = _try("contact",         lambda: __import__("routes_contact", fromlist=["bp_contact"]).bp_contact)
-    bp_contracts    = _try("contracts",       lambda: __import__("routes_contracts", fromlist=["bp_contracts"]).bp_contracts)
-    bp_franchise    = _try("franchise",       lambda: __import__("routes_franchise", fromlist=["bp_franchise"]).bp_franchise)
-    bp_auth         = _try("auth",            lambda: __import__("routes_auth", fromlist=["bp_auth"]).bp_auth)
-    bp_kyc          = _try("kyc",             lambda: __import__("routes_kyc", fromlist=["bp_kyc"]).bp_kyc)
-    bp_sms          = _try("sms",             lambda: __import__("routes_sms", fromlist=["bp_sms"]).bp_sms)
-    bp_owner        = _try("owner",           lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
+    # Owner mínimos (uploads)
+    bp_owner = _try("owner", lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
 
-    # Catastro opcional por ENV
-    bp_catastro = None
-    if os.getenv("ENABLE_BP_CATASTRO") in {"1", "true", "True"}:
-        bp_catastro = _try("catastro", lambda: __import__("routes_catastro", fromlist=["bp_catastro"]).bp_catastro)
-
-    # ---------- Crear tablas ----------
+    # ---------- Crear tablas (si hay modelos cargados) ----------
     with app.app_context():
-        db.create_all()
-        app.logger.info("DB create_all() OK")
+        try:
+            db.create_all()
+        except Exception as e:
+            app.logger.info(f"create_all omitido: {e}")
 
     # ---------- Registrar blueprints ----------
-    if bp_rooms:        app.register_blueprint(bp_rooms)                 # SIN prefijo extra
-    if bp_upload_rooms: app.register_blueprint(bp_upload_rooms)          # idem
-    if bp_upload_auto:  app.register_blueprint(bp_upload_auto)           # idem
-    if bp_contact:      app.register_blueprint(bp_contact,    url_prefix="/api/contacto")
-    if bp_contracts:    app.register_blueprint(bp_contracts,  url_prefix="/api/contracts")
-    if bp_franchise:    app.register_blueprint(bp_franchise,  url_prefix="/api/franchise")
-    if bp_auth:         app.register_blueprint(bp_auth,       url_prefix="/api/auth")
-    if bp_kyc:          app.register_blueprint(bp_kyc,        url_prefix="/api/kyc")
-    if bp_sms:          app.register_blueprint(bp_sms,        url_prefix="/sms")
-    if bp_owner:        app.register_blueprint(bp_owner,      url_prefix="/api/owner")
-    if bp_catastro:     app.register_blueprint(bp_catastro,   url_prefix="/api/catastro")
+    if bp_rooms: app.register_blueprint(bp_rooms)          # SIN prefijo extra
+    if bp_owner: app.register_blueprint(bp_owner, url_prefix="/api/owner")
 
     # ---------- CORS extra ----------
     ALLOWED_ORIGINS = {"http://localhost:5176", "http://127.0.0.1:5176"}
@@ -115,24 +96,7 @@ def create_app(test_config=None):
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp
 
-    # ---------- Endpoints internos (legal/owner mínimos) ----------
-    @app.route("/api/owner/check", methods=["POST","OPTIONS"])
-    def owner_check():
-        if request.method == "OPTIONS": return ("",204)
-        body = request.get_json(silent=True) or {}
-        import uuid
-        return jsonify(ok=True, id="SRV-CHK-" + uuid.uuid4().hex[:8], echo=body)
-
-    @app.route("/api/owner/cedula/upload", methods=["POST","OPTIONS"])
-    def cedula_upload():
-        if request.method == "OPTIONS": return ("",204)
-        f = request.files.get("file")
-        if not f: return jsonify(ok=False, error="no_file"), 400
-        filename = secure_filename(f.filename or "file")
-        up = Path(current_app.instance_path) / "uploads"; up.mkdir(parents=True, exist_ok=True)
-        tgt = up / filename; f.save(tgt)
-        return jsonify(ok=True, filename=filename, size=tgt.stat().st_size)
-
+    # ---------- LEGAL mínimos ----------
     @app.route("/api/legal/requirement", methods=["POST","OPTIONS"])
     def legal_requirement():
         if request.method == "OPTIONS": return ("",204)
@@ -179,51 +143,44 @@ def create_app(test_config=None):
             current_app.logger.warning(f"cedula_check DB error: {e}")
         return jsonify(ok=True, has_doc=False, status="no_consta")
 
-    @app.route("/api/admin/cedula/upsert", methods=["POST","OPTIONS"])
-    def cedula_upsert():
-        if request.method == "OPTIONS": return ("",204)
-        b = request.get_json(silent=True) or {}
-        ref = (b.get("refcat") or "").strip() or None
-        num = (b.get("cedula_numero") or "").strip() or None
-        estado = (b.get("estado") or "pendiente").strip().lower()
-        expires_at = (b.get("expires_at") or None)
-        source = (b.get("source") or "manual").strip().lower()
-        notes = b.get("notes")
-        if estado not in ("vigente","caducada","no_consta","pendiente"): return jsonify(ok=False,error="bad_request"),400
-        if not (ref or num): return jsonify(ok=False,error="bad_request"),400
-        sql = text("""
-            INSERT INTO owner_cedulas (refcat, cedula_numero, estado, expires_at, verified_at, source, notes)
-            VALUES (:r,:n,:e,:x,NOW(),:s,:t)
-        """)
-        try:
-            with db.engine.begin() as c:
-                c.execute(sql,{"r":ref,"n":num,"e":estado,"x":expires_at,"s":source,"t":notes})
-            return jsonify(ok=True)
-        except Exception as e:
-            current_app.logger.warning(f"cedula_upsert error: {e}")
-            return jsonify(ok=False,error="db_error"),500
-
-    # ---------- PROXY de pagos (Stripe) ----------
+    # ---------- PROXY pagos (Stripe) ----------
     @app.route("/api/payments/create-checkout-session", methods=["POST","OPTIONS"])
     def proxy_create_checkout_session():
         if request.method == "OPTIONS": return ("",204)
-        if not PAY_PROXY_BASE:
-            return jsonify(ok=False, error="proxy_not_configured"), 500
         try:
             r = requests.post(
                 f"{PAY_PROXY_BASE}/api/payments/create-checkout-session",
                 json=(request.get_json(silent=True) or {}),
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type":"application/json"},
                 timeout=12
             )
-            return Response(response=r.content, status=r.status_code, headers={"Content-Type": r.headers.get("Content-Type","application/json")})
+            return Response(response=r.content, status=r.status_code,
+                            headers={"Content-Type": r.headers.get("Content-Type","application/json")})
         except Exception as e:
             current_app.logger.warning(f"proxy payments error: {e}")
             return jsonify(ok=False, error="proxy_error"), 502
 
-    # ---------- Health / raíz ----------
+    # ---------- Owner mínimos ----------
+    @app.route("/api/owner/check", methods=["POST","OPTIONS"])
+    def owner_check():
+        if request.method == "OPTIONS": return ("",204)
+        body = request.get_json(silent=True) or {}
+        import uuid
+        return jsonify(ok=True, id="SRV-CHK-" + uuid.uuid4().hex[:8], echo=body)
+
+    @app.route("/api/owner/cedula/upload", methods=["POST","OPTIONS"])
+    def cedula_upload():
+        if request.method == "OPTIONS": return ("",204)
+        f = request.files.get("file")
+        if not f: return jsonify(ok=False, error="no_file"), 400
+        filename = secure_filename(f.filename or "file")
+        up = Path(current_app.instance_path) / "uploads"; up.mkdir(parents=True, exist_ok=True)
+        tgt = up / filename; f.save(tgt)
+        return jsonify(ok=True, filename=filename, size=tgt.stat().st_size)
+
+    # ---------- Health ----------
     @app.get("/health")
-    def health(): return jsonify(ok=True, service="spainroom-backend")
+    def health(): return jsonify(ok=True, service="spainroom-backend-proxy")
 
     @app.get("/")
     def root(): return jsonify(ok=True, msg="SpainRoom API")
