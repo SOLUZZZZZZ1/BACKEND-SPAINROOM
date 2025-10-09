@@ -15,7 +15,8 @@ Blueprints esperados:
   /sms/*             -> routes_sms.bp_sms
   /api/owner/*       -> routes_owner_cedula.bp_owner
   /api/catastro/*    -> routes_catastro.bp_catastro   (si ENABLE_BP_CATASTRO=1)
-Además: endpoints internos:
+
+Endpoints internos incluidos:
   /api/legal/requirement
   /api/legal/cedula/check
   /api/admin/cedula/upsert
@@ -84,7 +85,6 @@ def create_app(test_config=None):
     _init_logging(app)
 
     # --------- Importar modelos/rutas ANTES de create_all ----------
-    # (cada import va en try para no romper si falta un módulo)
     def _try_import(msg, fn):
         try:
             return fn()
@@ -105,7 +105,6 @@ def create_app(test_config=None):
     bp_owner           = _try_import("owner",           lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
     bp_upload_autofit  = _try_import("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
 
-    # Catastro sólo si lo activas por ENV
     bp_catastro = None
     if os.environ.get("ENABLE_BP_CATASTRO") in {"1","true","True"}:
         bp_catastro = _try_import("catastro", lambda: __import__("routes_catastro", fromlist=["bp_catastro"]).bp_catastro)
@@ -113,10 +112,10 @@ def create_app(test_config=None):
     # create_all
     with app.app_context():
         try:
-            # Si tienes modelos independientes, impórtalos aquí para que creen tablas
-            __import__("models_auth"), __import__("models_contact"), __import__("models_contracts")
-            __import__("models_rooms"), __import__("models_roomleads"), __import__("models_uploads")
-            # __import__("models_kyc")  # si existe
+            # importa modelos si los tienes para crear tablas
+            __import__("models_auth"); __import__("models_contact"); __import__("models_contracts")
+            __import__("models_rooms"); __import__("models_roomleads"); __import__("models_uploads")
+            # __import__("models_kyc")
         except Exception:
             pass
         db.create_all()
@@ -128,20 +127,20 @@ def create_app(test_config=None):
     if bp_contracts:      app.register_blueprint(bp_contracts,     url_prefix="/api/contracts")
     if bp_rooms:          app.register_blueprint(bp_rooms,         url_prefix="/api/rooms")
     if bp_upload_rooms:   app.register_blueprint(bp_upload_rooms,  url_prefix="/api/rooms")
-    if bp_upload_generic: app.register_blueprint(bp_upload_generic)  # define sus propias rutas
+    if bp_upload_generic: app.register_blueprint(bp_upload_generic)    # define sus propias rutas
     if bp_franchise:      app.register_blueprint(bp_franchise,     url_prefix="/api/franchise")
     if bp_kyc:            app.register_blueprint(bp_kyc,           url_prefix="/api/kyc")
     if bp_payments:       app.register_blueprint(bp_payments,      url_prefix="/api/payments")
     if bp_sms:            app.register_blueprint(bp_sms,           url_prefix="/sms")
     if bp_owner:          app.register_blueprint(bp_owner,         url_prefix="/api/owner")
-    if bp_upload_autofit: app.register_blueprint(bp_upload_autofit)  # si ya expone /api/rooms/*
+    if bp_upload_autofit: app.register_blueprint(bp_upload_autofit)    # si ya publica /api/rooms/*
     if bp_catastro:       app.register_blueprint(bp_catastro,      url_prefix="/api/catastro")
 
     # --------- CORS global (preflight friendly) ---------
     ALLOWED_ORIGINS = {
         "http://localhost:5176",
         "http://127.0.0.1:5176",
-        # "https://tu-frontend.vercel.app",  # añade tu dominio si procede
+        # "https://tu-frontend.vercel.app",
     }
     @app.after_request
     def add_cors_headers(resp):
@@ -159,16 +158,19 @@ def create_app(test_config=None):
     # --------- Endpoints internos (LEG/Owner mínimos) ---------
     @app.route("/api/owner/check", methods=["POST", "OPTIONS"])
     def owner_check():
-        if request.method == "OPTIONS": return ("", 204)
+        if request.method == "OPTIONS":
+            return ("", 204)
         body = request.get_json(silent=True) or {}
         import uuid
         return jsonify(ok=True, id="SRV-CHK-" + uuid.uuid4().hex[:8], echo=body)
 
     @app.route("/api/owner/cedula/upload", methods=["POST", "OPTIONS"])
     def cedula_upload():
-        if request.method == "OPTIONS": return ("", 204)
+        if request.method == "OPTIONS":
+            return ("", 204)
         f = request.files.get("file")
-        if not f: return jsonify(ok=False, error="no_file"), 400
+        if not f:
+            return jsonify(ok=False, error="no_file"), 400
         filename = secure_filename(f.filename or "file")
         up = Path(current_app.instance_path) / "uploads"
         up.mkdir(parents=True, exist_ok=True)
@@ -176,10 +178,10 @@ def create_app(test_config=None):
         f.save(tgt)
         return jsonify(ok=True, filename=filename, size=tgt.stat().st_size)
 
-    # Requisito legal por zona (lee legal_requirements)
     @app.route("/api/legal/requirement", methods=["POST", "OPTIONS"])
     def legal_requirement():
-        if request.method == "OPTIONS": return ("", 204)
+        if request.method == "OPTIONS":
+            return ("", 204)
         b = request.get_json(silent=True) or {}
         municipio = (b.get("municipio") or "").strip()
         provincia = (b.get("provincia") or "").strip()
@@ -202,19 +204,20 @@ def create_app(test_config=None):
         try:
             with db.engine.connect() as c:
                 r = c.execute(sql, {"mun": municipio, "prov": provincia}).mappings().first()
-                if r: row = dict(r)
+                if r:
+                    row = dict(r)
         except Exception as e:
-            current_app.logger.warning("legal_requirement DB error: %s", e)
+            current_app.logger.warning(f"legal_requirement DB error: {e}")
 
         if not row:
             row = {"cat":"no","doc":"—","org":"—","vig":"—","notas":"Sin datos para provincia/municipio.","link":None}
 
         return jsonify(ok=True, requirement=row)
 
-    # ¿TIENE cédula en vigor? (lee v_owner_cedulas_last)
     @app.route("/api/legal/cedula/check", methods=["POST", "OPTIONS"])
     def cedula_check():
-        if request.method == "OPTIONS": return ("", 204)
+        if request.method == "OPTIONS":
+            return ("", 204)
         b = request.get_json(silent=True) or {}
         refcat = (b.get("refcat") or "").strip()
         cedula_num = (b.get("cedula_numero") or "").strip()
@@ -223,16 +226,101 @@ def create_app(test_config=None):
 
         sql = text("""
             SELECT refcat, cedula_numero, estado, expires_at, verified_at, source, notes, created_at
-            FROM v_owner_cedulas_last
-            WHERE (:num IS NOT NULL AND cedula_numero = :num)
-               OR (:ref IS NOT NULL AND refcat = :ref)
-            ORDER BY created_at DESC
-            LIMIT 1
+              FROM v_owner_cedulas_last
+             WHERE (:num IS NOT NULL AND cedula_numero = :num)
+                OR (:ref IS NOT NULL AND refcat = :ref)
+             ORDER BY created_at DESC
+             LIMIT 1
         """)
         row = None
         try:
             with db.engine.connect() as c:
                 r = c.execute(sql, {"num": cedula_num or None, "ref": refcat or None}).mappings().first()
-                if r: row = dict(r)
+                if r:
+                    row = dict(r)
         except Exception as e:
-            current_app.logger.warning("
+            current_app.logger.warning(f"cedula_check DB error: {e}")
+
+        if not row:
+            return jsonify(ok=True, has_doc=False, status="no_consta",
+                           detail="Sin registro interno. Aporta cédula o espera verificación oficial."), 200
+
+        estado = (row.get("estado") or "no_consta").lower()
+        has_doc = (estado == "vigente")
+        return jsonify(ok=True, has_doc=has_doc, status=estado, data=row), 200
+
+    @app.route("/api/admin/cedula/upsert", methods=["POST", "OPTIONS"])
+    def admin_cedula_upsert():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        b = request.get_json(silent=True) or {}
+        refcat = (b.get("refcat") or "").strip() or None
+        cedula_num = (b.get("cedula_numero") or "").strip() or None
+        estado = (b.get("estado") or "pendiente").strip().lower()
+        expires_at = (b.get("expires_at") or None)
+        source = (b.get("source") or "manual").strip().lower()
+        notes = b.get("notes")
+
+        if estado not in ("vigente", "caducada", "no_consta", "pendiente"):
+            return jsonify(ok=False, error="bad_request", message="estado inválido"), 400
+        if not (refcat or cedula_num):
+            return jsonify(ok=False, error="bad_request", message="refcat o cedula_numero requerido"), 400
+
+        sql = text("""
+            INSERT INTO owner_cedulas (refcat, cedula_numero, estado, expires_at, verified_at, source, notes)
+            VALUES (:refcat, :cedula_numero, :estado, :expires_at, NOW(), :source, :notes)
+        """)
+        try:
+            with db.engine.begin() as c:
+                c.execute(sql, {
+                    "refcat": refcat, "cedula_numero": cedula_num,
+                    "estado": estado, "expires_at": expires_at,
+                    "source": source, "notes": notes
+                })
+        except Exception as e:
+            current_app.logger.warning(f"admin_cedula_upsert error: {e}")
+            return jsonify(ok=False, error="server_error"), 500
+
+        return jsonify(ok=True)
+
+    # --------- Salud y raíz ----------
+    @app.get("/health")
+    def health():
+        return jsonify(ok=True, service="spainroom-backend")
+
+    @app.get("/")
+    def index():
+        return jsonify(ok=True, msg="SpainRoom API")
+
+    @app.errorhandler(404)
+    def nf(e):
+        return jsonify(ok=False, error="not_found", message="No encontrado"), 404
+
+    @app.errorhandler(500)
+    def se(e):
+        app.logger.exception("500")
+        return jsonify(ok=False, error="server_error"), 500
+
+    return app
+
+# ---------- Logging ----------
+def _init_logging(app):
+    app.logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
+    app.logger.addHandler(sh)
+    logs_dir = BASE_DIR / "logs"; logs_dir.mkdir(exist_ok=True)
+    fh = RotatingFileHandler(logs_dir / "backend.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    fh.setFormatter(fmt); fh.setLevel(logging.INFO); app.logger.addHandler(fh)
+    app.logger.info("Logging listo")
+
+# ---------- Dev runner ----------
+def run_dev():
+    app = create_app()
+    debug = os.environ.get("FLASK_DEBUG", "1") in ("1","true","True")
+    port = int(os.environ.get("PORT", "5000"))
+    app.logger.info("Dev http://127.0.0.1:%s (debug=%s)", port, debug)
+    app.run(host="0.0.0.0", port=port, debug=debug)
+
+if __name__ == "__main__":
+    run_dev()
