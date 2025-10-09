@@ -1,9 +1,9 @@
 ﻿
-# migrate_legal_owner.py — crea/actualiza legal_requirements + owner_checks
-# - Usa columnas normalizadas generadas (municipality_norm, province_norm)
-# - UNIQUE CONSTRAINT sobre (municipality_norm, province_norm) para ON CONFLICT
-# - Inserta filas base y permite añadir más fácilmente
-import os, sys, json, datetime
+# migrate_legal_owner_v2.py — corrige "generation expression is not immutable"
+# Crea columnas normales municipality_key/province_key + UNIQUE CONSTRAINT
+# Inserta/actualiza filas base con UPSERT calculando las keys via unaccent(lower(...))
+
+import os, sys
 
 DDL = r"""
 CREATE EXTENSION IF NOT EXISTS unaccent;
@@ -19,11 +19,35 @@ CREATE TABLE IF NOT EXISTS legal_requirements (
   notas        TEXT,
   link         TEXT,
   updated_at   TIMESTAMP DEFAULT NOW(),
-  -- columnas normalizadas (generadas) para conflicto único
-  municipality_norm TEXT GENERATED ALWAYS AS (unaccent(lower(coalesce(municipality,'')))) STORED,
-  province_norm     TEXT GENERATED ALWAYS AS (unaccent(lower(province))) STORED,
-  CONSTRAINT uq_legal_req_muni_prov UNIQUE (municipality_norm, province_norm)
+  municipality_key TEXT,
+  province_key     TEXT
 );
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='legal_requirements' AND column_name='municipality_key'
+  ) THEN
+    ALTER TABLE legal_requirements ADD COLUMN municipality_key TEXT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='legal_requirements' AND column_name='province_key'
+  ) THEN
+    ALTER TABLE legal_requirements ADD COLUMN province_key TEXT;
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname='uq_legal_req_muni_prov'
+  ) THEN
+    ALTER TABLE legal_requirements
+    ADD CONSTRAINT uq_legal_req_muni_prov UNIQUE (municipality_key, province_key);
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS owner_checks (
   id TEXT PRIMARY KEY,
@@ -37,22 +61,31 @@ CREATE TABLE IF NOT EXISTS owner_checks (
 );
 """
 
-BASE_ROWS = [
-  # province-level (municipality=None)
-  {"municipality": None, "province": "Barcelona",       "cat": "si", "doc": "Cèdula d'habitabilitat", "org": "Generalitat/Ajuntament", "vig": "~15 años", "notas": "Requisito habitual para arrendamiento en Catalunya.", "link": "https://habitatge.gencat.cat/ca/ambits/rehabilitacio/certificats/certificat-habitabilitat/"},
-  {"municipality": None, "province": "Valencia",        "cat": "si", "doc": "Licencia 2ª ocupación / Declaración responsable", "org": "Ajuntament/GVA", "vig": "5–10 años", "notas": "Suele exigirse para alquiler.", "link": "https://www.gva.es/va/inicio/procedimientos?id_proc=18592"},
-  {"municipality": None, "province": "Islas Baleares",  "cat": "si", "doc": "Cédula de habitabilidad", "org": "GOIB/Ajuntament", "vig": "~10 años", "notas": "Requisito general para alquiler.", "link": "https://www.caib.es/sites/habitatge/ca/cedula_habitabilitat/"},
-  # example municipality
-  {"municipality": "Sant Llorenç Savall", "province": "Barcelona", "cat": "si", "doc": "Cèdula d'habitabilitat", "org": "Generalitat/Ajuntament", "vig": "~15 años", "notas": "Obligatorio para arrendamiento en Catalunya.", "link": "https://habitatge.gencat.cat/ca/ambits/rehabilitacio/certificats/certificat-habitabilitat/"},
-]
-
 UPSERT_SQL = r"""
-INSERT INTO legal_requirements (municipality, province, cat, doc, org, vig, notas, link, updated_at)
-VALUES (%(municipality)s, %(province)s, %(cat)s, %(doc)s, %(org)s, %(vig)s, %(notas)s, %(link)s, NOW())
+INSERT INTO legal_requirements (
+  municipality, province, cat, doc, org, vig, notas, link, updated_at,
+  municipality_key, province_key
+)
+VALUES (
+  %(municipality)s, %(province)s, %(cat)s, %(doc)s, %(org)s, %(vig)s, %(notas)s, %(link)s, NOW(),
+  unaccent(lower(coalesce(%(municipality)s,''))), unaccent(lower(%(province)s))
+)
 ON CONFLICT ON CONSTRAINT uq_legal_req_muni_prov DO UPDATE
 SET cat=EXCLUDED.cat, doc=EXCLUDED.doc, org=EXCLUDED.org, vig=EXCLUDED.vig,
     notas=EXCLUDED.notas, link=EXCLUDED.link, updated_at=NOW();
 """
+
+BASE_ROWS = [
+  # Catalunya (provinciales)
+  {"municipality": None, "province": "Barcelona",  "cat": "si", "doc": "Cèdula d'habitabilitat", "org": "Generalitat / Ajuntament", "vig": "~15 años", "notas": "Requisito habitual para arrendamiento en Catalunya.", "link": "https://habitatge.gencat.cat/ca/ambits/rehabilitacio/certificats/certificat-habitabilitat/"},
+  {"municipality": None, "province": "Girona",     "cat": "si", "doc": "Cèdula d'habitabilitat", "org": "Generalitat / Ajuntament", "vig": "~15 años", "notas": "Requisito habitual para arrendamiento en Catalunya.", "link": "https://habitatge.gencat.cat/"},
+  {"municipality": None, "province": "Lleida",     "cat": "si", "doc": "Cèdula d'habitabilitat", "org": "Generalitat / Ajuntament", "vig": "~15 años", "notas": "Requisito habitual para arrendamiento en Catalunya.", "link": "https://habitatge.gencat.cat/"},
+  {"municipality": None, "province": "Tarragona",  "cat": "si", "doc": "Cèdula d'habitabilitat", "org": "Generalitat / Ajuntament", "vig": "~15 años", "notas": "Requisito habitual para arrendamiento en Catalunya.", "link": "https://habitatge.gencat.cat/"},
+  # Baleares (provincial)
+  {"municipality": None, "province": "Islas Baleares", "cat": "si", "doc": "Cédula de habitabilidad", "org": "GOIB / Ajuntament", "vig": "~10 años", "notas": "Requisito general para alquiler.", "link": "https://www.caib.es/sites/habitatge/ca/cedula_habitabilitat/"},
+  # C. Valenciana (provincial)
+  {"municipality": None, "province": "Valencia", "cat": "si", "doc": "Licencia 2ª ocupación / Declaración responsable", "org": "Ajuntament / GVA", "vig": "5–10 años", "notas": "Suele exigirse para alquiler.", "link": "https://www.gva.es/va/inicio/procedimientos?id_proc=18592"},
+]
 
 def main():
     url = (os.getenv("DATABASE_URL") or "").strip() or (sys.argv[1].strip() if len(sys.argv) > 1 else "")
@@ -69,28 +102,13 @@ def main():
         subprocess.check_call([_sys.executable, "-m", "pip", "install", "-q", "psycopg2-binary"])
         import psycopg2, psycopg2.extras
 
-    con = psycopg2.connect(url)
-    con.autocommit = True
-    cur = con.cursor()
-    try:
+    con = psycopg2.connect(url); con.autocommit = True
+    with con.cursor() as cur:
         cur.execute(DDL)
-        print("✅ DDL aplicado (extensión unaccent, tablas y constraint único).")
-
-        # Permite añadir filas extra vía JSON en argumento 2 (opcional)
-        extra_rows = []
-        if len(sys.argv) > 2 and sys.argv[2] and os.path.isfile(sys.argv[2]):
-            with open(sys.argv[2], "r", encoding="utf-8") as fh:
-                extra_rows = json.load(fh)
-                assert isinstance(extra_rows, list), "El JSON debe ser una lista de objetos"
-
-        rows = BASE_ROWS + extra_rows
-        with con.cursor() as c2:
-            psycopg2.extras.execute_batch(c2, UPSERT_SQL, rows, page_size=100)
-        print(f"✅ UPSERT completado: {len(rows)} filas")
-
-    finally:
-        cur.close()
-        con.close()
+        print("✅ DDL OK (extensión, tablas, UNIQUE).")
+        psycopg2.extras.execute_batch(cur, UPSERT_SQL, BASE_ROWS, page_size=50)
+        print(f"✅ UPSERT base OK: {len(BASE_ROWS)} filas.")
+    con.close()
 
 if __name__ == "__main__":
     main()

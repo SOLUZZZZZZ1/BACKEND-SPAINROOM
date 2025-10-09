@@ -1,29 +1,14 @@
 
-# app.py
-"""
-SpainRoom BACKEND (API)
-Flask + SQLAlchemy + CORS + logging + health.
-
-Blueprints:
-  /api/auth/*        -> routes_auth.bp_auth
-  /api/contacto/*    -> routes_contact.bp_contact
-  /api/contracts/*   -> routes_contracts.bp_contracts
-  /api/rooms/*       -> routes_rooms.bp_rooms
-  /api/rooms/*       -> routes_uploads_rooms.bp_upload_rooms
-  /api/upload        -> routes_upload_generic.bp_upload_generic
-  /api/franchise/*   -> routes_franchise.bp_franchise
-  /api/kyc/*         -> routes_kyc.bp_kyc
-  /api/payments/*    -> payments.bp_payments
-  /sms/*             -> routes_sms.bp_sms
-"""
-import os, sys, types, logging, secrets
+# app.py — backend centrado en cédula (estricto y veraz)
+import os, sys, types, logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from flask import Flask, jsonify, request, current_app
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+from sqlalchemy import text
 
-# DB robusto
+# DB bootstrap
 try:
     from extensions import db
 except Exception:
@@ -34,236 +19,112 @@ except Exception:
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = f"sqlite:///{(BASE_DIR / 'spainroom.db').as_posix()}"
 
-# --- Construcción robusta de la URL de BD (Render/Postgres) ---
 SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", DEFAULT_DB)
+_raw = os.environ.get("DATABASE_URL")
+if _raw:
+    if _raw.startswith("postgres://"):
+        _raw = _raw.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif _raw.startswith("postgresql://"):
+        _raw = _raw.replace("postgresql://", "postgresql+psycopg2://", 1)
+    if "sslmode=" not in _raw and "+psycopg2://" in _raw:
+        _raw += ("&" if "?" in _raw else "?") + "sslmode=require"
+    SQLALCHEMY_DATABASE_URI = _raw
 
-_raw_db_url = os.environ.get("DATABASE_URL")
-if _raw_db_url:
-    # Normaliza prefijo para SQLAlchemy
-    if _raw_db_url.startswith("postgres://"):
-        _raw_db_url = _raw_db_url.replace("postgres://", "postgresql+psycopg2://", 1)
-    elif _raw_db_url.startswith("postgresql://"):
-        _raw_db_url = _raw_db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
-
-    # Asegura sslmode=require si no está ya presente
-    if "sslmode=" not in _raw_db_url and "+psycopg2://" in _raw_db_url:
-        sep = "&" if "?" in _raw_db_url else "?"
-        _raw_db_url = f"{_raw_db_url}{sep}sslmode=require"
-
-    SQLALCHEMY_DATABASE_URI = _raw_db_url
-
-# Opciones del engine para evitar conexiones "stale" y errores TLS
-ENGINE_OPTIONS = {
-    "pool_pre_ping": True,   # revalida conexiones antes de usarlas
-    "pool_recycle": 300,     # recicla conexiones cada 5 min
-    # "pool_size": 5, "max_overflow": 10,  # ajustables si hace falta
-}
-
-JWT_SECRET  = os.environ.get("JWT_SECRET", os.environ.get("SECRET_KEY", "sr-dev-secret"))
-JWT_TTL_MIN = int(os.environ.get("JWT_TTL_MIN", "720"))
+ENGINE_OPTIONS = {"pool_pre_ping": True, "pool_recycle": 300}
 
 def create_app(test_config=None):
     app = Flask(__name__, static_folder="public", static_url_path="/")
-    try:
-        Path(app.instance_path).mkdir(parents=True, exist_ok=True)
-        Path(app.instance_path, "uploads").mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
     app.config.update(
         SQLALCHEMY_DATABASE_URI=SQLALCHEMY_DATABASE_URI,
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
-        SQLALCHEMY_ENGINE_OPTIONS=ENGINE_OPTIONS,  # <--- parche clave
-        JWT_SECRET=JWT_SECRET,
-        JWT_TTL_MIN=JWT_TTL_MIN,
-        MAX_CONTENT_LENGTH=20 * 1024 * 1024,  # límite 20MB para uploads
+        SQLALCHEMY_ENGINE_OPTIONS=ENGINE_OPTIONS,
+        MAX_CONTENT_LENGTH=20 * 1024 * 1024,
     )
-    if test_config:
-        app.config.update(test_config)
+    if test_config: app.config.update(test_config)
 
     db.init_app(app)
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     _init_logging(app)
 
-    # Importar modelos y rutas ANTES de create_all
-    from routes_auth import bp_auth; import models_auth
-    from routes_contact import bp_contact; import models_contact
-    from routes_contracts import bp_contracts; import models_contracts
-    from routes_rooms import bp_rooms; import models_rooms; import models_roomleads
-    from routes_uploads_rooms import bp_upload_rooms; import models_uploads
-    from routes_upload_generic import bp_upload_generic
-    from routes_franchise import bp_franchise; import models_franchise
-    from routes_kyc import bp_kyc
-    from routes_sms import bp_sms
-    from payments import bp_payments  # << pagos/Stripe
-    from routes_uploads_rooms_autofit import bp_upload_rooms_autofit
-    from routes_owner_cedula import bp_owner
-    from routes_catastro import bp_catastro
-
-    # create_all
-    with app.app_context():
-        try:
-            import models_kyc  # si existe, crea tabla; si no, sigue
-        except Exception:
-            pass
-        db.create_all()
-        app.logger.info("DB create_all() OK")
-
-    # Registrar blueprints
-    app.register_blueprint(bp_auth, url_prefix="/api/auth")
-    app.register_blueprint(bp_contact)
-    app.register_blueprint(bp_contracts)
-    app.register_blueprint(bp_rooms)
-    app.register_blueprint(bp_upload_rooms)
-    app.register_blueprint(bp_upload_generic)
-    app.register_blueprint(bp_franchise)
-    app.register_blueprint(bp_kyc)
-    app.register_blueprint(bp_payments, url_prefix="/api/payments")
-    app.register_blueprint(bp_sms)
-    app.register_blueprint(bp_upload_rooms_autofit)
-    app.register_blueprint(bp_owner) 
-    app.register_blueprint(bp_catastro)
-
-    # CORS global
-    ALLOWED_ORIGINS = {
-        "http://localhost:5176",
-        "http://127.0.0.1:5176",
-        # añade Vercel si lo usas:
-        # "https://tu-frontend.vercel.app",
-    }
-    @app.after_request
-    def add_cors_headers(resp):
-        origin = request.headers.get("Origin")
-        if origin and (origin in ALLOWED_ORIGINS or origin.endswith(".vercel.app")):
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Vary"] = "Origin"
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key, X-Franquiciado"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-        return resp
-
-    # Salud
     @app.get("/health")
-    def health():
-        return jsonify(ok=True, service="spainroom-backend")
+    def health(): return jsonify(ok=True, service="spainroom-backend")
 
-    # ====== OWNER: rutas mínimas para desbloquear preflight y POST ======
+    # OWNER básicos
     @app.route("/api/owner/check", methods=["POST", "OPTIONS"])
-    def __owner_check_min():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        body = request.get_json(silent=True) or {}
-        # Registro “dummy” (el front sólo necesita un ID y ok=True)
+    def owner_check():
+        if request.method == "OPTIONS": return ("", 204)
         import uuid
-        return jsonify(ok=True, id="SRV-TEST-" + uuid.uuid4().hex[:8], echo=body)
-
-    @app.route("/api/owner/cedula/verify/numero", methods=["POST", "OPTIONS"])
-    def __owner_verify_num_min():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        body = request.get_json(silent=True) or {}
-        numero = (body.get("numero") or "").strip()
-        status = "valida" if numero.endswith(("OK", "ok")) else "no_encontrada"
-        return jsonify(ok=True, status=status, data={"numero": numero})
-
-    @app.route("/api/owner/cedula/verify/catastro", methods=["POST", "OPTIONS"])
-    def __owner_verify_cat_min():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        body = request.get_json(silent=True) or {}
-        refcat = (body.get("refcat") or "").strip()
-        # demo: par => valida; impar => no_encontrada
-        s = "valida" if (refcat[-1:].isdigit() and int(refcat[-1]) % 2 == 0) else "no_encontrada"
-        return jsonify(ok=True, status=s, data={"refcat": refcat})
-
-    @app.route("/api/owner/cedula/verify/direccion", methods=["POST", "OPTIONS"])
-    def __owner_verify_dir_min():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        body = request.get_json(silent=True) or {}
-        provincia = (body.get("provincia") or "").lower()
-        oblig = {"barcelona","girona","lleida","tarragona","valencia","alicante","castellon","castellón","illes balears","islas baleares","balears"}
-        s = "depende" if provincia in oblig else "no_encontrada"
-        return jsonify(ok=True, status=s, data={
-            "direccion": body.get("direccion"), "municipio": body.get("municipio"), "provincia": body.get("provincia")
-        })
-    # ================================================================
-
-    # ====== ENDPOINTS EXTRA PARA COMPATIBILIDAD CON VerificacionCedula.jsx ======
-    @app.route("/api/catastro/resolve_direccion", methods=["POST", "OPTIONS"])
-    def resolve_direccion():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        body = request.get_json(silent=True) or {}
-        direccion = (body.get("direccion") or "").strip()
-        municipio = (body.get("municipio") or "").strip()
-        provincia = (body.get("provincia") or "").strip()
-        cp = (body.get("cp") or "").strip()
-
-        # DEMO: genera una ref catastral "válida" (20 alfanuméricos) a partir de los datos
-        base = (municipio + provincia).upper().replace(" ", "")[:10]
-        rand = secrets.token_hex(10)[:10].upper()
-        refcat = (base + rand)[:20].ljust(20, "X")
-        return jsonify(ok=True, refcat=refcat)
-
-    @app.route("/api/catastro/consulta_refcat", methods=["POST", "OPTIONS"])
-    def consulta_refcat():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        body = request.get_json(silent=True) or {}
-        refcat = (body.get("refcat") or "").strip()
-        if not refcat or len(refcat) != 20:
-            return jsonify(ok=False, error="bad_refcat", message="La referencia catastral debe tener 20 caracteres."), 400
-        # DEMO: datos ficticios informativos
-        uso = "Residencial"
-        superficie_m2 = 80 + (hash(refcat) % 41)  # 80..120
-        antiguedad = str(1995 + (hash(refcat[::-1]) % 25))  # 1995..2019
-        return jsonify(ok=True, uso=uso, superficie_m2=superficie_m2, antiguedad=antiguedad)
-
-    @app.route("/api/legal/requirement", methods=["POST", "OPTIONS"])
-    def legal_requirement():
-        if request.method == "OPTIONS":
-            return ("", 204)
-        body = request.get_json(silent=True) or {}
-        provincia = (body.get("provincia") or "").strip().lower()
-        municipio = (body.get("municipio") or "").strip().lower()
-
-        oblig = {"barcelona","girona","lleida","tarragona","valencia","alicante","castellon","castellón","illes balears","islas baleares","balears"}
-        if provincia in oblig:
-            req = {"cat": "si", "doc": "Cédula de habitabilidad", "org": "Generalitat / CCAA", "vig": "10 años", "notas": "Obligatoria para alquilar"}
-        else:
-            req = {"cat": "no", "doc": "—", "org": "—", "vig": "—", "notas": "No se exige en esta provincia"}
-
-        return jsonify(ok=True, requirement=req)
+        return jsonify(ok=True, id="SRV-TEST-" + uuid.uuid4().hex[:8])
 
     @app.route("/api/owner/cedula/upload", methods=["POST", "OPTIONS"])
     def cedula_upload():
-        if request.method == "OPTIONS":
-            return ("", 204)
+        if request.method == "OPTIONS": return ("", 204)
         f = request.files.get("file")
-        if not f:
-            return jsonify(ok=False, error="no_file"), 400
+        if not f: return jsonify(ok=False, error="no_file"), 400
         filename = secure_filename(f.filename or "file")
-        # Carpeta de subidas en instance/uploads
-        up_dir = Path(current_app.instance_path) / "uploads"
-        up_dir.mkdir(parents=True, exist_ok=True)
-        target = up_dir / filename
-        f.save(target)
+        up_dir = Path(current_app.instance_path) / "uploads"; up_dir.mkdir(parents=True, exist_ok=True)
+        target = up_dir / filename; f.save(target)
         return jsonify(ok=True, filename=filename, size=target.stat().st_size)
-    # ==========================================================================
+
+    # CATASTRO estricto (sin mock)
+    @app.post("/api/catastro/resolve_direccion")
+    def resolve_dir():
+        body = request.get_json(silent=True) or {}
+        if not all((body.get("direccion"), body.get("municipio"), body.get("provincia"))):
+            return jsonify(ok=False, error="bad_request", message="Faltan direccion/municipio/provincia"), 400
+        return jsonify(ok=False, error="catastro_unavailable", message="Servicio Catastro no disponible"), 503
+
+    @app.post("/api/catastro/consulta_refcat")
+    def consulta_refcat():
+        body = request.get_json(silent=True) or {}
+        refcat = (body.get("refcat") or "").strip()
+        if len(refcat) != 20 or not refcat.isalnum():
+            return jsonify(ok=False, error="bad_refcat", message="La referencia catastral debe tener 20 caracteres alfanuméricos."), 400
+        return jsonify(ok=False, error="catastro_unavailable", message="Servicio Catastro no disponible"), 503
+
+    # CÉDULA: DB real (municipio -> provincia -> default), SIEMPRE 200 con resultado
+    @app.post("/api/legal/requirement")
+    def legal_requirement():
+        body = request.get_json(silent=True) or {}
+        municipio = (body.get("municipio") or "").strip()
+        provincia = (body.get("provincia") or "").strip()
+        if not provincia:
+            return jsonify(ok=False, error="bad_request", message="Falta 'provincia'"), 400
+
+        sql = text("""
+            WITH q AS (
+              SELECT cat, doc, org, vig, notas, link
+              FROM legal_requirements
+              WHERE
+                (municipality_key = unaccent(lower(coalesce(:mun,''))) AND province_key = unaccent(lower(:prov)))
+                OR (municipality IS NULL AND province_key = unaccent(lower(:prov)))
+              ORDER BY (municipality IS NOT NULL) DESC
+              LIMIT 1
+            )
+            SELECT * FROM q
+        """)
+        row = None
+        try:
+            with db.engine.connect() as conn:
+                r = conn.execute(sql, {"mun": municipio, "prov": provincia}).mappings().first()
+                if r: row = dict(r)
+        except Exception as e:
+            current_app.logger.warning("legal_requirement DB error: %s", e)
+
+        if not row:
+            row = {"cat":"no","doc":"—","org":"—","vig":"—","notas":"Sin datos para provincia/municipio.","link":None}
+
+        return jsonify(ok=True, requirement={**row, "has_doc": False})
 
     @app.get("/")
-    def index():
-        return jsonify(ok=True, msg="SpainRoom API")
+    def index(): return jsonify(ok=True, msg="SpainRoom API (cédula)")
 
     @app.errorhandler(404)
-    def nf(e):
-        return jsonify(ok=False, error="not_found", message="No encontrado"), 404
+    def nf(e): return jsonify(ok=False, error="not_found", message="No encontrado"), 404
 
     @app.errorhandler(500)
     def se(e):
-        app.logger.exception("500")
-        return jsonify(ok=False, error="server_error"), 500
+        app.logger.exception("500"); return jsonify(ok=False, error="server_error"), 500
 
     return app
 
@@ -276,13 +137,3 @@ def _init_logging(app):
     fh = RotatingFileHandler(logs_dir / "backend.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     fh.setFormatter(fmt); fh.setLevel(logging.INFO); app.logger.addHandler(fh)
     app.logger.info("Logging listo")
-
-def run_dev():
-    app = create_app()
-    debug = os.environ.get("FLASK_DEBUG", "1") in ("1","true","True")
-    port = int(os.environ.get("PORT", "5000"))
-    app.logger.info("Dev http://127.0.0.1:%s (debug=%s)", port, debug)
-    app.run(host="0.0.0.0", port=port, debug=debug)
-
-if __name__ == "__main__":
-    run_dev()
