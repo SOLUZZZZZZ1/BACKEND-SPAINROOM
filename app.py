@@ -31,7 +31,32 @@ except Exception:
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = f"sqlite:///{(BASE_DIR / 'spainroom.db').as_posix()}"
+
+# --- Construcción robusta de la URL de BD (Render/Postgres) ---
 SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", DEFAULT_DB)
+
+_raw_db_url = os.environ.get("DATABASE_URL")
+if _raw_db_url:
+    # Normaliza prefijo para SQLAlchemy
+    if _raw_db_url.startswith("postgres://"):
+        _raw_db_url = _raw_db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif _raw_db_url.startswith("postgresql://"):
+        _raw_db_url = _raw_db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+    # Asegura sslmode=require si no está ya presente
+    if "sslmode=" not in _raw_db_url and "+psycopg2://" in _raw_db_url:
+        sep = "&" if "?" in _raw_db_url else "?"
+        _raw_db_url = f"{_raw_db_url}{sep}sslmode=require"
+
+    SQLALCHEMY_DATABASE_URI = _raw_db_url
+
+# Opciones del engine para evitar conexiones "stale" y errores TLS
+ENGINE_OPTIONS = {
+    "pool_pre_ping": True,   # revalida conexiones antes de usarlas
+    "pool_recycle": 300,     # recicla conexiones cada 5 min
+    # "pool_size": 5, "max_overflow": 10,  # ajustables si hace falta
+}
+
 JWT_SECRET  = os.environ.get("JWT_SECRET", os.environ.get("SECRET_KEY", "sr-dev-secret"))
 JWT_TTL_MIN = int(os.environ.get("JWT_TTL_MIN", "720"))
 
@@ -46,6 +71,7 @@ def create_app(test_config=None):
     app.config.update(
         SQLALCHEMY_DATABASE_URI=SQLALCHEMY_DATABASE_URI,
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        SQLALCHEMY_ENGINE_OPTIONS=ENGINE_OPTIONS,  # <--- parche clave
         JWT_SECRET=JWT_SECRET,
         JWT_TTL_MIN=JWT_TTL_MIN,
     )
@@ -95,7 +121,6 @@ def create_app(test_config=None):
     app.register_blueprint(bp_owner) 
     app.register_blueprint(bp_catastro)
 
-
     # CORS global
     ALLOWED_ORIGINS = {
         "http://localhost:5176",
@@ -116,60 +141,63 @@ def create_app(test_config=None):
 
     # Salud y errores
     @app.get("/health")
-    def health(): return jsonify(ok=True, service="spainroom-backend")
-# ====== OWNER: rutas mínimas para desbloquear preflight y POST ======
-from flask import jsonify, request
+    def health(): 
+        return jsonify(ok=True, service="spainroom-backend")
 
-@app.route("/api/owner/check", methods=["POST", "OPTIONS"])
-def __owner_check_min():
-    # Preflight CORS
-    if request.method == "OPTIONS":
-        return ("", 204)
-    # Registro “dummy” (el front sólo necesita un ID y ok=True)
-    return jsonify(ok=True, id="SRV-TEST-" + __import__("uuid").uuid4().hex[:8])
+    # ====== OWNER: rutas mínimas para desbloquear preflight y POST ======
+    @app.route("/api/owner/check", methods=["POST", "OPTIONS"])
+    def __owner_check_min():
+        # Preflight CORS
+        if request.method == "OPTIONS":
+            return ("", 204)
+        # Registro “dummy” (el front sólo necesita un ID y ok=True)
+        import uuid
+        return jsonify(ok=True, id="SRV-TEST-" + uuid.uuid4().hex[:8])
 
-@app.route("/api/owner/cedula/verify/numero", methods=["POST", "OPTIONS"])
-def __owner_verify_num_min():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    body = request.get_json(silent=True) or {}
-    numero = (body.get("numero") or "").strip()
-    status = "valida" if numero.endswith(("OK", "ok")) else "no_encontrada"
-    return jsonify(ok=True, status=status, data={"numero": numero})
+    @app.route("/api/owner/cedula/verify/numero", methods=["POST", "OPTIONS"])
+    def __owner_verify_num_min():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        body = request.get_json(silent=True) or {}
+        numero = (body.get("numero") or "").strip()
+        status = "valida" if numero.endswith(("OK", "ok")) else "no_encontrada"
+        return jsonify(ok=True, status=status, data={"numero": numero})
 
-@app.route("/api/owner/cedula/verify/catastro", methods=["POST", "OPTIONS"])
-def __owner_verify_cat_min():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    body = request.get_json(silent=True) or {}
-    refcat = (body.get("refcat") or "").strip()
-    # demo: par => valida; impar => no_encontrada
-    s = "valida" if (refcat[-1:].isdigit() and int(refcat[-1]) % 2 == 0) else "no_encontrada"
-    return jsonify(ok=True, status=s, data={"refcat": refcat})
+    @app.route("/api/owner/cedula/verify/catastro", methods=["POST", "OPTIONS"])
+    def __owner_verify_cat_min():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        body = request.get_json(silent=True) or {}
+        refcat = (body.get("refcat") or "").strip()
+        # demo: par => valida; impar => no_encontrada
+        s = "valida" if (refcat[-1:].isdigit() and int(refcat[-1]) % 2 == 0) else "no_encontrada"
+        return jsonify(ok=True, status=s, data={"refcat": refcat})
 
-@app.route("/api/owner/cedula/verify/direccion", methods=["POST", "OPTIONS"])
-def __owner_verify_dir_min():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    body = request.get_json(silent=True) or {}
-    provincia = (body.get("provincia") or "").lower()
-    oblig = {"barcelona","girona","lleida","tarragona","valencia","alicante","castellon","castellón","illes balears","islas baleares","balears"}
-    s = "depende" if provincia in oblig else "no_encontrada"
-    return jsonify(ok=True, status=s, data={
-        "direccion": body.get("direccion"), "municipio": body.get("municipio"), "provincia": body.get("provincia")
-    })
-# ================================================================
-
+    @app.route("/api/owner/cedula/verify/direccion", methods=["POST", "OPTIONS"])
+    def __owner_verify_dir_min():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        body = request.get_json(silent=True) or {}
+        provincia = (body.get("provincia") or "").lower()
+        oblig = {"barcelona","girona","lleida","tarragona","valencia","alicante","castellon","castellón","illes balears","islas baleares","balears"}
+        s = "depende" if provincia in oblig else "no_encontrada"
+        return jsonify(ok=True, status=s, data={
+            "direccion": body.get("direccion"), "municipio": body.get("municipio"), "provincia": body.get("provincia")
+        })
+    # ================================================================
 
     @app.get("/")
-    def index(): return jsonify(ok=True, msg="SpainRoom API")
+    def index(): 
+        return jsonify(ok=True, msg="SpainRoom API")
 
     @app.errorhandler(404)
-    def nf(e): return jsonify(ok=False, error="not_found", message="No encontrado"), 404
+    def nf(e): 
+        return jsonify(ok=False, error="not_found", message="No encontrado"), 404
 
     @app.errorhandler(500)
     def se(e):
-        app.logger.exception("500"); return jsonify(ok=False, error="server_error"), 500
+        app.logger.exception("500")
+        return jsonify(ok=False, error="server_error"), 500
 
     return app
 
