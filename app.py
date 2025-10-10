@@ -1,10 +1,4 @@
-
-"""
-SpainRoom BACKEND (API) — PROXY pagos Stripe + blueprints ajustados
-- El front llama a /api/payments/create-checkout-session en este backend.
-- Este backend reenvía al backend con la clave Stripe (PAY_PROXY_BASE).
-"""
-
+# app.py — SpainRoom BACKEND principal: blueprints + proxy pagos + LEG/Owner
 import os, sys, types, logging, requests
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -36,8 +30,6 @@ if _raw_db:
     SQLALCHEMY_DATABASE_URI = _raw_db
 
 ENGINE_OPTIONS = {"pool_pre_ping": True, "pool_recycle": 300}
-
-# Backend con clave de Stripe (proxy destino)
 PAY_PROXY_BASE = os.getenv("PAY_PROXY_BASE", "https://spainroom-backend-1.onrender.com").rstrip("/")
 
 def create_app(test_config=None):
@@ -58,7 +50,7 @@ def create_app(test_config=None):
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     _init_logging(app)
 
-    # ---------- Import blueprints opcionales ----------
+    # ---------- Importar blueprints (con protección) ----------
     def _try(name, fn):
         try:
             return fn()
@@ -66,22 +58,40 @@ def create_app(test_config=None):
             app.logger.info(f"{name} no disponible: {e}")
             return None
 
-    # Rooms: decoradores ya incluyen /api/rooms/... => SIN url_prefix
+    # Rooms: tus decoradores YA incluyen /api/rooms/... => SIN url_prefix
     bp_rooms = _try("rooms", lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)
-
-    # Owner mínimos (uploads)
+    # Owner
     bp_owner = _try("owner", lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
+    # Contact / Contracts / Franchise / Auth / KYC / SMS / Uploads (si existen)
+    bp_contact         = _try("contact",         lambda: __import__("routes_contact", fromlist=["bp_contact"]).bp_contact)
+    bp_contracts       = _try("contracts",       lambda: __import__("routes_contracts", fromlist=["bp_contracts"]).bp_contracts)
+    bp_franchise       = _try("franchise",       lambda: __import__("routes_franchise", fromlist=["bp_franchise"]).bp_franchise)
+    bp_auth            = _try("auth",            lambda: __import__("routes_auth", fromlist=["bp_auth"]).bp_auth)
+    bp_kyc             = _try("kyc",             lambda: __import__("routes_kyc", fromlist=["bp_kyc"]).bp_kyc)
+    bp_sms             = _try("sms",             lambda: __import__("routes_sms", fromlist=["bp_sms"]).bp_sms)
+    bp_upload_rooms    = _try("upload_rooms",    lambda: __import__("routes_uploads_rooms", fromlist=["bp_upload_rooms"]).bp_upload_rooms)
+    bp_upload_autofit  = _try("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
+    bp_upload_generic  = _try("upload_generic",  lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
 
-    # ---------- Crear tablas (si hay modelos cargados) ----------
-    with app.app_context():
-        try:
-            db.create_all()
-        except Exception as e:
-            app.logger.info(f"create_all omitido: {e}")
+    # Catastro opcional por ENV (si tienes ese módulo)
+    bp_catastro = None
+    if os.getenv("ENABLE_BP_CATASTRO") in {"1","true","True"}:
+        bp_catastro = _try("catastro", lambda: __import__("routes_catastro", fromlist=["bp_catastro"]).bp_catastro)
 
     # ---------- Registrar blueprints ----------
-    if bp_rooms: app.register_blueprint(bp_rooms)          # SIN prefijo extra
-    if bp_owner: app.register_blueprint(bp_owner, url_prefix="/api/owner")
+    if bp_rooms:           app.register_blueprint(bp_rooms)             # SIN prefijo extra
+    if bp_upload_rooms:    app.register_blueprint(bp_upload_rooms)
+    if bp_upload_autofit:  app.register_blueprint(bp_upload_autofit)
+    if bp_upload_generic:  app.register_blueprint(bp_upload_generic)
+
+    if bp_contact:         app.register_blueprint(bp_contact,    url_prefix="/api/contacto")
+    if bp_contracts:       app.register_blueprint(bp_contracts,  url_prefix="/api/contracts")
+    if bp_franchise:       app.register_blueprint(bp_franchise,  url_prefix="/api/franchise")
+    if bp_auth:            app.register_blueprint(bp_auth,       url_prefix="/api/auth")
+    if bp_kyc:             app.register_blueprint(bp_kyc,        url_prefix="/api/kyc")
+    if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
+    if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")
+    if bp_catastro:        app.register_blueprint(bp_catastro,   url_prefix="/api/catastro")
 
     # ---------- CORS extra ----------
     ALLOWED_ORIGINS = {"http://localhost:5176", "http://127.0.0.1:5176"}
@@ -125,7 +135,8 @@ def create_app(test_config=None):
         b = request.get_json(silent=True) or {}
         ref = (b.get("refcat") or "").strip()
         num = (b.get("cedula_numero") or "").strip()
-        if not (ref or num): return jsonify(ok=False,error="bad_request",message="Falta refcat o cedula_numero"),400
+        if not (ref or num):
+            return jsonify(ok=False,error="bad_request",message="Falta refcat o cedula_numero"),400
         sql = text("""
             SELECT refcat,cedula_numero,estado,expires_at,verified_at,source,notes,created_at
               FROM v_owner_cedulas_last
@@ -144,12 +155,30 @@ def create_app(test_config=None):
         return jsonify(ok=True, has_doc=False, status="no_consta")
 
     # ---------- PROXY pagos (Stripe) ----------
-    @app.route("/api/payments/create-checkout-session", methods=["POST","OPTIONS"])
-    def proxy_create_checkout_session():
+    #  A) Ruta compatible con tu front actual
+    @app.route("/create-checkout-session", methods=["POST","OPTIONS"])
+    def proxy_create_checkout_session_root():
         if request.method == "OPTIONS": return ("",204)
         try:
             r = requests.post(
-                f"{PAY_PROXY_BASE}/api/payments/create-checkout-session",
+                f"{PAY_PROXY_BASE}/create-checkout-session",
+                json=(request.get_json(silent=True) or {}),
+                headers={"Content-Type":"application/json"},
+                timeout=12
+            )
+            return Response(response=r.content, status=r.status_code,
+                            headers={"Content-Type": r.headers.get("Content-Type","application/json")})
+        except Exception as e:
+            current_app.logger.warning(f"proxy payments error: {e}")
+            return jsonify(ok=False, error="proxy_error"), 502
+
+    #  B) Ruta “estándar” por si en algún sitio llamas a /api/payments/...
+    @app.route("/api/payments/create-checkout-session", methods=["POST","OPTIONS"])
+    def proxy_create_checkout_session_api():
+        if request.method == "OPTIONS": return ("",204)
+        try:
+            r = requests.post(
+                f"{PAY_PROXY_BASE}/create-checkout-session",
                 json=(request.get_json(silent=True) or {}),
                 headers={"Content-Type":"application/json"},
                 timeout=12
@@ -178,9 +207,9 @@ def create_app(test_config=None):
         tgt = up / filename; f.save(tgt)
         return jsonify(ok=True, filename=filename, size=tgt.stat().st_size)
 
-    # ---------- Health ----------
+    # ---------- Salud / raíz ----------
     @app.get("/health")
-    def health(): return jsonify(ok=True, service="spainroom-backend-proxy")
+    def health(): return jsonify(ok=True, service="spainroom-backend")
 
     @app.get("/")
     def root(): return jsonify(ok=True, msg="SpainRoom API")
