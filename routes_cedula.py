@@ -1,6 +1,6 @@
-# routes_cedula.py — /api/legal/* (requisito por provincia + check cédula por nº/refcat)
+# routes_cedula.py — /api/legal/* (requisito por provincia + check cédula con control de fuente)
 # Nora · 2025-10-11
-from datetime import date, timedelta
+from datetime import date
 from flask import Blueprint, request, jsonify, Response
 
 bp_legal = Blueprint("bp_legal", __name__)
@@ -10,7 +10,7 @@ def _corsify(resp: Response) -> Response:
     resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key, X-Catastro-Mode"
     return resp
 
 OBLIG = {
@@ -19,7 +19,7 @@ OBLIG = {
     "Lleida":       {"cat":"si", "doc":"Cédula d'habitabilitat", "org":"Agència de l'Habitatge de Catalunya", "vig":"15 años", "notas":"—", "link":"https://habitatge.gencat.cat/"},
     "Tarragona":    {"cat":"si", "doc":"Cédula d'habitabilitat", "org":"Agència de l'Habitatge de Catalunya", "vig":"15 años", "notas":"—", "link":"https://habitatge.gencat.cat/"},
     "Valencia":     {"cat":"si", "doc":"Licencia de ocupación / cédula", "org":"GVA", "vig":"10 años", "notas":"—", "link":"https://www.gva.es/"},
-    "Alicante":     {"cat":"si", "doc":"Licencia de ocupación / cédula", "org":"GVA", "vig":"10 años", "notas":"—", "link":"https://www.gva.es/"},
+    "Alicante":     {"cat":"si", "doc":"Licencia de ocupación / cédula", "org":"GVA", "vig":"10años", "notas":"—", "link":"https://www.gva.es/"},
     "Castellón":    {"cat":"si", "doc":"Licencia de ocupación / cédula", "org":"GVA", "vig":"10 años", "notas":"—", "link":"https://www.gva.es/"},
     "Islas Baleares":{"cat":"si","doc":"Cèdula d'habitabilitat","org":"Consells Insulars","vig":"10 años","notas":"—","link":"https://www.caib.es/"},
     "Mallorca":     {"cat":"si", "doc":"Cèdula d'habitabilitat", "org":"Consell de Mallorca", "vig":"10 años", "notas":"—", "link":"https://www.conselldemallorca.cat/"},
@@ -42,11 +42,23 @@ def cedula_check():
     if request.method == "OPTIONS":
         return _corsify(Response(status=204))
     data = request.get_json(silent=True) or {}
+
     refcat = (data.get("refcat") or "").strip()
     num = (data.get("cedula_numero") or "").strip()
+    catastro_mode = (request.headers.get("X-Catastro-Mode") or "").strip().lower()
 
-    # Regla simple: si hay nº razonable o refcat de 20 chars => "vigente" con caducidad 2 años
-    vigente = (len(num) >= 6) or (len(refcat) == 20)
+    vigente = False
+    expires_at = None
+
+    # Reglas: vigente si nº >= 6; o si refcat=20 y Catastro fue SOAP (no demo)
+    if num and len(num) >= 6:
+        vigente = True
+    elif len(refcat) == 20 and catastro_mode == "soap":
+        vigente = True
+
+    if vigente:
+        expires_at = date.today().replace(year=date.today().year + 2).isoformat()
+
     result = {
         "ok": True,
         "has_doc": vigente,
@@ -54,7 +66,7 @@ def cedula_check():
         "data": {
             "refcat": refcat or None,
             "cedula_numero": num or None,
-            "expires_at": (date.today().replace(year=date.today().year + 2)).isoformat() if vigente else None,
+            "expires_at": expires_at
         }
     }
     return _corsify(jsonify(result))

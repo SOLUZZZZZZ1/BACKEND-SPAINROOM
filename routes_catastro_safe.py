@@ -1,19 +1,8 @@
-# routes_catastro_safe.py — Catastro SOAP con fallback DEMO (no rompe el front)
+# routes_catastro_safe.py — Catastro SOAP con fallback DEMO o modo estricto (sin maquillar resultados)
 # Nora · 2025-10-11
-#
-# Endpoints (mismos que tu front usa):
-#   POST /api/catastro/resolve_direccion  -> { ok, refcat, mode }
-#   POST /api/catastro/consulta_refcat    -> { ok, uso, superficie_m2, antiguedad, mode }
-#
-# Variables de entorno soportadas (Render):
-#   CATASTRO_MODE = 'soap' | 'demo'   (por defecto: 'soap', pero cae a demo en error)
-#   CATASTRO_SOAP_URL_RESOLVE, CATASTRO_SOAP_ACTION_RESOLVE
-#   CATASTRO_SOAP_URL_REF,     CATASTRO_SOAP_ACTION_REF
-#   CATASTRO_TIMEOUT (float, segs)  (por defecto 8.0)
-
 import os, re, requests
 import xml.etree.ElementTree as ET
-from flask import Blueprint, request, jsonify, Response
+from flask import Blueprint, request, jsonify, Response, current_app
 
 bp_catastro = Blueprint("bp_catastro", __name__)
 
@@ -43,6 +32,16 @@ def _first_text_by_suffix(root: ET.Element, suffixes=("rc1","refcat","rc")):
     m = REFCAT_RE.search(xml_text or "")
     return m.group(1) if m else None
 
+def _strict_or_demo_demo_response(payload_demo: dict, where: str):
+    if MODE == "strict":
+        msg = f"SOAP no respondió correctamente en {where}"
+        try:
+            current_app.logger.warning("Catastro strict: %s", msg)
+        except Exception:
+            pass
+        return _corsify(jsonify(ok=False, error="catastro_unavailable", message=msg)), 502
+    return _corsify(jsonify({**payload_demo, "mode": "demo"}))
+
 @bp_catastro.route("/api/catastro/resolve_direccion", methods=["POST","OPTIONS"])
 def resolve_direccion():
     if request.method == "OPTIONS":
@@ -56,8 +55,10 @@ def resolve_direccion():
     if not (direccion and municipio and provincia):
         return _corsify(jsonify(ok=False, error="bad_request", message="Faltan direccion/municipio/provincia")), 400
 
-    # SOAP real si procede
-    if MODE == "soap" and URL_RESOLVE and ACT_RESOLVE:
+    if MODE == "demo":
+        return _corsify(jsonify(ok=True, refcat="A"*20, mode="demo"))
+
+    if URL_RESOLVE and ACT_RESOLVE:
         try:
             envelope = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -80,11 +81,17 @@ def resolve_direccion():
             rc = _first_text_by_suffix(root) or None
             if rc and len(rc) == 20:
                 return _corsify(jsonify(ok=True, refcat=rc, mode="soap"))
-        except Exception:
-            pass  # cae a demo
+            try:
+                current_app.logger.warning("Catastro SOAP sin RC válida (resolve). XML tail: %s", r.text[-400:])
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                current_app.logger.warning("Catastro SOAP fallo (resolve): %s", str(e))
+            except Exception:
+                pass
 
-    # DEMO estable (no rompe el front)
-    return _corsify(jsonify(ok=True, refcat="A"*20, mode="demo"))
+    return _strict_or_demo_demo_response({"ok": True, "refcat": "A"*20}, "resolve_direccion")
 
 @bp_catastro.route("/api/catastro/consulta_refcat", methods=["POST","OPTIONS"])
 def consulta_refcat():
@@ -96,7 +103,10 @@ def consulta_refcat():
     if len(refcat) != 20:
         return _corsify(jsonify(ok=False, error="bad_request", message="refcat debe tener 20 caracteres")), 400
 
-    if MODE == "soap" and URL_REF and ACT_REF:
+    if MODE == "demo":
+        return _corsify(jsonify(ok=True, uso="Residencial", superficie_m2=78, antiguedad="2004", mode="demo"))
+
+    if URL_REF and ACT_REF:
         try:
             envelope = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -111,9 +121,11 @@ def consulta_refcat():
             headers = {"Content-Type":"text/xml; charset=utf-8", "SOAPAction": ACT_REF}
             r = requests.post(URL_REF, data=envelope.encode("utf-8"), headers=headers, timeout=TIMEOUT)
             r.raise_for_status()
-            # Aquí podrías hacer parsing real si el XML trae esos campos
             return _corsify(jsonify(ok=True, uso="Residencial", superficie_m2=78, antiguedad="2004", mode="soap"))
-        except Exception:
-            pass  # cae a demo
+        except Exception as e:
+            try:
+                current_app.logger.warning("Catastro SOAP fallo (consulta_refcat): %s", str(e))
+            except Exception:
+                pass
 
-    return _corsify(jsonify(ok=True, uso="Residencial", superficie_m2=78, antiguedad="2004", mode="demo"))
+    return _strict_or_demo_demo_response({"ok": True, "uso": "Residencial", "superficie_m2": 78, "antiguedad": "2004"}, "consulta_refcat")
