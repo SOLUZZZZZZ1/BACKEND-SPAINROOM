@@ -1,5 +1,5 @@
 # app.py — SpainRoom BACKEND principal: blueprints + proxy pagos + CORS + health
-# Nora · 2025-10-11 (incluye /api/legal y Catastro con fallback seguro)
+# Nora · 2025-10-11 (incluye /api/legal, /api/catastro con fallback y /api/owner/auto_check)
 import os, sys, types, logging, requests
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -59,7 +59,8 @@ def create_app(test_config=None):
             app.logger.info(f"{name} no disponible: {e}")
             return None
 
-    bp_rooms = _try("rooms", lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)      # decoradores ya usan /api/rooms
+    # Ya existentes en tu proyecto
+    bp_rooms = _try("rooms", lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)  # decoradores ya usan /api/rooms
     bp_owner = _try("owner", lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
     bp_contact         = _try("contact",         lambda: __import__("routes_contact", fromlist=["bp_contact"]).bp_contact)
     bp_contracts       = _try("contracts",       lambda: __import__("routes_contracts", fromlist=["bp_contracts"]).bp_contracts)
@@ -71,16 +72,19 @@ def create_app(test_config=None):
     bp_upload_autofit  = _try("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
     bp_upload_generic  = _try("upload_generic",  lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
 
-    # --- NUEVO: Legal (requisitos/cedula) + Catastro (con fallback seguro) ---
+    # --- NUEVOS: Legal (requisito/cedula), Catastro (con fallback) y Auto-Check ---
     bp_legal    = _try("legal",    lambda: __import__("routes_cedula", fromlist=["bp_legal"]).bp_legal)
 
-    # Intentamos cargar el SOAP real; si falla, cargamos el seguro con fallback
+    # Primero intentamos tu módulo SOAP real; si falla, cargamos el seguro con fallback (routes_catastro_safe)
     bp_catastro = _try("catastro", lambda: __import__("routes_catastro", fromlist=["bp_catastro"]).bp_catastro)
     if not bp_catastro:
         bp_catastro = _try("catastro_safe", lambda: __import__("routes_catastro_safe", fromlist=["bp_catastro"]).bp_catastro)
 
+    # Auto check (address -> refcat -> guarda estado en DB)
+    bp_autocheck = _try("auto_check", lambda: __import__("routes_auto_check", fromlist=["bp_autocheck"]).bp_autocheck)
+
     # --- Registro de blueprints ---
-    if bp_rooms:           app.register_blueprint(bp_rooms)             # SIN prefijo extra
+    if bp_rooms:           app.register_blueprint(bp_rooms)             # SIN prefijo extra (ya definen /api/rooms)
     if bp_upload_rooms:    app.register_blueprint(bp_upload_rooms)
     if bp_upload_autofit:  app.register_blueprint(bp_upload_autofit)
     if bp_upload_generic:  app.register_blueprint(bp_upload_generic)
@@ -91,8 +95,11 @@ def create_app(test_config=None):
     if bp_kyc:             app.register_blueprint(bp_kyc,        url_prefix="/api/kyc")
     if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
     if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")
-    if bp_legal:           app.register_blueprint(bp_legal)              # expone /api/legal/...
-    if bp_catastro:        app.register_blueprint(bp_catastro)           # expone /api/catastro/...
+
+    # NUEVOS (sin prefijo adicional, ya lo llevan en las rutas internas)
+    if bp_legal:           app.register_blueprint(bp_legal)             # /api/legal/...
+    if bp_catastro:        app.register_blueprint(bp_catastro)          # /api/catastro/...
+    if bp_autocheck:       app.register_blueprint(bp_autocheck)         # /api/owner/auto_check...
 
     # ---------- CORS extra ----------
     ALLOWED_ORIGINS = {"http://localhost:5176", "http://127.0.0.1:5176"}
@@ -144,6 +151,7 @@ def create_app(test_config=None):
 
     # ---------- Salud ----------
     @app.get("/health")
+    @app.get("/healthz")
     def health(): return jsonify(ok=True, service="spainroom-backend")
 
     return app
