@@ -1,44 +1,45 @@
-# routes_owner.py
-from flask import Blueprint, request, jsonify
-from app import db
-from models_owner import OwnerCheck
-from services_owner import route_franchisee
+# routes_owner.py — Registro de verificación y carga de documentos
+# Nora · 2025-10-11
+import time
+from flask import Blueprint, request, jsonify, Response
+from werkzeug.utils import secure_filename
 
 bp_owner = Blueprint("owner", __name__)
 
-def require_admin_key():
-    key = request.headers.get("X-Admin-Key","")
-    return key == "ramon"
+def _corsify(resp: Response) -> Response:
+    origin = request.headers.get("Origin", "*")
+    resp.headers["Access-Control-Allow-Origin"] = origin
+    resp.headers["Vary"] = "Origin"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key"
+    return resp
 
-@bp_owner.post("/api/owner/check")
-def api_owner_check():
-    if not require_admin_key():
-        return jsonify(ok=False, error="forbidden"), 403
+def _require_admin():
+    # Sencillo control: cabecera X-Admin-Key (igual que usa el front)
+    admin = request.headers.get("X-Admin-Key")
+    expected = "ramon"  # o usa os.getenv("ADMIN_KEY")
+    return admin == expected
 
-    data = request.get_json(force=True, silent=True) or {}
-    nombre   = (data.get("nombre") or "").strip()
-    telefono = (data.get("telefono") or "").strip()
-    via      = (data.get("via") or "").strip()          # numero|catastro|direccion
-    status   = (data.get("status") or "").strip()       # valida|caducada|no_encontrada|error
-    provincia= (data.get("provincia") or "").strip()
-    municipio= (data.get("municipio") or "").strip()
+@bp_owner.route("/api/owner/check", methods=["POST","OPTIONS"])
+def owner_check():
+    if request.method == "OPTIONS":
+        return _corsify(Response(status=204))
+    if not _require_admin():
+        return _corsify(jsonify(ok=False, error="unauthorized")), 401
+    data = request.get_json(silent=True) or {}
+    # DEMO: devolvemos un ID de verificación generado
+    check_id = f"CHK-{int(time.time())}"
+    return _corsify(jsonify(ok=True, id=check_id))
 
-    if not nombre or not telefono:
-        return jsonify(ok=False, error="missing_contact"), 400
-
-    # routing por zona:
-    franchisee_id = route_franchisee(provincia, municipio)
-
-    oc = OwnerCheck(
-        nombre=nombre, telefono=telefono, via=via, status=status,
-        numero=data.get("numero"), refcat=data.get("refcat"),
-        direccion=data.get("direccion"), cp=data.get("cp"),
-        municipio=municipio, provincia=provincia,
-        raw=data, franchisee_id=franchisee_id
-    )
-    db.session.add(oc); db.session.commit()
-
-    # Notificación (placeholder): aquí puedes enviar email/webhook a Admin y al franquiciado
-    # send_email_admin(oc) / send_email_franchisee(franchisee_id, oc) etc.
-
-    return jsonify(ok=True, id=oc.id, franchisee_id=franchisee_id)
+@bp_owner.route("/api/owner/cedula/upload", methods=["POST","OPTIONS"])
+def owner_upload():
+    if request.method == "OPTIONS":
+        return _corsify(Response(status=204))
+    if not _require_admin():
+        return _corsify(jsonify(ok=False, error="unauthorized")), 401
+    file = request.files.get("file")
+    if not file:
+        return _corsify(jsonify(ok=False, error="no file")), 400
+    name = secure_filename(file.filename or "cedula.pdf")
+    # DEMO: no guardamos en disco en este ejemplo; solo respondemos OK
+    return _corsify(jsonify(ok=True, stored=name))
