@@ -1,11 +1,10 @@
 # app.py — SpainRoom BACKEND principal: blueprints + proxy pagos + CORS + health
-# Nora · 2025-10-11 (incluye /api/legal, /api/catastro con fallback y /api/owner/auto_check)
+# Nora · 2025-10-11 (Catastro forzado a routes_catastro_safe)
 import os, sys, types, logging, requests
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from flask import Flask, jsonify, request, current_app, Response
 from flask_cors import CORS
-from sqlalchemy import text
 
 # ---------- DB bootstrap ----------
 try:
@@ -71,16 +70,10 @@ def create_app(test_config=None):
     bp_upload_autofit  = _try("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
     bp_upload_generic  = _try("upload_generic",  lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
 
-    # --- NUEVOS: Legal, Catastro (fallback seguro) y Auto-Check ---
-    bp_legal    = _try("legal",    lambda: __import__("routes_cedula", fromlist=["bp_legal"]).bp_legal)
-
-    # Intento SOAP real; si falla el import, cargo el seguro con demo
-    bp_catastro = _try("catastro", lambda: __import__("routes_catastro", fromlist=["bp_catastro"]).bp_catastro)
-    if not bp_catastro:
-        bp_catastro = _try("catastro_safe", lambda: __import__("routes_catastro_safe", fromlist=["bp_catastro"]).bp_catastro)
-
-    # Auto-check (address -> refcat -> guarda estado en DB)
-    bp_autocheck = _try("auto_check", lambda: __import__("routes_auto_check", fromlist=["bp_autocheck"]).bp_autocheck)
+    # --- NUEVOS: Legal, Catastro (forzado SAFE) y Auto-Check ---
+    bp_legal      = _try("legal",      lambda: __import__("routes_cedula", fromlist=["bp_legal"]).bp_legal)
+    bp_catastro   = _try("catastro",   lambda: __import__("routes_catastro_safe", fromlist=["bp_catastro"]).bp_catastro)  # <— SAFE forzado
+    bp_autocheck  = _try("auto_check", lambda: __import__("routes_auto_check", fromlist=["bp_autocheck"]).bp_autocheck)
 
     # --- Registro de blueprints ---
     if bp_rooms:           app.register_blueprint(bp_rooms)             # /api/rooms...
@@ -95,7 +88,7 @@ def create_app(test_config=None):
     if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
     if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")
 
-    # NUEVOS (sin prefijo adicional; las rutas ya empiezan por /api/...)
+    # NUEVOS
     if bp_legal:           app.register_blueprint(bp_legal)             # /api/legal/...
     if bp_catastro:        app.register_blueprint(bp_catastro)          # /api/catastro/...
     if bp_autocheck:       app.register_blueprint(bp_autocheck)         # /api/owner/auto_check...
@@ -158,8 +151,11 @@ def _init_logging(app):
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     sh = logging.StreamHandler(); sh.setFormatter(fmt); app.logger.addHandler(sh)
     logs_dir = BASE_DIR / "logs"; logs_dir.mkdir(exist_ok=True)
-    fh = RotatingFileHandler(logs_dir / "backend.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt); app.logger.addHandler(fh)
+    try:
+        fh = RotatingFileHandler(logs_dir / "backend.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+        fh.setFormatter(fmt); app.logger.addHandler(fh)
+    except Exception:
+        pass
     app.logger.info("Logging listo")
 
 def run_dev():
