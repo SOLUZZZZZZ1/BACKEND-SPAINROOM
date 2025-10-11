@@ -5,7 +5,6 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from flask import Flask, jsonify, request, current_app, Response
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
 from sqlalchemy import text
 
 # ---------- DB bootstrap ----------
@@ -60,7 +59,7 @@ def create_app(test_config=None):
             return None
 
     # Ya existentes en tu proyecto
-    bp_rooms = _try("rooms", lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)  # decoradores ya usan /api/rooms
+    bp_rooms = _try("rooms", lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)  # /api/rooms (definido en el módulo)
     bp_owner = _try("owner", lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
     bp_contact         = _try("contact",         lambda: __import__("routes_contact", fromlist=["bp_contact"]).bp_contact)
     bp_contracts       = _try("contracts",       lambda: __import__("routes_contracts", fromlist=["bp_contracts"]).bp_contracts)
@@ -72,19 +71,19 @@ def create_app(test_config=None):
     bp_upload_autofit  = _try("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
     bp_upload_generic  = _try("upload_generic",  lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
 
-    # --- NUEVOS: Legal (requisito/cedula), Catastro (con fallback) y Auto-Check ---
+    # --- NUEVOS: Legal, Catastro (fallback seguro) y Auto-Check ---
     bp_legal    = _try("legal",    lambda: __import__("routes_cedula", fromlist=["bp_legal"]).bp_legal)
 
-    # Primero intentamos tu módulo SOAP real; si falla, cargamos el seguro con fallback (routes_catastro_safe)
+    # Intento SOAP real; si falla el import, cargo el seguro con demo
     bp_catastro = _try("catastro", lambda: __import__("routes_catastro", fromlist=["bp_catastro"]).bp_catastro)
     if not bp_catastro:
         bp_catastro = _try("catastro_safe", lambda: __import__("routes_catastro_safe", fromlist=["bp_catastro"]).bp_catastro)
 
-    # Auto check (address -> refcat -> guarda estado en DB)
+    # Auto-check (address -> refcat -> guarda estado en DB)
     bp_autocheck = _try("auto_check", lambda: __import__("routes_auto_check", fromlist=["bp_autocheck"]).bp_autocheck)
 
     # --- Registro de blueprints ---
-    if bp_rooms:           app.register_blueprint(bp_rooms)             # SIN prefijo extra (ya definen /api/rooms)
+    if bp_rooms:           app.register_blueprint(bp_rooms)             # /api/rooms...
     if bp_upload_rooms:    app.register_blueprint(bp_upload_rooms)
     if bp_upload_autofit:  app.register_blueprint(bp_upload_autofit)
     if bp_upload_generic:  app.register_blueprint(bp_upload_generic)
@@ -96,7 +95,7 @@ def create_app(test_config=None):
     if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
     if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")
 
-    # NUEVOS (sin prefijo adicional, ya lo llevan en las rutas internas)
+    # NUEVOS (sin prefijo adicional; las rutas ya empiezan por /api/...)
     if bp_legal:           app.register_blueprint(bp_legal)             # /api/legal/...
     if bp_catastro:        app.register_blueprint(bp_catastro)          # /api/catastro/...
     if bp_autocheck:       app.register_blueprint(bp_autocheck)         # /api/owner/auto_check...
@@ -115,7 +114,6 @@ def create_app(test_config=None):
         return resp
 
     # ---------- PROXY pagos (Stripe) ----------
-    # A) tu front actual llama a /create-checkout-session
     @app.route("/create-checkout-session", methods=["POST","OPTIONS"])
     def proxy_create_checkout_session_root():
         if request.method == "OPTIONS": return ("",204)
@@ -132,7 +130,6 @@ def create_app(test_config=None):
             current_app.logger.warning(f"proxy payments error: {e}")
             return jsonify(ok=False, error="proxy_error"), 502
 
-    # B) por si en algún lado usas /api/payments/create-checkout-session
     @app.route("/api/payments/create-checkout-session", methods=["POST","OPTIONS"])
     def proxy_create_checkout_session_api():
         if request.method == "OPTIONS": return ("",204)
