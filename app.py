@@ -70,9 +70,9 @@ def create_app(test_config=None):
     bp_upload_autofit  = _try("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
     bp_upload_generic  = _try("upload_generic",  lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
 
-    # --- NUEVOS: Legal, Catastro (forzado SAFE) y Auto-Check ---
+    # --- NUEVOS: Legal, Catastro (SAFE forzado) y Auto-Check (si existe) ---
     bp_legal      = _try("legal",      lambda: __import__("routes_cedula", fromlist=["bp_legal"]).bp_legal)
-    bp_catastro   = _try("catastro",   lambda: __import__("routes_catastro_safe", fromlist=["bp_catastro"]).bp_catastro)  # <— SAFE forzado
+    bp_catastro   = _try("catastro",   lambda: __import__("routes_catastro_safe", fromlist=["bp_catastro"]).bp_catastro)  # SAFE forzado
     bp_autocheck  = _try("auto_check", lambda: __import__("routes_auto_check", fromlist=["bp_autocheck"]).bp_autocheck)
 
     # --- Registro de blueprints ---
