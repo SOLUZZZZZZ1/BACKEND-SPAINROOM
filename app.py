@@ -1,4 +1,5 @@
 # app.py — SpainRoom BACKEND principal: blueprints + proxy pagos + CORS + health
+# Nora · 2025-10-11 (incluye /api/legal y Catastro con fallback seguro)
 import os, sys, types, logging, requests
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -70,6 +71,15 @@ def create_app(test_config=None):
     bp_upload_autofit  = _try("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
     bp_upload_generic  = _try("upload_generic",  lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
 
+    # --- NUEVO: Legal (requisitos/cedula) + Catastro (con fallback seguro) ---
+    bp_legal    = _try("legal",    lambda: __import__("routes_cedula", fromlist=["bp_legal"]).bp_legal)
+
+    # Intentamos cargar el SOAP real; si falla, cargamos el seguro con fallback
+    bp_catastro = _try("catastro", lambda: __import__("routes_catastro", fromlist=["bp_catastro"]).bp_catastro)
+    if not bp_catastro:
+        bp_catastro = _try("catastro_safe", lambda: __import__("routes_catastro_safe", fromlist=["bp_catastro"]).bp_catastro)
+
+    # --- Registro de blueprints ---
     if bp_rooms:           app.register_blueprint(bp_rooms)             # SIN prefijo extra
     if bp_upload_rooms:    app.register_blueprint(bp_upload_rooms)
     if bp_upload_autofit:  app.register_blueprint(bp_upload_autofit)
@@ -81,6 +91,8 @@ def create_app(test_config=None):
     if bp_kyc:             app.register_blueprint(bp_kyc,        url_prefix="/api/kyc")
     if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
     if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")
+    if bp_legal:           app.register_blueprint(bp_legal)              # expone /api/legal/...
+    if bp_catastro:        app.register_blueprint(bp_catastro)           # expone /api/catastro/...
 
     # ---------- CORS extra ----------
     ALLOWED_ORIGINS = {"http://localhost:5176", "http://127.0.0.1:5176"}
