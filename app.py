@@ -69,6 +69,8 @@ def create_app(test_config=None):
     bp_upload_rooms    = _try("upload_rooms",    lambda: __import__("routes_uploads_rooms", fromlist=["bp_upload_rooms"]).bp_upload_rooms)
     bp_upload_autofit  = _try("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
     bp_upload_generic  = _try("upload_generic",  lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
+    bp_cedula_ocr = _try("cedula_ocr", lambda: __import__("routes_cedula_ocr", fromlist=["bp_cedula_ocr"]).bp_cedula_ocr)
+    
 
     # NUEVOS
     bp_legal        = _try("legal",        lambda: __import__("routes_cedula", fromlist=["bp_legal"]).bp_legal)
@@ -88,6 +90,7 @@ def create_app(test_config=None):
     if bp_kyc:             app.register_blueprint(bp_kyc,        url_prefix="/api/kyc")
     if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
     if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")
+    if bp_cedula_ocr:      app.register_blueprint(bp_cedula_ocr)  # /api/legal/cedula/ocr*
 
     # NUEVOS (sin prefijo extra: cada archivo ya define /api/...)
     if bp_legal:           app.register_blueprint(bp_legal)             # /api/legal/...
