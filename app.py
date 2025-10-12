@@ -1,5 +1,5 @@
 # app.py — SpainRoom BACKEND principal: blueprints + proxy pagos + CORS + health
-# Nora · 2025-10-11 (Catastro forzado a routes_catastro_safe)
+# Nora · 2025-10-11 (Catastro SAFE forzado + Cataluña cedula adapter integrado)
 import os, sys, types, logging, requests
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -57,7 +57,7 @@ def create_app(test_config=None):
             app.logger.info(f"{name} no disponible: {e}")
             return None
 
-    # Ya existentes en tu proyecto
+    # Ya existentes
     bp_rooms = _try("rooms", lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)  # /api/rooms (definido en el módulo)
     bp_owner = _try("owner", lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
     bp_contact         = _try("contact",         lambda: __import__("routes_contact", fromlist=["bp_contact"]).bp_contact)
@@ -70,10 +70,11 @@ def create_app(test_config=None):
     bp_upload_autofit  = _try("uploads_autofit", lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
     bp_upload_generic  = _try("upload_generic",  lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
 
-    # --- NUEVOS: Legal, Catastro (SAFE forzado) y Auto-Check (si existe) ---
-    bp_legal      = _try("legal",      lambda: __import__("routes_cedula", fromlist=["bp_legal"]).bp_legal)
-    bp_catastro   = _try("catastro",   lambda: __import__("routes_catastro_safe", fromlist=["bp_catastro"]).bp_catastro)  # SAFE forzado
-    bp_autocheck  = _try("auto_check", lambda: __import__("routes_auto_check", fromlist=["bp_autocheck"]).bp_autocheck)
+    # NUEVOS
+    bp_legal        = _try("legal",        lambda: __import__("routes_cedula", fromlist=["bp_legal"]).bp_legal)
+    bp_cedula_cat   = _try("cedula_cat",   lambda: __import__("routes_cedula_cat", fromlist=["bp_cedula_cat"]).bp_cedula_cat)
+    bp_catastro     = _try("catastro_safe",lambda: __import__("routes_catastro_safe", fromlist=["bp_catastro"]).bp_catastro)  # SAFE forzado
+    bp_autocheck    = _try("auto_check",   lambda: __import__("routes_auto_check", fromlist=["bp_autocheck"]).bp_autocheck)
 
     # --- Registro de blueprints ---
     if bp_rooms:           app.register_blueprint(bp_rooms)             # /api/rooms...
@@ -88,8 +89,9 @@ def create_app(test_config=None):
     if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
     if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")
 
-    # NUEVOS
+    # NUEVOS (sin prefijo extra: cada archivo ya define /api/...)
     if bp_legal:           app.register_blueprint(bp_legal)             # /api/legal/...
+    if bp_cedula_cat:      app.register_blueprint(bp_cedula_cat)        # /api/legal/cat/check
     if bp_catastro:        app.register_blueprint(bp_catastro)          # /api/catastro/...
     if bp_autocheck:       app.register_blueprint(bp_autocheck)         # /api/owner/auto_check...
 
@@ -102,7 +104,7 @@ def create_app(test_config=None):
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Vary"] = "Origin"
             resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key, Stripe-Signature"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key, Stripe-Signature, X-Catastro-Mode, X-Provincia"
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp
 
