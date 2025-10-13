@@ -1,4 +1,4 @@
-# app.py — SpainRoom backend-API (GO LIVE, import corregido admin franquicia)
+# app.py — SpainRoom backend-API (GO LIVE, import corregido admin franquicia + presign + delete)
 import os, sys, types, logging, requests
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -67,30 +67,25 @@ def create_app(test_config=None):
     bp_veriff           = _try("veriff",           lambda: __import__("routes_veriff", fromlist=["bp_veriff"]).bp_veriff)
     bp_twilio           = _try("twilio",           lambda: __import__("routes_twilio", fromlist=["bp_twilio"]).bp_twilio)
     bp_sms              = _try("sms",              lambda: __import__("routes_sms", fromlist=["bp_sms"]).bp_sms)
-    bp_owner_presign = _try("owner_presign",       lambda: __import__("routes_owner_presign", fromlist=["bp_owner_presign"]).bp_owner_presign)
-    # 👇 nombre correcto del módulo y del blueprint de franquicia
-    bp_admin_franq      = _try("admin_franq",
-                               lambda: __import__("routes_admin_franchise",
-                                                  fromlist=["bp_admin_franq"]).bp_admin_franq)
-    bp_owner_delete = _try("owner_delete",         lambda: __import__("routes_owner_delete", fromlist=["bp_owner_delete"]).bp_owner_delete)                                                    lambda: __import__("routes_owner_delete", fromlist=["bp_owner_delete"]).bp_owner_delete)
+    bp_owner_presign    = _try("owner_presign",    lambda: __import__("routes_owner_presign", fromlist=["bp_owner_presign"]).bp_owner_presign)
+    bp_owner_delete     = _try("owner_delete",     lambda: __import__("routes_owner_delete", fromlist=["bp_owner_delete"]).bp_owner_delete)
+    bp_admin_franq      = _try("admin_franq",      lambda: __import__("routes_admin_franchise", fromlist=["bp_admin_franq"]).bp_admin_franq)
 
-                                                   
     # ---------- Registro ----------
-    if bp_rooms:           app.register_blueprint(bp_rooms)                              # /api/rooms/*
-    if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")# /api/owner/*
-    if bp_contact:         app.register_blueprint(bp_contact)                            # ya publica /api/contacto/*
-    if bp_upload_generic:  app.register_blueprint(bp_upload_generic)                     # /api/upload
-    if bp_upload_rooms:    app.register_blueprint(bp_upload_rooms)                       # /api/rooms/upload_*
-    if bp_upload_autofit:  app.register_blueprint(bp_upload_autofit)                     # /api/rooms/upload_photos (autofit)
-    if bp_auth:            app.register_blueprint(bp_auth)                                # /api/auth/*
-    if bp_kyc:             app.register_blueprint(bp_kyc)                                 # /api/kyc/*
-    if bp_veriff:          app.register_blueprint(bp_veriff)                              # /api/kyc/veriff/*
-    if bp_twilio:          app.register_blueprint(bp_twilio)                              # /twilio/*
-    if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")       # /sms/inbound
-    if bp_admin_franq:     app.register_blueprint(bp_admin_franq)                         # /api/admin/franquicia/*
-    if bp_owner_presign:   app.register_blueprint(bp_owner_presign)                       # /api/owner/cedula/presign
-     if bp_owner_delete:   app.register_blueprint(bp_owner_delete)
-    
+    if bp_rooms:           app.register_blueprint(bp_rooms)
+    if bp_owner:           app.register_blueprint(bp_owner, url_prefix="/api/owner")
+    if bp_contact:         app.register_blueprint(bp_contact)
+    if bp_upload_generic:  app.register_blueprint(bp_upload_generic)
+    if bp_upload_rooms:    app.register_blueprint(bp_upload_rooms)
+    if bp_upload_autofit:  app.register_blueprint(bp_upload_autofit)
+    if bp_auth:            app.register_blueprint(bp_auth)
+    if bp_kyc:             app.register_blueprint(bp_kyc)
+    if bp_veriff:          app.register_blueprint(bp_veriff)
+    if bp_twilio:          app.register_blueprint(bp_twilio)
+    if bp_sms:             app.register_blueprint(bp_sms, url_prefix="/sms")
+    if bp_admin_franq:     app.register_blueprint(bp_admin_franq)
+    if bp_owner_presign:   app.register_blueprint(bp_owner_presign)
+    if bp_owner_delete:    app.register_blueprint(bp_owner_delete)
 
     # ---------- Proxy pagos a backend-1 ----------
     @app.route("/create-checkout-session", methods=["POST","OPTIONS"])
@@ -100,7 +95,7 @@ def create_app(test_config=None):
             r = requests.post(
                 f"{PAY_PROXY_BASE}/create-checkout-session",
                 json=(request.get_json(silent=True) or {}),
-                headers={"Content-Type":"application/json"},
+                headers={"Content-Type": "application/json"},
                 timeout=12
             )
             return Response(response=r.content, status=r.status_code,
@@ -116,7 +111,7 @@ def create_app(test_config=None):
             r = requests.post(
                 f"{PAY_PROXY_BASE}/create-checkout-session",
                 json=(request.get_json(silent=True) or {}),
-                headers={"Content-Type":"application/json"},
+                headers={"Content-Type": "application/json"},
                 timeout=12
             )
             return Response(response=r.content, status=r.status_code,
