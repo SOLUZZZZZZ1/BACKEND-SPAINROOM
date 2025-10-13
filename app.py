@@ -67,7 +67,7 @@ def create_app(test_config=None):
     bp_veriff           = _try("veriff",           lambda: __import__("routes_veriff", fromlist=["bp_veriff"]).bp_veriff)
     bp_twilio           = _try("twilio",           lambda: __import__("routes_twilio", fromlist=["bp_twilio"]).bp_twilio)
     bp_sms              = _try("sms",              lambda: __import__("routes_sms", fromlist=["bp_sms"]).bp_sms)
-
+    bp_owner_presign = _try("owner_presign",       lambda: __import__("routes_owner_presign", fromlist=["bp_owner_presign"]).bp_owner_presign)
     # 👇 nombre correcto del módulo y del blueprint de franquicia
     bp_admin_franq      = _try("admin_franq",
                                lambda: __import__("routes_admin_franchise",
@@ -86,6 +86,7 @@ def create_app(test_config=None):
     if bp_twilio:          app.register_blueprint(bp_twilio)                              # /twilio/*
     if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")       # /sms/inbound
     if bp_admin_franq:     app.register_blueprint(bp_admin_franq)                         # /api/admin/franquicia/*
+    if bp_owner_presign:   app.register_blueprint(bp_owner_presign)                       # /api/owner/cedula/presign
 
     # ---------- Proxy pagos a backend-1 ----------
     @app.route("/create-checkout-session", methods=["POST","OPTIONS"])
