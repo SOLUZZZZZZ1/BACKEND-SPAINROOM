@@ -56,7 +56,7 @@ def create_app(test_config=None):
     bp_veriff           = _try("veriff",           lambda: __import__("routes_veriff", fromlist=["bp_veriff"]).bp_veriff)
     bp_twilio           = _try("twilio",           lambda: __import__("routes_twilio", fromlist=["bp_twilio"]).bp_twilio)
     bp_sms              = _try("sms",              lambda: __import__("routes_sms", fromlist=["bp_sms"]).bp_sms)
-    bp_admin_franq      = _try("admin_franq",      lambda: __import__("routes_admin_franq", fromlist=["bp_admin_franq"]).bp_admin_franq)
+    bp_admin_franq      = _try("admin_franchise",  lambda: __import__("routes_admin_franchise", fromlist=["bp_admin_franchise"]).bp_admin_franchise)
 
     # Registro
     if bp_rooms:           app.register_blueprint(bp_rooms)
@@ -70,7 +70,7 @@ def create_app(test_config=None):
     if bp_veriff:          app.register_blueprint(bp_veriff)
     if bp_twilio:          app.register_blueprint(bp_twilio)
     if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
-    if bp_admin_franq:     app.register_blueprint(bp_admin_franq)
+    if bp_admin_franchise: app.register_blueprint(bp_admin_franchise)
 
     # Proxy pagos
     @app.route("/create-checkout-session", methods=["POST","OPTIONS"])
