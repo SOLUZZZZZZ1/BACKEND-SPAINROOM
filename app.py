@@ -72,7 +72,9 @@ def create_app(test_config=None):
     bp_admin_franq      = _try("admin_franq",
                                lambda: __import__("routes_admin_franchise",
                                                   fromlist=["bp_admin_franq"]).bp_admin_franq)
+    bp_owner_delete = _try("owner_delete",         lambda: __import__("routes_owner_delete", fromlist=["bp_owner_delete"]).bp_owner_delete)                                                    lambda: __import__("routes_owner_delete", fromlist=["bp_owner_delete"]).bp_owner_delete)
 
+                                                   
     # ---------- Registro ----------
     if bp_rooms:           app.register_blueprint(bp_rooms)                              # /api/rooms/*
     if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")# /api/owner/*
@@ -87,6 +89,8 @@ def create_app(test_config=None):
     if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")       # /sms/inbound
     if bp_admin_franq:     app.register_blueprint(bp_admin_franq)                         # /api/admin/franquicia/*
     if bp_owner_presign:   app.register_blueprint(bp_owner_presign)                       # /api/owner/cedula/presign
+     if bp_owner_delete:   app.register_blueprint(bp_owner_delete)
+    
 
     # ---------- Proxy pagos a backend-1 ----------
     @app.route("/create-checkout-session", methods=["POST","OPTIONS"])
