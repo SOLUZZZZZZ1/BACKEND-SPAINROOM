@@ -70,7 +70,8 @@ def create_app(test_config=None):
     bp_admin_franq      = _try("admin_franq",      lambda: __import__("routes_admin_franchise", fromlist=["bp_admin_franq"]).bp_admin_franq)
     bp_leads            = _try("leads",            lambda: __import__("routes_leads", fromlist=["bp_leads"]).bp_leads)
     bp_franchise        = _try("franchise",        lambda: __import__("routes_franchise", fromlist=["bp_franchise"]).bp_franchise)
-
+    bp_wa = _try("wa",                             lambda: __import__("routes_wa", fromlist=["bp_wa"]).bp_wa)
+    bp_wa_webhook = _try("wa_webhook",             lambda: __import__("routes_wa", fromlist=["bp_wa_webhook"]).bp_wa_webhook)
     # ---------- WhatsApp (MessageBird / Meta / 360) ----------
     bp_wa               = _try("wa",               lambda: __import__("routes_wa", fromlist=["bp_wa"]).bp_wa)
     bp_wa_webhook       = _try("wa_webhook",       lambda: __import__("routes_wa", fromlist=["bp_wa_webhook"]).bp_wa_webhook)
