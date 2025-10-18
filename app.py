@@ -96,7 +96,7 @@ def create_app(test_config=None):
 
     if bp_wa:              app.register_blueprint(bp_wa)                 # /api/wa/*
     if bp_wa_webhook:      app.register_blueprint(bp_wa_webhook)         # /webhooks/wa
-     if bp_push:           app.register_blueprint(bp_push)               # /api/push/*
+    if bp_push:            app.register_blueprint(bp_push)               # /api/push/*
 
     # ---------- Fallback inline /api/wa/send_template (por si el blueprint no carga) ----------
     if not bp_wa:
