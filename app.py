@@ -56,47 +56,47 @@ def create_app(test_config=None):
             return None
 
     # ---------- Blueprints ya existentes ----------
-    bp_rooms            = _try("rooms",            lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)
-    bp_owner            = _try("owner",            lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
-    bp_contact          = _try("contact",          lambda: __import__("routes_contact", fromlist=["bp_contact"]).bp_contact)
-    bp_upload_generic   = _try("upload_generic",   lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
-    bp_upload_rooms     = _try("upload_rooms",     lambda: __import__("routes_uploads_rooms", fromlist=["bp_upload_rooms"]).bp_upload_rooms)
-    bp_upload_autofit   = _try("upload_rooms_auto",lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
-    bp_auth             = _try("auth",             lambda: __import__("routes_auth", fromlist=["bp_auth"]).bp_auth)
-    bp_kyc              = _try("kyc",              lambda: __import__("routes_kyc", fromlist=["bp_kyc"]).bp_kyc)
-    bp_veriff           = _try("veriff",           lambda: __import__("routes_veriff", fromlist=["bp_veriff"]).bp_veriff)
-    bp_twilio           = _try("twilio",           lambda: __import__("routes_twilio", fromlist=["bp_twilio"]).bp_twilio)
-    bp_sms              = _try("sms",              lambda: __import__("routes_sms", fromlist=["bp_sms"]).bp_sms)
-    bp_admin_franq      = _try("admin_franq",      lambda: __import__("routes_admin_franchise", fromlist=["bp_admin_franq"]).bp_admin_franq)
-    bp_leads            = _try("leads",            lambda: __import__("routes_leads", fromlist=["bp_leads"]).bp_leads)
-    bp_franchise        = _try("franchise",        lambda: __import__("routes_franchise", fromlist=["bp_franchise"]).bp_franchise)
-    bp_wa = _try("wa",                             lambda: __import__("routes_wa", fromlist=["bp_wa"]).bp_wa)
-    bp_wa_webhook = _try("wa_webhook",             lambda: __import__("routes_wa", fromlist=["bp_wa_webhook"]).bp_wa_webhook)
-    # ---------- WhatsApp (MessageBird / Meta / 360) ----------
-    bp_wa               = _try("wa",               lambda: __import__("routes_wa", fromlist=["bp_wa"]).bp_wa)
-    bp_wa_webhook       = _try("wa_webhook",       lambda: __import__("routes_wa", fromlist=["bp_wa_webhook"]).bp_wa_webhook)
-      bp_push =           _try("push",             lambda: __import__("routes_push", fromlist=["bp_push"]).bp_push)
+    # ---------- Blueprints ----------
+bp_rooms            = _try("rooms",            lambda: __import__("routes_rooms", fromlist=["bp_rooms"]).bp_rooms)
+bp_owner            = _try("owner",            lambda: __import__("routes_owner_cedula", fromlist=["bp_owner"]).bp_owner)
+bp_contact          = _try("contact",          lambda: __import__("routes_contact", fromlist=["bp_contact"]).bp_contact)
+bp_upload_generic   = _try("upload_generic",   lambda: __import__("routes_upload_generic", fromlist=["bp_upload_generic"]).bp_upload_generic)
+bp_upload_rooms     = _try("upload_rooms",     lambda: __import__("routes_uploads_rooms", fromlist=["bp_upload_rooms"]).bp_upload_rooms)
+bp_upload_autofit   = _try("upload_rooms_auto",lambda: __import__("routes_uploads_rooms_autofit", fromlist=["bp_upload_rooms_autofit"]).bp_upload_rooms_autofit)
+bp_auth             = _try("auth",             lambda: __import__("routes_auth", fromlist=["bp_auth"]).bp_auth)
+bp_kyc              = _try("kyc",              lambda: __import__("routes_kyc", fromlist=["bp_kyc"]).bp_kyc)
+bp_veriff           = _try("veriff",           lambda: __import__("routes_veriff", fromlist=["bp_veriff"]).bp_veriff)
+bp_twilio           = _try("twilio",           lambda: __import__("routes_twilio", fromlist=["bp_twilio"]).bp_twilio)
+bp_sms              = _try("sms",              lambda: __import__("routes_sms", fromlist=["bp_sms"]).bp_sms)
+bp_admin_franq      = _try("admin_franq",      lambda: __import__("routes_admin_franchise", fromlist=["bp_admin_franq"]).bp_admin_franq)
+bp_leads            = _try("leads",            lambda: __import__("routes_leads", fromlist=["bp_leads"]).bp_leads)
+bp_franchise        = _try("franchise",        lambda: __import__("routes_franchise", fromlist=["bp_franchise"]).bp_franchise)
+bp_wa               = _try("wa",               lambda: __import__("routes_wa", fromlist=["bp_wa"]).bp_wa)
+bp_wa_webhook       = _try("wa_webhook",       lambda: __import__("routes_wa", fromlist=["bp_wa_webhook"]).bp_wa_webhook)
+bp_push             = _try("push",             lambda: __import__("routes_push", fromlist=["bp_push"]).bp_push)
+
 
 
     # ---------- Registro ----------
-    if bp_rooms:           app.register_blueprint(bp_rooms)
-    if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")
-    if bp_contact:         app.register_blueprint(bp_contact)
-    if bp_upload_generic:  app.register_blueprint(bp_upload_generic)
-    if bp_upload_rooms:    app.register_blueprint(bp_upload_rooms)
-    if bp_upload_autofit:  app.register_blueprint(bp_upload_autofit)
-    if bp_auth:            app.register_blueprint(bp_auth)
-    if bp_kyc:             app.register_blueprint(bp_kyc)
-    if bp_veriff:          app.register_blueprint(bp_veriff)
-    if bp_twilio:          app.register_blueprint(bp_twilio)
-    if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
-    if bp_admin_franq:     app.register_blueprint(bp_admin_franq)
-    if bp_leads:           app.register_blueprint(bp_leads)
-    if bp_franchise:       app.register_blueprint(bp_franchise)
+    # ---------- Registro ----------
+if bp_rooms:           app.register_blueprint(bp_rooms)
+if bp_owner:           app.register_blueprint(bp_owner,      url_prefix="/api/owner")
+if bp_contact:         app.register_blueprint(bp_contact)
+if bp_upload_generic:  app.register_blueprint(bp_upload_generic)
+if bp_upload_rooms:    app.register_blueprint(bp_upload_rooms)
+if bp_upload_autofit:  app.register_blueprint(bp_upload_autofit)
+if bp_auth:            app.register_blueprint(bp_auth)
+if bp_kyc:             app.register_blueprint(bp_kyc)
+if bp_veriff:          app.register_blueprint(bp_veriff)
+if bp_twilio:          app.register_blueprint(bp_twilio)
+if bp_sms:             app.register_blueprint(bp_sms,        url_prefix="/sms")
+if bp_admin_franq:     app.register_blueprint(bp_admin_franq)
+if bp_leads:           app.register_blueprint(bp_leads)
+if bp_franchise:       app.register_blueprint(bp_franchise)
+if bp_wa:              app.register_blueprint(bp_wa)                 # /api/wa/*
+if bp_wa_webhook:      app.register_blueprint(bp_wa_webhook)         # /webhooks/wa
+if bp_push:            app.register_blueprint(bp_push)               # /api/push/*
 
-    if bp_wa:              app.register_blueprint(bp_wa)                 # /api/wa/*
-    if bp_wa_webhook:      app.register_blueprint(bp_wa_webhook)         # /webhooks/wa
-    if bp_push:            app.register_blueprint(bp_push)               # /api/push/*
 
     # ---------- Fallback inline /api/wa/send_template (por si el blueprint no carga) ----------
     if not bp_wa:
