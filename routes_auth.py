@@ -1,4 +1,4 @@
-# routes_auth.py — SpainRoom Auth (OTP + Password Link + Password Login) con Twilio y parches anti-500
+# routes_auth.py — SpainRoom Auth (OTP + Password Link + Password Login)
 import os, re, time, random
 from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, current_app
@@ -6,7 +6,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 
 from extensions import db
-from models_auth import User, Otp  # Asegúrate de que User tenga password_hash y Otp funcione
+from models_auth import User, Otp
 
 bp_auth = Blueprint("auth", __name__)
 
@@ -14,18 +14,28 @@ bp_auth = Blueprint("auth", __name__)
 JWT_SECRET  = os.getenv("JWT_SECRET", "sr-dev-secret")
 JWT_TTL_MIN = int(os.getenv("JWT_TTL_MIN", "720"))
 PASSLINK_TTL_MIN = int(os.getenv("PASSLINK_TTL_MIN", "15"))
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173").rstrip("/")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "ramon")
 
 PHONE_RE = re.compile(r"^\+?\d{9,15}$")
 
 def normalize_phone(v: str) -> str:
     s = re.sub(r"[^\d+]", "", v or "")
-    if not s: return ""
-    if s.startswith("+"): return s
-    if s.startswith("34"): return "+"+s
-    if re.fullmatch(r"\d{9,15}", s): return "+34"+s
+    if not s:
+        return ""
+    if s.startswith("+"):
+        return s
+    if s.startswith("34"):
+        return "+" + s
+    if re.fullmatch(r"\d{9,15}", s):
+        return "+34" + s
     return s
+
+def _mask_phone(phone: str) -> str:
+    p = phone or ""
+    if len(p) <= 5:
+        return p
+    return p[:4] + "***" + p[-3:]
 
 # ---------- JWT helpers ----------
 def make_jwt(user: User):
@@ -66,16 +76,13 @@ def _twilio_client_or_none():
     return Client(sid, tok), frm, sid
 
 def send_sms(phone_to: str, body: str) -> bool:
-    """
-    Envía SMS con Twilio. Devuelve True si se pudo enviar, False si no (sin romper el flujo).
-    """
     try:
         client, from_number, _ = _twilio_client_or_none()
         if not client or not from_number:
             current_app.logger.warning("[SMS] Twilio no configurado; body=%s", body)
             return False
         m = client.messages.create(body=body, from_=from_number, to=phone_to)
-        current_app.logger.info("[SMS] enviado sid=%s to=%s", getattr(m, "sid", "?"), phone_to)
+        current_app.logger.info("[SMS] enviado sid=%s to=%s", getattr(m, "sid", "?"), _mask_phone(phone_to))
         return True
     except Exception as e:
         current_app.logger.warning("[SMS] fallo enviando: %s", e)
@@ -90,64 +97,78 @@ def me():
 def create_user():
     if (request.headers.get("X-Admin-Key") or "") != ADMIN_API_KEY:
         return jsonify(ok=False, error="forbidden"), 403
+
     data = request.get_json(force=True)
     role = (data.get("role") or "inquilino").strip()
     phone = normalize_phone(data.get("phone") or "")
     email = (data.get("email") or "").strip().lower() or None
     name  = (data.get("name") or "").strip() or None
+
     if not phone and not email:
         return jsonify(ok=False, error="need_phone_or_email"), 400
     if phone and not PHONE_RE.match(phone):
         return jsonify(ok=False, error="bad_phone"), 400
 
     u = None
-    if phone: u = User.query.filter_by(phone=phone).first()
-    if not u and email: u = User.query.filter_by(email=email).first()
+    if phone:
+        u = User.query.filter_by(phone=phone).first()
+    if not u and email:
+        u = User.query.filter_by(email=email).first()
+
     if not u:
         u = User(phone=phone or None, email=email or None, role=role, name=name)
-        db.session.add(u); db.session.commit()
+        db.session.add(u)
+        db.session.commit()
     else:
-        u.role = role or u.role; u.name = name or u.name; db.session.commit()
+        u.role = role or u.role
+        u.name = name or u.name
+        if email and not u.email:
+            u.email = email
+        db.session.commit()
+
     return jsonify(ok=True, user=u.to_dict())
 
-# ----- OTP por SMS (parche anti-500) -----
+# ----- OTP por SMS -----
 @bp_auth.post("/api/auth/request_otp")
 def request_otp():
     data = request.get_json(force=True)
     phone = normalize_phone(data.get("phone") or "")
     email = (data.get("email") or "").strip().lower()
     target = phone or email
+
     if not target:
         return jsonify(ok=False, error="need_phone_or_email"), 400
     if phone and not PHONE_RE.match(phone):
         return jsonify(ok=False, error="bad_phone"), 400
 
-    # asegura usuario
     try:
         if phone:
             u = User.query.filter_by(phone=phone).first()
             if not u:
-                u = User(phone=phone, role="inquilino"); db.session.add(u); db.session.commit()
+                u = User(phone=phone, role="inquilino")
+                db.session.add(u)
+                db.session.commit()
         else:
             u = User.query.filter_by(email=email).first()
             if not u:
-                u = User(email=email, role="inquilino"); db.session.add(u); db.session.commit()
+                u = User(email=email, role="inquilino")
+                db.session.add(u)
+                db.session.commit()
     except Exception as e:
         current_app.logger.exception("[OTP] fallo preparando usuario: %s", e)
         return jsonify(ok=False, error="server_error_user"), 500
 
-    # genera OTP (persistente si el modelo lo soporta) o fallback
     code = None
     try:
-        otp = Otp.new(target, ttl_sec=300)    # tu modelo debe tener este método
+        otp = Otp.new(target, ttl_sec=300)
         code = otp.code
-        db.session.add(otp); db.session.commit()
+        db.session.add(otp)
+        db.session.commit()
     except Exception as e:
         current_app.logger.exception("[OTP] fallo creando OTP: %s", e)
-        code = f"{random.randint(0, 999999):06d}"  # fallback (no persistido)
-        current_app.logger.warning("[OTP] usando fallback code (no persistido)")
+        code = f"{random.randint(0, 999999):06d}"
+        current_app.logger.warning("[OTP] usando fallback code no persistido")
 
-    # intenta enviar SMS; si Twilio falla, no tumbes
     sent = False
     try:
         if phone and code:
@@ -155,7 +176,7 @@ def request_otp():
     except Exception as e:
         current_app.logger.warning("[OTP] fallo enviando SMS: %s", e)
 
-    current_app.logger.info("[OTP] solicitado para %s (sent=%s)", target, sent)
+    current_app.logger.info("[OTP] solicitado para %s (sent=%s)", _mask_phone(target), sent)
     return jsonify(ok=True, sent=bool(sent))
 
 @bp_auth.post("/api/auth/verify_otp")
@@ -164,38 +185,44 @@ def verify_otp():
     phone = normalize_phone(data.get("phone") or "")
     email = (data.get("email") or "").strip().lower()
     code  = (data.get("code") or "").strip()
-    target= phone or email
+    target = phone or email
+
     if not target or not code:
         return jsonify(ok=False, error="missing_fields"), 400
 
-    otp = (Otp.query.filter_by(target=target, used=False).order_by(Otp.created_at.desc()).first())
+    otp = Otp.query.filter_by(target=target, used=False).order_by(Otp.created_at.desc()).first()
     if not otp:
         return jsonify(ok=False, error="otp_not_found"), 404
     if datetime.utcnow() > otp.expires_at:
         return jsonify(ok=False, error="otp_expired"), 400
+
     otp.tries += 1
     if otp.code != code:
         db.session.commit()
         return jsonify(ok=False, error="otp_mismatch"), 400
 
-    otp.used = True; db.session.commit()
+    otp.used = True
+    db.session.commit()
 
     if phone:
         u = User.query.filter_by(phone=phone).first()
     else:
         u = User.query.filter_by(email=email).first()
+
     if not u:
         u = User(phone=phone or None, email=email or None, role="inquilino")
-        db.session.add(u); db.session.commit()
+        db.session.add(u)
+        db.session.commit()
 
     token = make_jwt(u)
     return jsonify(ok=True, token=token, user=u.to_dict())
 
-# ----- Enlace SMS para crear/recuperar contraseña (con fallback demo) -----
+# ----- Enlace para crear/recuperar contraseña -----
 @bp_auth.post("/api/auth/request_password_link")
 def request_password_link():
     data = request.get_json(force=True)
     phone = normalize_phone(data.get("phone") or "")
+
     if not phone:
         return jsonify(ok=False, error="missing_phone"), 400
     if not PHONE_RE.match(phone):
@@ -204,7 +231,8 @@ def request_password_link():
     u = User.query.filter_by(phone=phone).first()
     if not u:
         u = User(phone=phone, role="inquilino")
-        db.session.add(u); db.session.commit()
+        db.session.add(u)
+        db.session.commit()
 
     token = _make_passlink_token(phone)
     link = f"{FRONTEND_BASE_URL}/set-password?token={token}"
@@ -226,15 +254,25 @@ def set_password():
     data = request.get_json(force=True)
     token = (data.get("token") or "").strip()
     newpass = (data.get("password") or "").strip()
+
     if not token or not newpass:
         return jsonify(ok=False, error="missing_fields"), 400
+    if len(newpass) < 6:
+        return jsonify(ok=False, error="password_too_short"), 400
+
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"require":["exp","iat","iss"]})
-        sub = str(payload.get("sub",""))
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["exp", "iat", "iss"]},
+        )
+        sub = str(payload.get("sub", ""))
         if not sub.startswith("passlink:"):
             return jsonify(ok=False, error="bad_token"), 400
         phone = normalize_phone(payload.get("phone") or "")
-        if not phone: return jsonify(ok=False, error="bad_token"), 400
+        if not phone:
+            return jsonify(ok=False, error="bad_token"), 400
     except Exception as e:
         return jsonify(ok=False, error="invalid_or_expired", message=str(e)), 400
 
@@ -242,22 +280,39 @@ def set_password():
     if not u:
         return jsonify(ok=False, error="user_not_found"), 404
 
-    u.password_hash = generate_password_hash(newpass)
-    db.session.commit()
-    return jsonify(ok=True)
+    try:
+        u.password_hash = generate_password_hash(newpass)
+        db.session.commit()
+        current_app.logger.info("[AUTH] password set user_id=%s phone=%s has_hash=%s", u.id, _mask_phone(phone), bool(u.password_hash))
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("[AUTH] set_password failed: %s", e)
+        return jsonify(ok=False, error="set_password_failed", message=str(e)), 500
+
+    return jsonify(ok=True, user_id=u.id, phone=phone, has_password=bool(u.password_hash))
 
 # ----- Login con móvil + contraseña -----
 @bp_auth.post("/api/auth/login_password")
 def login_password():
     data = request.get_json(force=True)
     phone = normalize_phone(data.get("phone") or "")
-    pw    = (data.get("password") or "").strip()
+    pw = (data.get("password") or "").strip()
+
     if not phone or not pw:
         return jsonify(ok=False, error="missing_fields"), 400
 
     u = User.query.filter_by(phone=phone).first()
-    if not u or not getattr(u, "password_hash", None):
+
+    if not u:
+        current_app.logger.info("[AUTH] login no_user phone=%s", _mask_phone(phone))
+        return jsonify(ok=False, error="user_not_found"), 404
+
+    has_hash = bool(getattr(u, "password_hash", None))
+    current_app.logger.info("[AUTH] login user_id=%s phone=%s has_hash=%s role=%s", u.id, _mask_phone(phone), has_hash, u.role)
+
+    if not has_hash:
         return jsonify(ok=False, error="no_password_set"), 400
+
     if not check_password_hash(u.password_hash, pw):
         return jsonify(ok=False, error="bad_credentials"), 401
 

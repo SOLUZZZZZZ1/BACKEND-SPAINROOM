@@ -16,6 +16,9 @@ class User(db.Model):
     email       = db.Column(db.String(200), unique=True, index=True)
     role        = db.Column(db.String(32), default="inquilino")  # admin|franquiciado|propietario|inquilino
     name        = db.Column(db.String(200))
+
+    # NECESARIO para login por contraseña.
+    # Sin esta columna en el modelo, set_password podía devolver 200 pero no persistir nada.
     password_hash = db.Column(db.String(255))
 
     def to_dict(self):
