@@ -144,16 +144,15 @@ def request_otp():
     try:
         if phone:
             u = User.query.filter_by(phone=phone).first()
-            if not u:
-                u = User(phone=phone, role="inquilino")
-                db.session.add(u)
-                db.session.commit()
         else:
             u = User.query.filter_by(email=email).first()
-            if not u:
-                u = User(email=email, role="inquilino")
-                db.session.add(u)
-                db.session.commit()
+
+        if not u:
+            return jsonify(
+                ok=False,
+                error="user_not_found",
+                message="Tu cuenta debe ser creada previamente por SpainRoom."
+            ), 404
     except Exception as e:
         current_app.logger.exception("[OTP] fallo preparando usuario: %s", e)
         return jsonify(ok=False, error="server_error_user"), 500
@@ -210,9 +209,11 @@ def verify_otp():
         u = User.query.filter_by(email=email).first()
 
     if not u:
-        u = User(phone=phone or None, email=email or None, role="inquilino")
-        db.session.add(u)
-        db.session.commit()
+        return jsonify(
+            ok=False,
+            error="user_not_found",
+            message="Tu cuenta debe ser creada previamente por SpainRoom."
+        ), 404
 
     token = make_jwt(u)
     return jsonify(ok=True, token=token, user=u.to_dict())
@@ -230,9 +231,11 @@ def request_password_link():
 
     u = User.query.filter_by(phone=phone).first()
     if not u:
-        u = User(phone=phone, role="inquilino")
-        db.session.add(u)
-        db.session.commit()
+        return jsonify(
+            ok=False,
+            error="user_not_found",
+            message="Tu cuenta debe ser creada previamente por SpainRoom."
+        ), 404
 
     token = _make_passlink_token(phone)
     link = f"{FRONTEND_BASE_URL}/set-password?token={token}"
