@@ -128,6 +128,49 @@ def create_user():
 
     return jsonify(ok=True, user=u.to_dict())
 
+
+@bp_auth.get("/api/auth/users")
+def list_users():
+    """
+    Lista usuarios reales de auth_user para Centro de Control.
+    Protegido por X-Admin-Key.
+    """
+    if (request.headers.get("X-Admin-Key") or "") != ADMIN_API_KEY:
+        return jsonify(ok=False, error="forbidden"), 403
+
+    q = (request.args.get("q") or "").strip().lower()
+    role = (request.args.get("role") or "").strip().lower()
+
+    try:
+        limit = min(int(request.args.get("limit") or 100), 500)
+    except Exception:
+        limit = 100
+
+    query = User.query
+
+    if role:
+        query = query.filter(User.role == role)
+
+    rows = query.order_by(User.created_at.desc()).limit(limit).all()
+
+    users = []
+    for u in rows:
+        d = u.to_dict()
+        d["created_at"] = u.created_at.isoformat() if getattr(u, "created_at", None) else None
+        d["has_password"] = bool(getattr(u, "password_hash", None))
+        users.append(d)
+
+    if q:
+        users = [
+            u for u in users
+            if q in str(u.get("name") or "").lower()
+            or q in str(u.get("phone") or "").lower()
+            or q in str(u.get("email") or "").lower()
+            or q in str(u.get("role") or "").lower()
+        ]
+
+    return jsonify(ok=True, users=users)
+
 # ----- OTP por SMS -----
 @bp_auth.post("/api/auth/request_otp")
 def request_otp():
