@@ -171,6 +171,30 @@ def list_users():
 
     return jsonify(ok=True, users=users)
 
+
+@bp_auth.delete("/api/auth/users/<int:user_id>")
+def delete_user(user_id):
+    """
+    Borra un usuario desde Centro de Control.
+    Protegido por X-Admin-Key.
+    """
+    if (request.headers.get("X-Admin-Key") or "") != ADMIN_API_KEY:
+        return jsonify(ok=False, error="forbidden"), 403
+
+    u = db.session.get(User, user_id)
+    if not u:
+        return jsonify(ok=False, error="user_not_found"), 404
+
+    if (u.role or "").lower() in ("admin", "equipo"):
+        admin_count = User.query.filter(User.role.in_(["admin", "equipo"])).count()
+        if admin_count <= 1:
+            return jsonify(ok=False, error="last_admin", message="No puedes borrar el último admin/equipo."), 400
+
+    deleted = u.to_dict()
+    db.session.delete(u)
+    db.session.commit()
+    return jsonify(ok=True, deleted=deleted)
+
 # ----- OTP por SMS -----
 @bp_auth.post("/api/auth/request_otp")
 def request_otp():
